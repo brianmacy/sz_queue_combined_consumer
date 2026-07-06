@@ -1,0 +1,3 @@
+[submodule "truth-sets"]
+	path = truth-sets
+	url = https://github.com/Senzing/truth-sets.git

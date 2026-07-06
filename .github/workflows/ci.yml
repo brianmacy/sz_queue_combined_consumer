@@ -1,0 +1,253 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # build.rs links dylib=Sz from here; provided by the Senzing runtime container.
+  SENZING_LIB_PATH: /opt/senzing/er/lib
+  LD_LIBRARY_PATH: /opt/senzing/er/lib
+
+jobs:
+  # fmt + clippy do not link a final binary, but the build graph references the
+  # native Senzing library, so every Rust job runs inside the pinned Senzing
+  # runtime image (which ships /opt/senzing/er/lib). The image is pinned (NOT
+  # :latest) for reproducibility, and `--user root` is required because rustup /
+  # cargo install cannot write to the toolchain dirs as the image's default
+  # non-root user.
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    container:
+      image: senzing/senzingsdk-runtime:4.3.2
+      options: --user root
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (pinned 2026-06-29)
+        with:
+          toolchain: 1.88.0
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build:
+    name: Build (release)
+    runs-on: ubuntu-latest
+    container:
+      image: senzing/senzingsdk-runtime:4.3.2
+      options: --user root
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (pinned 2026-06-29)
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache cargo + target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-build-
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Run unit tests
+        run: cargo test --bins
+
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    container:
+      image: senzing/senzingsdk-runtime:4.3.2
+      options: --user root
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: senzing
+          POSTGRES_PASSWORD: senzing
+          POSTGRES_DB: G2
+        options: >-
+          --health-cmd "pg_isready -U senzing -d G2"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:3-management
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: senzing
+      POSTGRES_PASSWORD: senzing
+      POSTGRES_DB: G2
+      PGPASSWORD: senzing
+      SENZING_AMQP_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      SENZING_RABBITMQ_QUEUE: senzing-rabbitmq-queue
+      # Engine connection uses Senzing's colon-form (host:port:database). The
+      # Senzing C engine expects the database name after a COLON, not a slash;
+      # the slash form is parsed as a database literally named "/G2" and fails.
+      SENZING_ENGINE_CONFIGURATION_JSON: >-
+        {"PIPELINE":{"CONFIGPATH":"/etc/opt/senzing","RESOURCEPATH":"/opt/senzing/er/resources","SUPPORTPATH":"/opt/senzing/data"},"SQL":{"CONNECTION":"postgresql://senzing:senzing@postgres:5432:G2"}}
+      # Slash-form libpq DSN for the truth-set test's psql scoped entity-count
+      # query (distinct from the engine's colon-form connection string above).
+      IT_PG_DSN: postgresql://senzing:senzing@postgres:5432/G2
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Fetch the truth-sets submodule so e2e_truthset_resolution_and_redo_drain
+          # can load the Senzing demo truth set from truth-sets/truthsets/demo/.
+          submodules: recursive
+
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates build-essential pkg-config libssl-dev
+
+      - name: Install Senzing init tooling
+        # senzingsdk-setup ships the schema DDL under /opt/senzing/er/resources/schema.
+        # senzingsdk-tools ships the Python SDK (senzing_core) used to register the
+        # default ER configuration. psql + psycopg2 provide DB access.
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            senzingsdk-setup senzingsdk-tools \
+            postgresql-client python3 python3-psycopg2
+
+      - name: Initialize Senzing repository (schema DDL + default config + data sources)
+        # Authoritative init sequence (mirrors sz_init_postgresql-v4/init-postgresql.py):
+        #   1. apply the engine schema DDL to the Postgres database (psql, slash-form URL),
+        #   2. register the default ER configuration AND the data sources the tests use
+        #      via the Senzing Python SDK.
+        # The Rust SDK's split SzConfigMgr_init rejects an empty datastore (SENZ7220),
+        # so config registration uses the Python SDK exactly as the reference repo does.
+        # Data sources: CUSTOMERS / REFERENCE / WATCHLIST are the demo truth-set codes
+        # (used by e2e_truthset_resolution_and_redo_drain); TEST / SEARCH are used by the
+        # other real-engine + e2e tests. add_record fails on an unregistered data source.
+        run: |
+          set -euo pipefail
+          psql "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}" \
+            -q -v ON_ERROR_STOP=1 \
+            -f /opt/senzing/er/resources/schema/szcore-schema-postgresql-create.sql
+          export PYTHONPATH=/opt/senzing/er/sdk/python:${PYTHONPATH:-}
+          python3 - <<'PY'
+          import os
+          import senzing_core
+
+          settings = os.environ["SENZING_ENGINE_CONFIGURATION_JSON"]
+          factory = senzing_core.SzAbstractFactoryCore("ci_init", settings)
+          config_mgr = factory.create_configmanager()
+          if not config_mgr.get_default_config_id():
+              config = config_mgr.create_config_from_template()
+              config_mgr.set_default_config(config.export(), "CI initial configuration")
+          # Register the data sources the tests load into (idempotent: derive a new
+          # config from the current default, add any missing sources, set as default).
+          config = config_mgr.create_config_from_config_id(config_mgr.get_default_config_id())
+          for ds in ("CUSTOMERS", "REFERENCE", "WATCHLIST", "TEST", "SEARCH"):
+              try:
+                  config.register_data_source(ds)
+              except Exception as e:
+                  print(f"data source {ds}: {e}")
+          config_mgr.set_default_config(config.export(), "CI config + test data sources")
+          print("default config id:", config_mgr.get_default_config_id())
+          factory.destroy()
+          PY
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable (pinned 2026-06-29)
+        with:
+          toolchain: 1.88.0
+
+      - name: Cache cargo + target
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-integration-
+
+      - name: Run integration tests
+        # --test-threads=1: the Senzing engine is a process-global singleton;
+        # parallel get_instance() calls race its init. Serialize the suite.
+        run: cargo test --test integration_test -- --nocapture --test-threads=1
+
+  docker:
+    name: Docker build (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # All three backend variants build. The MSSQL closure installs
+          # msodbcsql18 from packages.microsoft.com (Debian 13 config) and lets
+          # it pull Debian's own fastvalidate-enabled unixodbc; the canonical
+          # Senzing section is byte-identical to the sibling dbperf images
+          # (sz_rabbit_consumer_rust / sz_simple_redoer_rust), whose :mssql and
+          # :both tags build successfully. Verified locally 2026-07-06:
+          # `docker build --build-arg WITH_MSSQL=1 --build-arg WITH_POSTGRES=0`
+          # and the "both" default both succeed. (An earlier "SHA1 apt-key"
+          # claim carried over from the sibling CI was incorrect.)
+          - backend: postgres
+            args: "WITH_POSTGRES=1 WITH_MSSQL=0"
+          - backend: mssql
+            args: "WITH_POSTGRES=0 WITH_MSSQL=1"
+          - backend: both
+            args: "WITH_POSTGRES=1 WITH_MSSQL=1"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Build image
+        run: |
+          BUILD_ARGS=""
+          for kv in ${{ matrix.args }}; do BUILD_ARGS="$BUILD_ARGS --build-arg $kv"; done
+          docker build $BUILD_ARGS -t sz_rabbit_combined_consumer:${{ matrix.backend }} .

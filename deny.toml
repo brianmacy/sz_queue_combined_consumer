@@ -1,0 +1,54 @@
+# cargo-deny configuration
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+version = 2
+# TODO: Remove these ignores when upstream fixes are available
+# These are transitive dependencies from lapin -> amq-protocol-tcp -> tcp-stream
+# tracking: https://github.com/lapin-rs/lapin/issues
+ignore = [
+    # rustls-pemfile is unmaintained, should migrate to rustls-pki-types
+    # Blocked by: tcp-stream needs to update its dependencies
+    # Impact: Low - maintenance advisory, not a security vulnerability
+    # Plan: Monitor tcp-stream releases, upgrade when fixed
+    "RUSTSEC-2025-0134",
+
+    # time crate RFC 2822 DoS (requires time >= 0.3.47)
+    # Blocked by: p12-keystore -> x509-parser uses time 0.3.45
+    # Impact: Medium (6.8) - DoS via stack exhaustion with malicious RFC 2822 input
+    # Mitigation: We don't parse RFC 2822 formatted data in our code path
+    # Plan: Monitor upstream releases, upgrade when tcp-stream/p12-keystore updates
+    "RUSTSEC-2026-0009",
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OpenSSL",
+    # Community Data License Agreement - Permissive 2.0. A permissive (non-
+    # copyleft) data license used by webpki-root-certs, pulled transitively via
+    # lapin -> amq-protocol-tcp -> tcp-stream -> rustls-connector. Consumer-only;
+    # the redoer has no lapin/rustls dependency and does not carry this.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The Senzing Rust SDK is a public git dependency (pinned rev in Cargo.toml).
+# It is not published to crates.io, so its git source must be explicitly allowed.
+allow-git = ["https://github.com/brianmacy/sz-rust-sdk"]
