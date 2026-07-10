@@ -1,9 +1,11 @@
 //! Combined RabbitMQ load + redo Senzing driver.
 //!
-//! One binary subsumes both `sz_rabbit_consumer` (load: `add_record` from a
-//! RabbitMQ queue) and `sz_simple_redoer` (redo: `process_redo_record` from the
-//! engine's own redo queue), governed by a single `SENZING_REDO_PERCENT`
-//! parameter in `[0, 100]`:
+//! One binary runs both roles in a single worker pool: the load role of
+//! `sz_rabbit_consumer` (`add_record` from a RabbitMQ queue) and the redo role
+//! of `sz_simple_redoer` (`process_redo_record` from the engine's own redo
+//! queue), governed by a single `SENZING_REDO_PERCENT` parameter in `[0, 100]`.
+//! It does not replace those standalone drivers — it combines their two roles
+//! into one process so capacity can flow between load and redo:
 //!
 //! * `0`   — pure loader: no redo fetcher is started, zero redo-related calls.
 //! * `100` — pure redoer: the AMQP connection (and the tokio runtime) is never

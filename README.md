@@ -1,11 +1,14 @@
 # sz_rabbit_combined_consumer
 
-Combined Senzing **load + redo** driver in Rust. One binary subsumes both
-[`sz_rabbit_consumer_rust`](../sz_rabbit_consumer_rust) (RabbitMQ →
-`add_record`) and [`sz_simple_redoer_rust`](../sz_simple_redoer_rust)
-(`get_redo_record` → `process_redo_record`), governed by a single
-`SENZING_REDO_PERCENT` knob. Like its siblings, the container is **distroless**
-(no interpreter, no shell) and glue-layer errors surface at compile time.
+Combined Senzing **load + redo** driver in Rust. One binary runs both roles —
+the load role of [`sz_rabbit_consumer_rust`](../sz_rabbit_consumer_rust)
+(RabbitMQ → `add_record`) and the redo role of
+[`sz_simple_redoer_rust`](../sz_simple_redoer_rust) (`get_redo_record` →
+`process_redo_record`) — in a single worker pool, governed by a single
+`SENZING_REDO_PERCENT` knob. It does **not** replace those standalone drivers;
+it combines their two roles into one process so capacity can flow between load
+and redo. Like its siblings, the container is **distroless** (no interpreter,
+no shell) and glue-layer errors surface at compile time.
 
 Design document: `~/.claude/plans/dbperf_combined_consumer_design.md`.
 
@@ -16,7 +19,7 @@ the two pools are sized at launch and cannot borrow from each other: the redoer
 pool lags during load (SYS_EVAL_QUEUE grows) and the consumer pool idles during
 the redo tail. Here the same capacity flows to whichever work exists:
 
-| redo% | Behavior | Subsumes |
+| redo% | Behavior | Same work as |
 |---|---|---|
 | 0 | Pure loader. No redo fetcher, zero redo-related calls. | `sz_rabbit_consumer` |
 | 100 | Pure redoer. AMQP never opened; tokio runtime never built; `SENZING_AMQP_URL`/queue may be unset. | `sz_simple_redoer` |
@@ -93,6 +96,39 @@ Validation is loud (exit 1): redo% ∉ [0,100]; redo% < 100 without URL/queue;
   the redo queue's perspective (dequeued at fetch) — the tiny redo channel
   bounds this, and the harness's DB-side `SYS_EVAL_QUEUE` check remains the
   completion authority.
+
+## Memory under sustained load
+
+Under long, high-volume loads (esp. datasets with large "giant-component"
+regions on high-core hosts), the process **RSS balloons** far beyond the
+engine's live footprint — e.g. an individual process reaching 20–70 GB while
+`get_stats` reports ~1 GB live. This is **glibc arena high-water retention**:
+the compare/scoring path allocates large transient buffers per giant-component
+resolution, frees them, but glibc parks the freed memory on its arena free-lists
+and never returns it to the OS (no auto-trim; the dynamic mmap threshold ratchets
+up so large allocations land in the arena rather than being `mmap`'d). RSS pins
+at the high-water mark until the process restarts. It is **not** a leak (live
+memory stays bounded) and **not** an arena-*count* problem (`MALLOC_ARENA_MAX=2`
+does not bound it — a single process still ballooned to 69 GB).
+
+**The real fix is in the engine** — a per-thread `mmap`-backed arena for the
+compare/scoring buffers with `MADV_DONTNEED` on release, tracked in
+**[GDEV-4294]** (Senzing G2Dev). Until that ships:
+
+- **Mitigation (validated, default-on):** the reference `Dockerfile` sets
+  `MALLOC_MMAP_THRESHOLD_=131072` and `MALLOC_TRIM_THRESHOLD_=131072`. This
+  forces large allocations through `mmap` (returned to the OS on free), so RSS
+  tracks the live working set instead of pinning. In an A/B on a 330 M-record
+  load, a host with these set held free memory steadily / recovered under load,
+  while an unmodified host ballooned to OOM and required periodic restarts. It is
+  a **stopgap, not a cure**: it applies bluntly to *every* >128 KB allocation
+  (some throughput cost) and does not reclaim retention living in ≤128 KB chunks.
+  Unset them (or raise the threshold) if that per-allocation `mmap` cost
+  outweighs the RSS benefit for your workload.
+- **Do NOT `LD_PRELOAD` jemalloc/tcmalloc.** Empirically this **SIGSEGVs libSz**
+  at startup (verified with jemalloc 5.3.0, exit 139) — the engine does not
+  tolerate an interposed allocator. Swapping the process allocator is not a
+  viable deployment-level mitigation.
 
 ## Build
 

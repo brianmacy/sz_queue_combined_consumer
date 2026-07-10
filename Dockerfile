@@ -25,13 +25,24 @@ ARG WITH_POSTGRES=1
 ARG WITH_MSSQL=1
 
 # ---------------------------------------------------------------------------
+# Stage 0: szruntime — alias the (version-parameterized) Senzing runtime image
+# ONCE, so every COPY --from below pulls the SAME version. Override
+# SENZING_RUNTIME_IMAGE (e.g. --build-arg SENZING_RUNTIME_IMAGE=senzing/
+# senzingsdk-runtime:4.2.4) to rebuild the whole image against another engine
+# version. 4.2.4 / 4.3.2 / 4.4.0 runtimes are all Debian 13 (trixie, glibc
+# 2.41), so the cc-debian13 runtime base + debian/13 MS ODBC repo below hold
+# across versions. (Previously each COPY hardcoded :4.3.2.)
+# ---------------------------------------------------------------------------
+FROM ${SENZING_RUNTIME_IMAGE} AS szruntime
+
+# ---------------------------------------------------------------------------
 # Stage 1: builder — compile the Rust binary against libSz.
 # ---------------------------------------------------------------------------
 FROM ${RUST_IMAGE} AS builder
 
 # Bring in the Senzing runtime so the sz-rust-sdk build.rs can link dylib=Sz. It
 # searches /opt/senzing/er/lib by default (overridable via SENZING_LIB_PATH).
-COPY --from=senzing/senzingsdk-runtime:4.3.2 /opt/senzing /opt/senzing
+COPY --from=szruntime /opt/senzing /opt/senzing
 ENV SENZING_LIB_PATH=/opt/senzing/er/lib
 ENV LD_LIBRARY_PATH=/opt/senzing/er/lib
 
@@ -170,17 +181,17 @@ FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 # entire lib directory guarantees the engine's full plugin set is present; the
 # ECreator libs (libg2*ECreator.so) ship in the runtime image and are required
 # by the engine (their absence raises SENZ0087).
-COPY --from=senzing/senzingsdk-runtime:4.3.2 /opt/senzing/er/lib       /opt/senzing/er/lib
-COPY --from=senzing/senzingsdk-runtime:4.3.2 /opt/senzing/er/resources /opt/senzing/er/resources
-COPY --from=senzing/senzingsdk-runtime:4.3.2 /opt/senzing/er/szBuildVersion.json /opt/senzing/er/szBuildVersion.json
+COPY --from=szruntime /opt/senzing/er/lib       /opt/senzing/er/lib
+COPY --from=szruntime /opt/senzing/er/resources /opt/senzing/er/resources
+COPY --from=szruntime /opt/senzing/er/szBuildVersion.json /opt/senzing/er/szBuildVersion.json
 
 # SUPPORTPATH data (transliteration models, name/address data models, etc.) and
 # the CONFIGPATH templates. The engine loads these at init — measured: omitting
 # /opt/senzing/data raises SENZ7426 (e.g. "Could not load transliterator module:
 # thaiTransRules.sz"). The default engine config points SUPPORTPATH at
 # /opt/senzing/data and CONFIGPATH at /etc/opt/senzing.
-COPY --from=senzing/senzingsdk-runtime:4.3.2 /opt/senzing/data /opt/senzing/data
-COPY --from=senzing/senzingsdk-runtime:4.3.2 /etc/opt/senzing  /etc/opt/senzing
+COPY --from=szruntime /opt/senzing/data /opt/senzing/data
+COPY --from=szruntime /etc/opt/senzing  /etc/opt/senzing
 
 # Backend-specific libraries + ODBC ini files + driver tree assembled in stage 2.
 #
@@ -210,6 +221,21 @@ ENV LD_LIBRARY_PATH=/opt/senzing/er/lib
 # ===========================================================================
 # END CANONICAL SENZING SECTION.
 # ===========================================================================
+
+# Memory mitigation (GDEV-4294). Under sustained giant-component load the
+# compare/scoring path allocates large transient buffers that glibc frees but
+# retains at arena high-water (process RSS balloons to 20-70 GB while engine live
+# is ~1 GB). Pinning MALLOC_MMAP_THRESHOLD_ disables glibc's dynamic threshold so
+# large allocations go through mmap and are returned to the OS on free — RSS then
+# tracks the live working set instead of pinning. MALLOC_TRIM_THRESHOLD_ keeps the
+# main-arena top trimmed. Validated on a 330 M load: a host with these set held
+# steady / recovered under load while an unmodified control ballooned to OOM.
+# Stopgap only (blunt: applies to every >128 KB alloc) — the real fix is in-engine
+# (mmap-backed compare/scoring arenas, GDEV-4294). Unset if the per-alloc mmap
+# cost outweighs the RSS benefit for your workload. Do NOT LD_PRELOAD jemalloc/
+# tcmalloc — an interposed allocator SIGSEGVs libSz.
+ENV MALLOC_MMAP_THRESHOLD_=131072 \
+    MALLOC_TRIM_THRESHOLD_=131072
 
 LABEL org.opencontainers.image.title="sz_rabbit_combined_consumer" \
       org.opencontainers.image.description="Combined Senzing RabbitMQ load + redo driver (Rust)" \

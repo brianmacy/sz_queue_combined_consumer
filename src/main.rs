@@ -99,8 +99,16 @@ fn run_pure_redoer(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
 }
 
 /// redo% < 100: tokio runtime for the AMQP I/O layer only.
+///
+/// worker_threads is pinned to 2 (not the num_cpus default): this runtime only
+/// drives AMQP consume/ack + a few timers and hands every record to the
+/// dedicated `sz-worker` OS threads via channels — no Senzing/libSz FFI ever
+/// runs on a tokio worker. On a high-core host the default (one worker per core,
+/// e.g. 64) spawns dozens of idle runtime threads per process, each able to seed
+/// its own glibc malloc arena; 2 is ample for the I/O layer.
 fn run_combined(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
     {
