@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — live config auto-reload (2026-07-16)
+
+* **`src/config_reload.rs` (new)** — adopt a new registered DEFAULT engine config WITHOUT a
+  process restart, so an operator can bump the config (e.g. apply a
+  `setGenericThreshold ... "behavior":"NAME" ... "sendToRedo":"No"` tweak) and have every worker in
+  every process converge within ~one poll interval.
+  * `poll(&env)` — PERIODIC trigger called per-record; a PROCESS-GLOBAL throttle collapses all callers
+    to one `get_default_config_id` select per `SENZING_CONFIG_RELOAD_SECS` (default 60) per process.
+  * `reinit_if_stale(&env)` — ERROR-DRIVEN trigger: on an `add_record`/`process_redo_record` error, if
+    the active config drifted from the default the engine is reinitialized and the caller RETRIES once;
+    if active == default the error is genuine and propagates unchanged.
+  * `reconcile()` — double-checked reinit behind a process-global `Mutex` (re-checks `active != default`
+    inside the lock) so concurrent stale-config errors do not stack `reinitialize` calls.
+  * Logs every refresh with both IDs: `CONFIG REFRESHED: engine reinitialized from config {old} -> {new}`.
+* Wired into `src/worker.rs` (`process_load`, `process_redo`) and `src/redo.rs` (fetcher loop).
+* Uses `SzEnvironment::reinitialize` (documented thread-safe; existing engine handles stay valid).
+* No new dep; env knob `SENZING_CONFIG_RELOAD_SECS` (default 60, `0` disables periodic; error-path stays on).
+
 ## 0.1.0 (unreleased)
 
 Initial scaffold implementing the combined load+redo design
