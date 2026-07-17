@@ -13,10 +13,16 @@
   tokio-runtime and `Arc<env>` drops, which can wedge on the stuck thread so the process never
   exits and the container never restarts; a hard exit lets the OS reclaim everything and
   restart-on-failure bring up a clean instance.
-* **`src/config_reload.rs` — `reconcile()` now keys off `get_active_config_id()`** (the engine's
-  real state) instead of the process-local `LAST_APPLIED` sentinel, which has been removed
-  along with its `AtomicI64`. Refresh logging now records the active id before and after the
-  reinitialize so a no-op reinit is visible.
+* **`src/config_reload.rs` — `reconcile()` keys off the registered DEFAULT changing**
+  (`get_default_config_id()` vs an adopted-default sentinel), **not** `get_active_config_id()`.
+  On the settings-JSON init path the engine returns `get_active_config_id()==0` even after a
+  valid init AND after `reinitialize(default)` succeeds (engine defect **GDEV-4313**), so keying
+  on the active id caused a ~60s reinit storm → connection churn → prepared-statement 8179 storm
+  (**GDEV-4314**). The adopted default is seeded at startup to the default the engine loaded, so
+  reinit fires exactly once per real registered-default change. The active id is still logged for
+  GDEV-4313 visibility but is not used for the reload decision. (Supersedes the earlier
+  `get_active_config_id`-based reconcile; the `LAST_APPLIED`-style intent-tracking is restored,
+  now justified by the GDEV-4313 evidence.)
 * **Config/license diagnostics** — added `log_startup_config()` (logs `CONFIG AT INIT:
   active=… default=…` once per process after init), called from `combined.rs` and
   `pure_redoer.rs`; plus `LICENSE AFTER INIT` / `LICENSE AFTER REINIT` logging to detect a
