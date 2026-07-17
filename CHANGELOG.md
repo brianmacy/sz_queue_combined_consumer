@@ -21,6 +21,11 @@
   active=… default=…` once per process after init), called from `combined.rs` and
   `pure_redoer.rs`; plus `LICENSE AFTER INIT` / `LICENSE AFTER REINIT` logging to detect a
   license drop across `reinitialize`.
+* **CI — `.github/workflows/ci.yml`: fix Integration Tests submodule checkout.** The
+  `integration` job runs inside `senzing/senzingsdk-runtime`, which ships without `git`, so
+  `actions/checkout` fell back to the REST tarball API and could not fetch the `truth-sets`
+  submodule (job failed at checkout in ~34s). Added an `Install git` step before checkout so the
+  submodule is fetched via native git.
 
 ## Unreleased — live config auto-reload (2026-07-16)
 

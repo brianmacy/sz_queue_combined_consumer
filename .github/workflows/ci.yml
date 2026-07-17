@@ -136,6 +136,17 @@ jobs:
       # query (distinct from the engine's colon-form connection string above).
       IT_PG_DSN: postgresql://senzing:senzing@postgres:5432/G2
     steps:
+      # actions/checkout needs a real git >=2.18 on PATH to fetch submodules. The
+      # senzingsdk-runtime image ships WITHOUT git, so checkout silently falls back
+      # to the REST tarball API — which cannot fetch submodules and fails the job
+      # ("Input 'submodules' not supported when falling back to download using the
+      # GitHub REST API"). Install git BEFORE checkout so the truth-sets submodule
+      # is fetched via native git.
+      - name: Install git (required for submodule checkout)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends git
+
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
