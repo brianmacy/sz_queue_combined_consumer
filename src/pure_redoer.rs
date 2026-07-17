@@ -132,15 +132,13 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
             Err(e) => warn!("Could not retrieve engine stats: {e}"),
         }
 
-        // Monitoring ONLY (one table scan per interval); emptiness is always
-        // detected by the fetcher's get_redo_record() coming back empty.
-        let backlog = match monitor_engine.count_redo_records() {
-            Ok(n) => Some(n),
-            Err(e) => {
-                warn!("count_redo_records failed: {e}");
-                None
-            }
-        };
+        // TODO(reporting): backlog gauge removed. count_redo_records() =
+        // `COUNT(*) FROM SYS_EVAL_QUEUE` (full table scan) and dominated DB user
+        // CPU at billion-record scale (~25% of total worker_time). Emptiness/drain is
+        // already detected by the fetcher's get_redo_record() coming back empty.
+        // Restore backlog via a cheap source (engine redo counters or DB-side
+        // metadata rowcount) — do NOT reintroduce the COUNT(*) scan.
+        let backlog: Option<i64> = None;
 
         let now = Instant::now();
         let dt = now.duration_since(last_status_at).as_secs_f64().max(0.001);

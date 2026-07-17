@@ -25,7 +25,7 @@
 //! stale-config error at once, the first reinitializes and the other 11 observe
 //! `active == default` under the lock and skip — no stacked reinit calls.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,15 @@ use tracing::{info, warn};
 /// Serializes the actual `reinitialize` so concurrent stale-config errors do not
 /// stack reinit calls. The double-check inside is what makes it correct.
 static REINIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// The registered default config id this process has actually reinitialized onto
+/// (0 = none applied yet). Drift is detected by comparing the current registered
+/// default against THIS, NOT against `get_active_config_id()`: on the settings-JSON
+/// (default-config) init path the engine's `Sz_getActiveConfigID` reports 0 even
+/// after a successful `reinitialize`, so keying off it made every poll see
+/// "active(0) != default" and reinitialize forever (a ~60s reinit storm). Tracking
+/// what we applied here makes reinit fire exactly once per real default change.
+static LAST_APPLIED: AtomicI64 = AtomicI64::new(0);
 
 /// Millis-since-[`poll_base`] of the last periodic default-config check claimed
 /// by SOME thread in this process (0 = never).
@@ -98,30 +107,41 @@ pub fn reinit_if_stale(env: &SzEnvironmentCore) -> bool {
     }
 }
 
-/// Cheap active-vs-default pre-check outside the lock; if stale, take the
-/// process-global lock and RE-CHECK before reinitializing (double-checked, so
-/// concurrent callers do not stack reinit calls). Returns `Ok(true)` iff the
-/// config was stale at entry (a reinit was warranted — performed here or by a
-/// peer), `Ok(false)` if already current.
+/// Cheap applied-vs-default pre-check outside the lock; if the registered default
+/// differs from what this process last applied, take the process-global lock and
+/// RE-CHECK before reinitializing (double-checked, so concurrent callers do not
+/// stack reinit calls). Returns `Ok(true)` iff a reinit was warranted at entry
+/// (performed here or by a peer), `Ok(false)` if already current.
+///
+/// Drift is measured against [`LAST_APPLIED`] — the id we last reinitialized onto —
+/// NOT `get_active_config_id()`, which reports 0 on this init path and would make
+/// every poll reinitialize forever (see the static's doc).
 fn reconcile(env: &SzEnvironmentCore) -> Result<bool, SzError> {
-    // Each id read is one SQL select; the pre-check keeps the common (current)
-    // case off the lock entirely.
-    let active = env.get_active_config_id()?;
+    // One SQL select for the registered default; the pre-check keeps the common
+    // (unchanged) case off the lock entirely.
     let default = env.get_config_manager()?.get_default_config_id()?;
-    if active == default {
+    if LAST_APPLIED.load(Ordering::Relaxed) == default {
         return Ok(false);
     }
 
     let _guard = REINIT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    // Re-check under the lock: a peer may have reinitialized while we waited.
-    let active = env.get_active_config_id()?;
+    // Re-read under the lock: a peer may have applied it while we waited.
     let default = env.get_config_manager()?.get_default_config_id()?;
-    if active != default {
+    let prev = LAST_APPLIED.load(Ordering::Relaxed);
+    if prev != default {
         env.reinitialize(default)?;
-        // Log EVERY refresh with both the old and new config IDs (Master
-        // directive): this line is the audit trail that a live config change
-        // propagated to this process.
-        info!("CONFIG REFRESHED: engine reinitialized from config {active} -> {default}");
+        // Record what we applied only AFTER a successful reinit, so a failed
+        // reinit is retried on the next poll rather than silently skipped.
+        LAST_APPLIED.store(default, Ordering::Relaxed);
+        // Audit trail that a live config change propagated to this process.
+        info!("CONFIG REFRESHED: engine reinitialized from config {prev} -> {default}");
+        // DIAGNOSTIC: does reinitialize() preserve the license? If recordLimit here
+        // flips to a small demo value (e.g. 500), reinit dropped the init-JSON
+        // LICENSESTRINGBASE64 and the engine fell back to the demo license.
+        match env.get_product().and_then(|p| p.get_license()) {
+            Ok(lic) => info!("LICENSE AFTER REINIT: {lic}"),
+            Err(e) => warn!("get_license after reinit failed: {e}"),
+        }
     }
     Ok(true)
 }
