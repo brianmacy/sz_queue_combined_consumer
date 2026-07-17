@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased — remove count_redo anti-pattern; shutdown wedge fix; config/license diagnostics (2026-07-17)
+
+* **`src/combined.rs`, `src/pure_redoer.rs` — removed `count_redo_records()`.** It issued
+  `COUNT(*) FROM SYS_EVAL_QUEUE` (a full table scan) once per stats interval, which dominated
+  DB user-CPU at scale. The redo-backlog gauge now reports `None` with a
+  `TODO(reporting)` to restore it via a cheap source (engine redo counters or a DB-side
+  estimate) rather than a full scan.
+* **`src/main.rs` — shutdown wedge fix (both `run_combined` and `run_pure_redoer`).** On the
+  leak-on-exit path (a worker still stuck in an uninterruptible libSz FFI call at shutdown),
+  force `std::process::exit(255)` instead of returning `ExitCode`. Returning would run the
+  tokio-runtime and `Arc<env>` drops, which can wedge on the stuck thread so the process never
+  exits and the container never restarts; a hard exit lets the OS reclaim everything and
+  restart-on-failure bring up a clean instance.
+* **`src/config_reload.rs` — `reconcile()` now keys off `get_active_config_id()`** (the engine's
+  real state) instead of the process-local `LAST_APPLIED` sentinel, which has been removed
+  along with its `AtomicI64`. Refresh logging now records the active id before and after the
+  reinitialize so a no-op reinit is visible.
+* **Config/license diagnostics** — added `log_startup_config()` (logs `CONFIG AT INIT:
+  active=… default=…` once per process after init), called from `combined.rs` and
+  `pure_redoer.rs`; plus `LICENSE AFTER INIT` / `LICENSE AFTER REINIT` logging to detect a
+  license drop across `reinitialize`.
+
 ## Unreleased — live config auto-reload (2026-07-16)
 
 * **`src/config_reload.rs` (new)** — adopt a new registered DEFAULT engine config WITHOUT a

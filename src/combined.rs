@@ -107,6 +107,10 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
         Ok(lic) => tracing::info!("LICENSE AFTER INIT: {lic}"),
         Err(e) => tracing::warn!("get_license after init failed: {e}"),
     }
+    // Log the engine's active-config-id vs the registered default at startup, so we
+    // can see whether the first reconcile reinit is real (active != default) — keyed
+    // on get_active_config_id(), the engine's true state.
+    crate::config_reload::log_startup_config(&env);
     let url = config
         .url
         .clone()

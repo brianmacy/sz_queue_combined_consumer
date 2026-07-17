@@ -76,25 +76,30 @@ fn run_pure_redoer(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
     let (workers_clean, result) = pure_redoer::run(&config, env);
 
     // Use-after-free guard (redoer FIX-3): only destroy the global Senzing
-    // environment if EVERY worker finished within the shutdown grace window;
-    // otherwise skip teardown and let process exit reclaim resources.
+    // environment if EVERY worker finished within the shutdown grace window.
     if workers_clean {
         if let Err(e) = SzEnvironmentCore::destroy_global_instance() {
             tracing::warn!("Error during Senzing environment teardown: {e}");
         }
-    } else {
-        tracing::warn!(
-            "Skipping Senzing environment teardown: a worker is still running an \
-             uninterruptible engine call; letting process exit reclaim resources"
-        );
-    }
-
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("{e:#}");
-            ExitCode::from(255)
+        match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e:#}");
+                ExitCode::from(255)
+            }
         }
+    } else {
+        // A worker is stuck in an uninterruptible engine call — force a hard exit
+        // rather than risk wedging on Arc<env>/thread drops (see run_combined). The
+        // OS reclaims everything; restart-on-failure restarts a clean instance.
+        if let Err(e) = &result {
+            eprintln!("{e:#}");
+        }
+        tracing::warn!(
+            "worker still in an uninterruptible engine call at shutdown; forcing hard \
+             process exit (restart-on-failure restarts clean)"
+        );
+        std::process::exit(255);
     }
 }
 
@@ -127,30 +132,41 @@ fn run_combined(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
     match &result {
         Ok(outcome) => {
             if outcome.all_workers_joined {
+                // Clean: every worker finished within the grace window -> safe to
+                // destroy the env and return normally.
                 if let Err(e) = SzEnvironmentCore::destroy_global_instance() {
                     tracing::warn!("error destroying Senzing environment: {e}");
                 }
-            } else {
-                tracing::warn!(
-                    "skipping Senzing environment destroy: a worker may still be in an \
-                     engine call (leak-on-exit to avoid use-after-free)"
-                );
-            }
-            match &outcome.fatal {
-                None => ExitCode::SUCCESS,
-                Some(msg) => {
-                    eprintln!("Shutting down due to error: {msg}");
-                    ExitCode::from(255)
+                match &outcome.fatal {
+                    None => ExitCode::SUCCESS,
+                    Some(msg) => {
+                        eprintln!("Shutting down due to error: {msg}");
+                        ExitCode::from(255)
+                    }
                 }
+            } else {
+                // A worker did NOT finish within the grace window — it is stuck in an
+                // uninterruptible libSz FFI call. Returning normally here would run the
+                // tokio-runtime and Arc<env> drops, which can WEDGE on that stuck thread
+                // so the process never exits and the container never restarts (observed:
+                // "Shutting down" logged, then a hung "Up" that restart-on-failure can't
+                // recover). Force an immediate hard exit: the OS reclaims everything (no
+                // use-after-free — the whole process is gone) and restart:on-failure
+                // brings up a clean instance.
+                if let Some(msg) = &outcome.fatal {
+                    eprintln!("Shutting down due to error: {msg}");
+                }
+                tracing::warn!(
+                    "workers still in engine calls at shutdown; forcing hard process exit \
+                     (skip env destroy; restart-on-failure restarts clean)"
+                );
+                std::process::exit(255);
             }
         }
         Err(e) => {
-            tracing::warn!(
-                "skipping Senzing environment destroy after run() error \
-                 (leak-on-exit to avoid use-after-free)"
-            );
             eprintln!("{e:#}");
-            ExitCode::from(255)
+            tracing::warn!("run() failed at startup; forcing hard process exit");
+            std::process::exit(255);
         }
     }
 }

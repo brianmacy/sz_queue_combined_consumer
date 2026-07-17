@@ -40,6 +40,8 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
         "Pure redoer (redo% = 100): {n_workers} workers, no AMQP connection, \
          no tokio runtime"
     );
+    // Log active-config-id vs default at startup (diagnostic; see combined.rs).
+    crate::config_reload::log_startup_config(&env);
 
     // Channel capacity |B| + 2 with |B| = N at this endpoint (design §2.3):
     // small on purpose — fetched-but-unprocessed redo records are lost on
