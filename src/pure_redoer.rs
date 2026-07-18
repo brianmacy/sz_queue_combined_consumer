@@ -28,8 +28,8 @@ use crate::worker::{
 /// EWMA smoothing for the redo-backlog slope (same as the mixed path).
 const SLOPE_EWMA_ALPHA: f64 = 0.3;
 
-/// Runs the pure-redoer topology until SIGINT/SIGTERM (installed by `main`
-/// via `ctrlc`, which flips [`RUNNING`]) or a fatal error.
+/// Runs the pure-redoer topology until SIGINT/SIGTERM (handled by `main`'s
+/// dedicated `sigwait` thread, which flips [`RUNNING`]) or a fatal error.
 ///
 /// Returns `(workers_clean, result)`: `workers_clean` is `true` iff every
 /// engine thread finished within the shutdown grace window; when `false`,

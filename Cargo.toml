@@ -25,11 +25,12 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ctrlc = { version = "3", features = ["termination"] }
 num_cpus = "1"
-# `_exit(2)` for the shutdown path: terminate WITHOUT running libc atexit(3)
-# handlers / C++ static destructors, which is where the native Senzing engine
-# teardown wedges on SIGTERM (issue #4). Already in the tree transitively.
+# Signal handling (block-before-init + dedicated sigwait thread) and `_exit(2)`
+# for the shutdown path: terminate WITHOUT running libc atexit(3) handlers / C++
+# static destructors, which is where the native Senzing engine teardown wedges on
+# SIGTERM (issue #4). Replaces the previous `ctrlc` handler, which never fired
+# because libSz's `Sz_init` interferes with per-handler signal delivery.
 libc = "0.2"
 
 [profile.release]

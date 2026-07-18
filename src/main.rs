@@ -39,30 +39,79 @@ use sz_rabbit_combined_consumer::{INSTANCE_NAME, combined, pure_redoer, stats};
 /// 30s test grace and the sibling drivers' 10s worker-join grace.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Remove SIGTERM/SIGINT/SIGHUP from the calling (main) thread's blocked signal
-/// set so the graceful-shutdown handlers can actually fire (issue #4).
+/// Build the SIGTERM/SIGINT/SIGHUP signal set used for both the process-wide
+/// block and the dedicated `sigwait` thread.
 ///
-/// `SzEnvironmentCore::get_instance` (native `Sz_init`) blocks these signals in
-/// the process mask; because a blocked signal is never delivered, the tokio /
-/// ctrlc handlers installed afterwards would otherwise never run and the driver
-/// would ignore SIGTERM entirely (running until the test's SIGKILL). We unblock
-/// on the MAIN thread only — that is enough for a process-directed `kill` to be
-/// delivered here — and every worker / runtime / handler thread spawned later
-/// inherits this unblocked mask. Idempotent and harmless if nothing blocked them.
-fn unblock_termination_signals() {
-    // SAFETY: standard POSIX signal-set manipulation on a stack-local sigset_t,
-    // then pthread_sigmask (the correct call in a multithreaded process) to
-    // unblock. No pointers escape; all args are valid for the call's duration.
+/// SAFETY: writes only to the caller-owned `set`; standard POSIX sigset ops.
+unsafe fn termination_sigset() -> libc::sigset_t {
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::sigaddset(&mut set, libc::SIGINT);
         libc::sigaddset(&mut set, libc::SIGHUP);
-        let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+    }
+    set
+}
+
+/// Install robust termination-signal shutdown that survives the native Senzing
+/// library's signal interference (issue #4).
+///
+/// PR #5 bounded the teardown and PR #7 tried to *unblock* the signals after
+/// `Sz_init`, but the driver STILL ignored SIGTERM (ran to the test's SIGKILL,
+/// no "shutting down" line ever logged): ordinary handlers (tokio `signal::unix`,
+/// `ctrlc`) installed after `Sz_init` never fired. The only mechanism-independent
+/// fix is to BLOCK these signals on the main thread BEFORE `Sz_init`, so every
+/// thread libSz / tokio / our workers spawn inherits the block and can neither
+/// steal nor mask them, then consume them synchronously on ONE dedicated thread
+/// via `sigwait(2)`. On receipt we flip [`RUNNING`]; both driver loops poll it and
+/// then exit through the bounded teardown. This is the canonical pattern for a
+/// process whose native dependency manipulates signal state.
+///
+/// MUST be called before `get_instance` and before any other thread is spawned.
+fn install_signal_shutdown() {
+    // SAFETY: block the termination signals on the main thread; threads spawned
+    // afterwards inherit this mask, so the signals are delivered to no handler and
+    // are instead dequeued by our `sigwait` below.
+    unsafe {
+        let set = termination_sigset();
+        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
         if rc != 0 {
-            tracing::warn!("pthread_sigmask(SIG_UNBLOCK) failed (rc={rc}); SIGTERM may be ignored");
+            tracing::warn!("pthread_sigmask(SIG_BLOCK) failed (rc={rc}); SIGTERM may be ignored");
         }
+    }
+
+    let spawned = std::thread::Builder::new()
+        .name("sz-signal".to_string())
+        .spawn(signal_wait_loop);
+
+    if let Err(e) = spawned {
+        // Could not spawn the dedicated waiter — unblock so the OS default
+        // (terminate) applies rather than silently ignoring SIGTERM forever.
+        tracing::warn!("could not spawn signal thread ({e}); unblocking for default terminate");
+        unsafe {
+            let set = termination_sigset();
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Dedicated thread: synchronously wait for a termination signal and flip
+/// [`RUNNING`] so both driver shapes begin graceful shutdown. Loops so repeated
+/// signals are harmless.
+fn signal_wait_loop() {
+    // SAFETY: `sigwait` on the (already process-blocked) termination set; `sig`
+    // is a valid out-param.
+    let set = unsafe { termination_sigset() };
+    loop {
+        let mut sig: libc::c_int = 0;
+        let rc = unsafe { libc::sigwait(&set, &mut sig) };
+        if rc != 0 {
+            tracing::warn!("sigwait failed (rc={rc}); signal-shutdown thread exiting");
+            return;
+        }
+        tracing::warn!("received signal {sig}, shutting down gracefully");
+        RUNNING.store(false, Ordering::Relaxed);
     }
 }
 
@@ -152,6 +201,14 @@ fn main() -> ExitCode {
         }
     };
 
+    // CRITICAL (issue #4): install termination-signal shutdown BEFORE Sz_init.
+    // `get_instance` (libSz `Sz_init`) manipulates the process signal state such
+    // that handlers installed afterwards never fire; blocking the signals here
+    // (before any libSz/tokio/worker thread exists) and dequeuing them on a
+    // dedicated `sigwait` thread is immune to that interference. See
+    // `install_signal_shutdown`.
+    install_signal_shutdown();
+
     // Initialize the Senzing environment singleton: exactly ONE Sz_init per
     // process; every thread derives its own engine handle from it.
     let env: Arc<SzEnvironmentCore> = match SzEnvironmentCore::get_instance(
@@ -166,18 +223,6 @@ fn main() -> ExitCode {
         }
     };
 
-    // CRITICAL (issue #4): unblock the termination signals on the main thread
-    // AFTER the native engine has initialized. `SzEnvironmentCore::get_instance`
-    // (libSz `Sz_init`) leaves SIGTERM/SIGINT/SIGHUP BLOCKED in the process
-    // signal mask; a blocked signal is never delivered, so neither the tokio
-    // `signal::unix` handler (combined path) nor the `ctrlc` handler (pure-redoer
-    // path) — both installed AFTER this point — ever fires. That is why the e2e
-    // driver ran until SIGKILL with no "shutting down" line ever logged (the
-    // RUNNING flag was never flipped). Unblocking here restores delivery to the
-    // main thread; the worker / tokio / ctrlc threads are all spawned afterwards
-    // and inherit this unblocked mask.
-    unblock_termination_signals();
-
     if config.redo_percent == 100 {
         run_pure_redoer(config, env)
     } else {
@@ -185,16 +230,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// redo% = 100: pure std::thread shape; graceful shutdown via ctrlc
-/// (termination feature covers SIGTERM/SIGHUP as well as SIGINT).
+/// redo% = 100: pure std::thread shape. Graceful shutdown is driven by the
+/// dedicated `sigwait` thread (see `install_signal_shutdown`), which flips
+/// `RUNNING`; this loop and its workers poll it.
 fn run_pure_redoer(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
-    if let Err(e) = ctrlc::set_handler(|| {
-        tracing::warn!("Graceful shutdown requested");
-        RUNNING.store(false, Ordering::Relaxed);
-    }) {
-        tracing::warn!("Could not install signal handler: {e}");
-    }
-
     let (workers_clean, result) = pure_redoer::run(&config, env);
 
     let code = match result {

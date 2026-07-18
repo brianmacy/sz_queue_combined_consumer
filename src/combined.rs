@@ -229,11 +229,15 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
         .await
         .context("failed to start consuming")?;
 
-    // --- Signal handling -----------------------------------------------------
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("failed to install SIGINT handler")?;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("failed to install SIGTERM handler")?;
+    // --- Shutdown polling ----------------------------------------------------
+    // Termination signals are handled by the process-wide `sigwait` thread (see
+    // `main::install_signal_shutdown`), which flips `stats::RUNNING`. We poll that
+    // flag here instead of installing a tokio `signal::unix` handler, because
+    // libSz's `Sz_init` interferes with per-handler signal delivery so the tokio
+    // handler never fired (issue #4). 250ms is imperceptible against the shutdown
+    // grace yet reacts effectively instantly to SIGTERM.
+    let mut shutdown_poll = tokio::time::interval(Duration::from_millis(250));
+    shutdown_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // --- Stats thread (blocking get_stats / count_redo_records) --------------
     let stats_env = env.clone();
@@ -276,14 +280,13 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
         tokio::select! {
             biased;
 
-            // Signals: begin graceful shutdown.
-            _ = sigint.recv(), if !shutting_down => {
-                tracing::info!("SIGINT received, shutting down gracefully");
-                shutting_down = true;
-            }
-            _ = sigterm.recv(), if !shutting_down => {
-                tracing::info!("SIGTERM received, shutting down gracefully");
-                shutting_down = true;
+            // Termination signal (flipped by the sigwait thread): begin graceful
+            // shutdown. Polled because libSz breaks per-handler signal delivery.
+            _ = shutdown_poll.tick(), if !shutting_down => {
+                if !RUNNING.load(Ordering::Relaxed) {
+                    tracing::info!("shutdown signal received, shutting down gracefully");
+                    shutting_down = true;
+                }
             }
 
             // Wakeup optimization for fatal errors; the durable signal is the
