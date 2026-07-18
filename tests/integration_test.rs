@@ -454,7 +454,9 @@ fn run_combined_e2e(redo_percent: u8) {
         drained,
         "queue did not drain within timeout (redo%={redo_percent})\n{stdout}"
     );
-    let status = status.expect("driver did not exit within grace after SIGTERM");
+    let status = status.unwrap_or_else(|| {
+        panic!("driver did not exit within grace after SIGTERM (redo%={redo_percent})\n{stdout}")
+    });
     assert!(
         status.success(),
         "driver exited non-zero (redo%={redo_percent}): {status:?}\n{stdout}"
@@ -560,7 +562,8 @@ fn e2e_pure_redoer_100pct() {
     let _ = std::fs::File::open(&out_path).and_then(|mut f| f.read_to_string(&mut stdout));
     let _ = std::fs::remove_file(&out_path);
 
-    let status = status.expect("pure redoer did not exit within grace after SIGTERM");
+    let status = status
+        .unwrap_or_else(|| panic!("pure redoer did not exit within grace after SIGTERM\n{stdout}"));
     assert!(
         status.success(),
         "pure redoer exited non-zero: {status:?}\n{stdout}"
@@ -788,7 +791,9 @@ fn e2e_truthset_resolution_and_redo_drain() {
         drained_load,
         "load queue did not drain within timeout\n{stdout_a}"
     );
-    let status_a = status_a.expect("Phase A driver did not exit within grace after SIGTERM");
+    let status_a = status_a.unwrap_or_else(|| {
+        panic!("Phase A driver did not exit within grace after SIGTERM\n{stdout_a}")
+    });
     assert!(
         status_a.success(),
         "Phase A (redo%=0 load) exited non-zero: {status_a:?}\n{stdout_a}"
@@ -854,7 +859,9 @@ fn e2e_truthset_resolution_and_redo_drain() {
     let _ = std::fs::File::open(&out_b).and_then(|mut f| f.read_to_string(&mut stdout_b));
     let _ = std::fs::remove_file(&out_b);
 
-    let status_b = status_b.expect("Phase B pure redoer did not exit within grace after SIGTERM");
+    let status_b = status_b.unwrap_or_else(|| {
+        panic!("Phase B pure redoer did not exit within grace after SIGTERM\n{stdout_b}")
+    });
     assert!(
         status_b.success(),
         "Phase B (redo%=100 pure redoer) exited non-zero: {status_b:?}\n{stdout_b}"

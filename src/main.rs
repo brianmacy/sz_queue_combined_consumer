@@ -32,24 +32,49 @@ use sz_rabbit_combined_consumer::{INSTANCE_NAME, combined, pure_redoer, stats};
 /// exercised by the e2e integration tests it can BLOCK indefinitely: once the
 /// worker threads that made engine calls have exited, the engine's per-thread DB
 /// connections / native state outlive them and `Sz_destroy()` wedges cleaning
-/// them up, so the process never exits and overruns `docker stop`'s SIGTERM
-/// grace (issue #4: "driver hangs >30s on SIGTERM shutdown"). We therefore run
+/// them up (issue #4: "driver hangs >30s on SIGTERM shutdown"). We therefore run
 /// the teardown on a dedicated thread and wait only up to this bound; past it the
 /// process is exiting anyway, so we hard-exit and let the OS reclaim native
 /// resources (no use-after-free — the whole process is gone). Kept well under the
 /// 30s test grace and the sibling drivers' 10s worker-join grace.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Terminate the process IMMEDIATELY with `code`, bypassing libc `atexit(3)`
+/// handlers and C++ static destructors.
+///
+/// This is the crux of the issue #4 fix. PR #5 bounded the EXPLICIT
+/// `destroy_global_instance()` call, but the process still hung >30s on SIGTERM
+/// in ALL modes. Root cause: `std::process::exit` calls the C library `exit(3)`,
+/// which runs `atexit` handlers and the **C++ static destructors registered by
+/// the native Senzing library (libSz)** — and those perform the very same engine
+/// teardown that PR #5 found wedges. So bounding the explicit destroy and then
+/// calling `process::exit` merely RELOCATED the identical hang into `exit()`'s
+/// static-destructor phase, which nothing bounds. Every mode (tokio combined and
+/// pure-std redoer) funnels through here, which is why every mode hung.
+///
+/// `_exit(2)` returns the process to the OS at once WITHOUT running any of that
+/// cleanup, so a wedged native teardown can never overrun the SIGTERM grace. We
+/// flush Rust's buffered stdout first (both `process::exit` and `_exit` would
+/// otherwise drop the final "Processed total ..." line the e2e tests scrape;
+/// `_exit` does not flush C stdio either, but we only write via Rust here).
+fn hard_exit(code: u8) -> ! {
+    let _ = std::io::stdout().flush();
+    // SAFETY: `_exit` is async-signal-safe and simply terminates the process
+    // with the given status. Nothing we still need Rust or C to run remains —
+    // that is precisely the point (see the doc comment).
+    unsafe { libc::_exit(code as i32) }
+}
+
 /// Tear the native Senzing environment down (best effort, time-bounded) and then
-/// terminate the process with `code` — GUARANTEEING a prompt exit within the
-/// SIGTERM grace regardless of whether `Sz_destroy()`, the tokio runtime drop, or
-/// any `Arc<env>` drop would otherwise wedge (issue #4).
+/// terminate the process with `code` via [`hard_exit`] — GUARANTEEING a prompt
+/// exit within the SIGTERM grace regardless of whether `Sz_destroy()`, the tokio
+/// runtime drop, or any `Arc<env>` drop would otherwise wedge (issue #4).
 ///
 /// `destroy_global_instance()` is attempted on a dedicated thread; if it has not
 /// returned within [`TEARDOWN_GRACE`] we stop waiting and hard-exit. `Sz_destroy`
-/// may still be running on that detached thread, but `process::exit` reclaims it
-/// along with the rest of the process — the same leak-on-exit trade the drivers
-/// already accept when a worker is stuck in an uninterruptible engine call.
+/// may still be running on that detached thread, but `_exit` reclaims it along
+/// with the rest of the process — the same leak-on-exit trade the drivers already
+/// accept when a worker is stuck in an uninterruptible engine call.
 ///
 /// Only ever called AFTER the workers/fetcher have been joined (or deliberately
 /// detached) and stdout has the final totals, so exiting here loses nothing.
@@ -77,10 +102,7 @@ fn teardown_and_exit(code: u8) -> ! {
         Err(e) => tracing::warn!("could not spawn teardown thread ({e}); forcing process exit"),
     }
 
-    // Flush stdout so the final "Processed total ..." line the e2e tests scrape is
-    // never lost to process::exit skipping Rust's buffered-writer drop.
-    let _ = std::io::stdout().flush();
-    std::process::exit(code as i32);
+    hard_exit(code);
 }
 
 fn main() -> ExitCode {
@@ -155,8 +177,7 @@ fn run_pure_redoer(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
             "worker still in an uninterruptible engine call at shutdown; skipping \
              native teardown and forcing process exit (restart-on-failure restarts clean)"
         );
-        let _ = std::io::stdout().flush();
-        std::process::exit(code as i32);
+        hard_exit(code);
     }
 }
 
@@ -205,8 +226,7 @@ fn run_combined(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
                     "skipping Senzing environment destroy: a worker may still be in an \
                      engine call (leak-on-exit to avoid use-after-free); forcing process exit"
                 );
-                let _ = std::io::stdout().flush();
-                std::process::exit(code as i32);
+                hard_exit(code);
             }
         }
         Err(e) => {
@@ -214,8 +234,7 @@ fn run_combined(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
             tracing::warn!(
                 "run() failed; skipping native teardown (leak-on-exit) and forcing process exit"
             );
-            let _ = std::io::stdout().flush();
-            std::process::exit(255);
+            hard_exit(255);
         }
     }
 }
