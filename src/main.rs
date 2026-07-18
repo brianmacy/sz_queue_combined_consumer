@@ -10,9 +10,12 @@
 //! global Senzing environment is destroyed ONLY when every engine thread
 //! finished within the shutdown grace; otherwise we leak-on-exit deliberately.
 
+use std::io::Write;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use clap::Parser;
 use sz_rust_sdk::prelude::*;
@@ -21,6 +24,64 @@ use tracing_subscriber::{EnvFilter, fmt};
 use sz_rabbit_combined_consumer::config::{Args, Config};
 use sz_rabbit_combined_consumer::stats::RUNNING;
 use sz_rabbit_combined_consumer::{INSTANCE_NAME, combined, pure_redoer, stats};
+
+/// Upper bound on the native environment teardown at shutdown.
+///
+/// `SzEnvironmentCore::destroy_global_instance()` calls `Sz_destroy()`, an
+/// uninterruptible native FFI call with no timeout. On the SIGTERM shutdown path
+/// exercised by the e2e integration tests it can BLOCK indefinitely: once the
+/// worker threads that made engine calls have exited, the engine's per-thread DB
+/// connections / native state outlive them and `Sz_destroy()` wedges cleaning
+/// them up, so the process never exits and overruns `docker stop`'s SIGTERM
+/// grace (issue #4: "driver hangs >30s on SIGTERM shutdown"). We therefore run
+/// the teardown on a dedicated thread and wait only up to this bound; past it the
+/// process is exiting anyway, so we hard-exit and let the OS reclaim native
+/// resources (no use-after-free — the whole process is gone). Kept well under the
+/// 30s test grace and the sibling drivers' 10s worker-join grace.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Tear the native Senzing environment down (best effort, time-bounded) and then
+/// terminate the process with `code` — GUARANTEEING a prompt exit within the
+/// SIGTERM grace regardless of whether `Sz_destroy()`, the tokio runtime drop, or
+/// any `Arc<env>` drop would otherwise wedge (issue #4).
+///
+/// `destroy_global_instance()` is attempted on a dedicated thread; if it has not
+/// returned within [`TEARDOWN_GRACE`] we stop waiting and hard-exit. `Sz_destroy`
+/// may still be running on that detached thread, but `process::exit` reclaims it
+/// along with the rest of the process — the same leak-on-exit trade the drivers
+/// already accept when a worker is stuck in an uninterruptible engine call.
+///
+/// Only ever called AFTER the workers/fetcher have been joined (or deliberately
+/// detached) and stdout has the final totals, so exiting here loses nothing.
+fn teardown_and_exit(code: u8) -> ! {
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let spawned = std::thread::Builder::new()
+        .name("sz-teardown".to_string())
+        .spawn(move || {
+            if let Err(e) = SzEnvironmentCore::destroy_global_instance() {
+                tracing::warn!("error destroying Senzing environment: {e}");
+            }
+            let _ = done_tx.send(());
+        });
+
+    match spawned {
+        // recv_timeout returns Err on both timeout AND a dropped sender (e.g. the
+        // teardown thread panicked); either way we have waited long enough.
+        Ok(_) => match done_rx.recv_timeout(TEARDOWN_GRACE) {
+            Ok(()) => tracing::info!("Senzing environment destroyed; exiting cleanly"),
+            Err(_) => tracing::warn!(
+                "native teardown did not complete within {TEARDOWN_GRACE:?}; forcing \
+                 process exit (OS reclaims native resources)"
+            ),
+        },
+        Err(e) => tracing::warn!("could not spawn teardown thread ({e}); forcing process exit"),
+    }
+
+    // Flush stdout so the final "Processed total ..." line the e2e tests scrape is
+    // never lost to process::exit skipping Rust's buffered-writer drop.
+    let _ = std::io::stdout().flush();
+    std::process::exit(code as i32);
+}
 
 fn main() -> ExitCode {
     // Logging: SENZING_LOG_LEVEL controls the default level (parity with the
@@ -75,26 +136,27 @@ fn run_pure_redoer(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
 
     let (workers_clean, result) = pure_redoer::run(&config, env);
 
-    // Use-after-free guard (redoer FIX-3): only destroy the global Senzing
-    // environment if EVERY worker finished within the shutdown grace window;
-    // otherwise skip teardown and let process exit reclaim resources.
-    if workers_clean {
-        if let Err(e) = SzEnvironmentCore::destroy_global_instance() {
-            tracing::warn!("Error during Senzing environment teardown: {e}");
-        }
-    } else {
-        tracing::warn!(
-            "Skipping Senzing environment teardown: a worker is still running an \
-             uninterruptible engine call; letting process exit reclaim resources"
-        );
-    }
-
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+    let code = match result {
+        Ok(()) => 0,
         Err(e) => {
             eprintln!("{e:#}");
-            ExitCode::from(255)
+            255
         }
+    };
+
+    // Use-after-free guard (redoer FIX-3): only destroy the global Senzing
+    // environment if EVERY worker finished within the shutdown grace window.
+    // Either way we terminate via `process::exit` so a wedged native teardown can
+    // never overrun the SIGTERM grace (issue #4).
+    if workers_clean {
+        teardown_and_exit(code);
+    } else {
+        tracing::warn!(
+            "worker still in an uninterruptible engine call at shutdown; skipping \
+             native teardown and forcing process exit (restart-on-failure restarts clean)"
+        );
+        let _ = std::io::stdout().flush();
+        std::process::exit(code as i32);
     }
 }
 
@@ -123,34 +185,37 @@ fn run_combined(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
 
     // Use-after-free guard (consumer FIX-2): only tear down the Senzing
     // environment when EVERY engine thread actually finished. A startup `Err`
-    // from `run()` is also treated conservatively as "do not destroy".
+    // from `run()` is also treated conservatively as "do not destroy". In every
+    // case we terminate via `process::exit` rather than returning: returning would
+    // drop the tokio runtime and `Arc<env>`, either of which can wedge on a stuck
+    // native thread and overrun the SIGTERM grace (issue #4).
     match &result {
         Ok(outcome) => {
-            if outcome.all_workers_joined {
-                if let Err(e) = SzEnvironmentCore::destroy_global_instance() {
-                    tracing::warn!("error destroying Senzing environment: {e}");
+            let code: u8 = match &outcome.fatal {
+                None => 0,
+                Some(msg) => {
+                    eprintln!("Shutting down due to error: {msg}");
+                    255
                 }
+            };
+            if outcome.all_workers_joined {
+                teardown_and_exit(code);
             } else {
                 tracing::warn!(
                     "skipping Senzing environment destroy: a worker may still be in an \
-                     engine call (leak-on-exit to avoid use-after-free)"
+                     engine call (leak-on-exit to avoid use-after-free); forcing process exit"
                 );
-            }
-            match &outcome.fatal {
-                None => ExitCode::SUCCESS,
-                Some(msg) => {
-                    eprintln!("Shutting down due to error: {msg}");
-                    ExitCode::from(255)
-                }
+                let _ = std::io::stdout().flush();
+                std::process::exit(code as i32);
             }
         }
         Err(e) => {
-            tracing::warn!(
-                "skipping Senzing environment destroy after run() error \
-                 (leak-on-exit to avoid use-after-free)"
-            );
             eprintln!("{e:#}");
-            ExitCode::from(255)
+            tracing::warn!(
+                "run() failed; skipping native teardown (leak-on-exit) and forcing process exit"
+            );
+            let _ = std::io::stdout().flush();
+            std::process::exit(255);
         }
     }
 }

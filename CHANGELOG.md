@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — fix SIGTERM shutdown hang (issue #4)
+
+* **`src/main.rs` — bound the native teardown and guarantee a prompt process exit
+  on every shutdown path.** The four e2e integration tests hung >30s on SIGTERM
+  and were SIGKILLed (never exiting 0). Root cause: on the CLEAN shutdown path
+  (all engine threads joined) both `run_combined` and `run_pure_redoer` called
+  `SzEnvironmentCore::destroy_global_instance()`, which invokes `Sz_destroy()` —
+  an uninterruptible native FFI call with no timeout that BLOCKS indefinitely once
+  the worker threads that made engine calls have exited (the engine's per-thread
+  DB connections / native state outlive them). This teardown was never exercised
+  in CI before: the sibling drivers have no spawn-binary + SIGTERM e2e tests, and
+  this suite only began running once PR #3 fixed the submodule checkout. The fix
+  runs `destroy_global_instance()` on a dedicated thread bounded by
+  `TEARDOWN_GRACE` (5s), then `std::process::exit(code)` with the correct code
+  (0 on clean success). Because we exit rather than return, the tokio-runtime drop
+  and `Arc<env>` drops (other candidate wedges called out in the issue) are also
+  bypassed. stdout is flushed first so the e2e-scraped "Processed total ..." line
+  is never lost. The not-joined leak-on-exit path likewise hard-exits with the
+  correct code.
+
 ## 0.1.0 (unreleased)
 
 Initial scaffold implementing the combined load+redo design
