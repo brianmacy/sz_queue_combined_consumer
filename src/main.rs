@@ -39,79 +39,47 @@ use sz_rabbit_combined_consumer::{INSTANCE_NAME, combined, pure_redoer, stats};
 /// 30s test grace and the sibling drivers' 10s worker-join grace.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// Build the SIGTERM/SIGINT/SIGHUP signal set used for both the process-wide
-/// block and the dedicated `sigwait` thread.
-///
-/// SAFETY: writes only to the caller-owned `set`; standard POSIX sigset ops.
-unsafe fn termination_sigset() -> libc::sigset_t {
-    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGTERM);
-        libc::sigaddset(&mut set, libc::SIGINT);
-        libc::sigaddset(&mut set, libc::SIGHUP);
-    }
-    set
+/// Async-signal-safe termination handler: flips [`RUNNING`] so both driver
+/// shapes begin graceful shutdown. A relaxed atomic store is one of the few
+/// operations permitted in a signal handler — nothing else runs here.
+extern "C" fn on_terminate(_sig: libc::c_int) {
+    RUNNING.store(false, Ordering::SeqCst);
 }
 
-/// Install robust termination-signal shutdown that survives the native Senzing
-/// library's signal interference (issue #4).
+/// Install SIGTERM/SIGINT/SIGHUP handlers that flip [`RUNNING`], registered
+/// BEFORE `Sz_init` (issue #4).
 ///
-/// PR #5 bounded the teardown and PR #7 tried to *unblock* the signals after
-/// `Sz_init`, but the driver STILL ignored SIGTERM (ran to the test's SIGKILL,
-/// no "shutting down" line ever logged): ordinary handlers (tokio `signal::unix`,
-/// `ctrlc`) installed after `Sz_init` never fired. The only mechanism-independent
-/// fix is to BLOCK these signals on the main thread BEFORE `Sz_init`, so every
-/// thread libSz / tokio / our workers spawn inherits the block and can neither
-/// steal nor mask them, then consume them synchronously on ONE dedicated thread
-/// via `sigwait(2)`. On receipt we flip [`RUNNING`]; both driver loops poll it and
-/// then exit through the bounded teardown. This is the canonical pattern for a
-/// process whose native dependency manipulates signal state.
+/// Root cause of the hang: the native Senzing engine takes over the termination
+/// signals during `Sz_init`, so any handler registered AFTERWARDS never fires —
+/// the driver ran to the test's SIGKILL with `RUNNING` never flipped and no
+/// "shutting down" line logged. This defeated PR #5 (bounded teardown), the
+/// unblock-after-init attempt, and a block-before-init + `sigwait` thread (the
+/// engine's init disrupts the blocked-signal mechanism `sigwait` relies on).
 ///
-/// MUST be called before `get_instance` and before any other thread is spawned.
+/// The fix follows Senzing's OWN documented pattern (the `signal_handler`
+/// initialization example registers `signal.signal(SIGINT, handler)` BEFORE
+/// building the factory): install a plain `sigaction` handler here, before
+/// `get_instance`, so it survives engine init. Both driver loops poll `RUNNING`;
+/// the process then drains and exits via the bounded teardown / `hard_exit`.
+///
+/// MUST be called before `get_instance`.
 fn install_signal_shutdown() {
-    // SAFETY: block the termination signals on the main thread; threads spawned
-    // afterwards inherit this mask, so the signals are delivered to no handler and
-    // are instead dequeued by our `sigwait` below.
+    // SAFETY: standard POSIX sigaction install on a stack-local struct; the
+    // handler is a plain `extern "C"` fn doing only an atomic store. No pointers
+    // escape the calls.
     unsafe {
-        let set = termination_sigset();
-        let rc = libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
-        if rc != 0 {
-            tracing::warn!("pthread_sigmask(SIG_BLOCK) failed (rc={rc}); SIGTERM may be ignored");
+        let mut action: libc::sigaction = std::mem::zeroed();
+        // Cast via a fn pointer (not a direct fn-item→int cast) to satisfy clippy.
+        action.sa_sigaction = on_terminate as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::sigemptyset(&mut action.sa_mask);
+        // SA_RESTART: let blocking syscalls resume; the driver loops poll RUNNING,
+        // so they observe shutdown without relying on EINTR.
+        action.sa_flags = libc::SA_RESTART;
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
+                tracing::warn!("sigaction({sig}) install failed; {sig} may be ignored");
+            }
         }
-    }
-
-    let spawned = std::thread::Builder::new()
-        .name("sz-signal".to_string())
-        .spawn(signal_wait_loop);
-
-    if let Err(e) = spawned {
-        // Could not spawn the dedicated waiter — unblock so the OS default
-        // (terminate) applies rather than silently ignoring SIGTERM forever.
-        tracing::warn!("could not spawn signal thread ({e}); unblocking for default terminate");
-        unsafe {
-            let set = termination_sigset();
-            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-        }
-    }
-}
-
-/// Dedicated thread: synchronously wait for a termination signal and flip
-/// [`RUNNING`] so both driver shapes begin graceful shutdown. Loops so repeated
-/// signals are harmless.
-fn signal_wait_loop() {
-    // SAFETY: `sigwait` on the (already process-blocked) termination set; `sig`
-    // is a valid out-param.
-    let set = unsafe { termination_sigset() };
-    loop {
-        let mut sig: libc::c_int = 0;
-        let rc = unsafe { libc::sigwait(&set, &mut sig) };
-        if rc != 0 {
-            tracing::warn!("sigwait failed (rc={rc}); signal-shutdown thread exiting");
-            return;
-        }
-        tracing::warn!("received signal {sig}, shutting down gracefully");
-        RUNNING.store(false, Ordering::Relaxed);
     }
 }
 
