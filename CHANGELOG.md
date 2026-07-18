@@ -2,25 +2,37 @@
 
 ## Unreleased — fix SIGTERM shutdown hang, take 2 (issue #4, reopened)
 
-* **`src/main.rs` — terminate via `_exit(2)` so the native library's atexit /
-  C++ static-destructor teardown can never wedge the exit.** PR #5 bounded the
-  EXPLICIT `destroy_global_instance()` call to `TEARDOWN_GRACE` and then called
-  `std::process::exit(code)` — but the four e2e tests STILL hung the full 30s
-  SIGTERM grace in every mode (tokio combined AND pure-std redoer). Root cause:
-  `std::process::exit` calls the C library `exit(3)`, which runs `atexit`
-  handlers and the **C++ static destructors registered by the native Senzing
-  library (libSz)**. Those perform the very same engine teardown that PR #5 found
-  wedges — so bounding the explicit destroy and then calling `process::exit`
-  merely RELOCATED the identical hang into `exit()`'s static-destructor phase,
-  which nothing bounds. Every shutdown path funnels through the terminal exit,
-  which is why every mode hung regardless of signal mechanism.
+* **`src/main.rs` — unblock SIGTERM/SIGINT/SIGHUP after engine init so the
+  shutdown handlers can fire (the actual root cause).** PR #5's bounded teardown
+  did not help because the driver never observed SIGTERM at all: the captured
+  child shutdown log (CI run 88091597511) shows every failing driver running its
+  normal loop right up to the 30s SIGKILL with **no `shutting down` line ever
+  logged** — the `RUNNING` flag was never flipped, in BOTH the tokio combined
+  path and the pure-std redoer path. `SzEnvironmentCore::get_instance` (native
+  `Sz_init`) leaves SIGTERM/SIGINT/SIGHUP **blocked in the process signal mask**;
+  a blocked signal is never delivered, so neither the tokio `signal::unix`
+  handler nor the `ctrlc` handler (both installed after engine init) ever ran.
+  The fix calls `pthread_sigmask(SIG_UNBLOCK, …)` for those three signals on the
+  main thread immediately after `get_instance`, before any worker / runtime /
+  handler thread is spawned (they inherit the unblocked mask). Senzing's own
+  `signal_handler.py` example installs its handler *before* the factory for the
+  same reason.
 
-  The fix introduces `hard_exit(code)`: flush Rust's stdout (preserving the
-  e2e-scraped "Processed total ..." line), then `libc::_exit(code)` — the raw
-  `_exit(2)` syscall wrapper, which returns the process to the OS AT ONCE without
-  running any atexit handler or static destructor. All terminal exits
+* **`src/main.rs` — terminate via `_exit(2)` so the native library's atexit /
+  C++ static-destructor teardown can never wedge the exit (complementary
+  hardening).** Even once the signal is observed, `std::process::exit` calls the
+  C library `exit(3)`, which runs `atexit` handlers and the C++ static
+  destructors registered by libSz — those perform the same engine teardown PR #5
+  found can wedge (the `Sz_destroy`-equivalent cleanup of per-thread native/DB
+  state). PR #5 bounded the EXPLICIT `destroy_global_instance()` call but then
+  still called `std::process::exit`, which would relocate that hang into
+  `exit()`'s static-destructor phase (nothing bounds it). The fix introduces
+  `hard_exit(code)`: flush Rust's stdout (preserving the e2e-scraped
+  "Processed total ..." line), then `libc::_exit(code)` — the raw `_exit(2)`
+  syscall wrapper, which returns the process to the OS AT ONCE without running
+  any atexit handler or static destructor. All terminal exits
   (`teardown_and_exit` and the leak-on-exit branches in both `run_combined` and
-  `run_pure_redoer`) now go through it. The best-effort bounded
+  `run_pure_redoer`) go through it. The best-effort bounded
   `destroy_global_instance()` attempt is retained for a clean DB checkpoint when
   it returns promptly; when it wedges we `_exit` after the grace — the same
   leak-on-exit trade already accepted for a stuck worker. Exit code is preserved

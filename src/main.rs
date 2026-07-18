@@ -39,6 +39,33 @@ use sz_rabbit_combined_consumer::{INSTANCE_NAME, combined, pure_redoer, stats};
 /// 30s test grace and the sibling drivers' 10s worker-join grace.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Remove SIGTERM/SIGINT/SIGHUP from the calling (main) thread's blocked signal
+/// set so the graceful-shutdown handlers can actually fire (issue #4).
+///
+/// `SzEnvironmentCore::get_instance` (native `Sz_init`) blocks these signals in
+/// the process mask; because a blocked signal is never delivered, the tokio /
+/// ctrlc handlers installed afterwards would otherwise never run and the driver
+/// would ignore SIGTERM entirely (running until the test's SIGKILL). We unblock
+/// on the MAIN thread only — that is enough for a process-directed `kill` to be
+/// delivered here — and every worker / runtime / handler thread spawned later
+/// inherits this unblocked mask. Idempotent and harmless if nothing blocked them.
+fn unblock_termination_signals() {
+    // SAFETY: standard POSIX signal-set manipulation on a stack-local sigset_t,
+    // then pthread_sigmask (the correct call in a multithreaded process) to
+    // unblock. No pointers escape; all args are valid for the call's duration.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigaddset(&mut set, libc::SIGHUP);
+        let rc = libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        if rc != 0 {
+            tracing::warn!("pthread_sigmask(SIG_UNBLOCK) failed (rc={rc}); SIGTERM may be ignored");
+        }
+    }
+}
+
 /// Terminate the process IMMEDIATELY with `code`, bypassing libc `atexit(3)`
 /// handlers and C++ static destructors.
 ///
@@ -138,6 +165,18 @@ fn main() -> ExitCode {
             return ExitCode::from(255);
         }
     };
+
+    // CRITICAL (issue #4): unblock the termination signals on the main thread
+    // AFTER the native engine has initialized. `SzEnvironmentCore::get_instance`
+    // (libSz `Sz_init`) leaves SIGTERM/SIGINT/SIGHUP BLOCKED in the process
+    // signal mask; a blocked signal is never delivered, so neither the tokio
+    // `signal::unix` handler (combined path) nor the `ctrlc` handler (pure-redoer
+    // path) — both installed AFTER this point — ever fires. That is why the e2e
+    // driver ran until SIGKILL with no "shutting down" line ever logged (the
+    // RUNNING flag was never flipped). Unblocking here restores delivery to the
+    // main thread; the worker / tokio / ctrlc threads are all spawned afterwards
+    // and inherit this unblocked mask.
+    unblock_termination_signals();
 
     if config.redo_percent == 100 {
         run_pure_redoer(config, env)
