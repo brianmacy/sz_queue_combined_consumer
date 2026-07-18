@@ -16,7 +16,7 @@
 # identical between the two repos; only the builder's source layout, the app
 # binary name in the final COPY, and the ENTRYPOINT differ.
 
-ARG SENZING_RUNTIME_IMAGE=senzing/senzingsdk-runtime:4.3.2
+ARG SENZING_RUNTIME_IMAGE=senzing/senzingsdk-runtime:4.3.3
 ARG RUST_IMAGE=rust:1.88
 
 # Global build args (declared before the first FROM so the backend-libs stage
@@ -29,7 +29,7 @@ ARG WITH_MSSQL=1
 # ONCE, so every COPY --from below pulls the SAME version. Override
 # SENZING_RUNTIME_IMAGE (e.g. --build-arg SENZING_RUNTIME_IMAGE=senzing/
 # senzingsdk-runtime:4.2.4) to rebuild the whole image against another engine
-# version. 4.2.4 / 4.3.2 / 4.4.0 runtimes are all Debian 13 (trixie, glibc
+# version. 4.2.4 / 4.3.3 / 4.4.0 runtimes are all Debian 13 (trixie, glibc
 # 2.41), so the cc-debian13 runtime base + debian/13 MS ODBC repo below hold
 # across versions. (Previously each COPY hardcoded :4.3.2.)
 # ---------------------------------------------------------------------------
@@ -147,7 +147,7 @@ RUN set -eu; \
 # ---------------------------------------------------------------------------
 # Stage 3: runtime — distroless. No interpreter, no apt, no shell.
 # ---------------------------------------------------------------------------
-# Runtime base MUST match the glibc of senzingsdk-runtime. As of 4.3.2 that base
+# Runtime base MUST match the glibc of senzingsdk-runtime. As of 4.3.3 that base
 # is Debian 13 (trixie, glibc 2.41), so cc-debian13 is required — cc-debian12
 # (glibc 2.36) fails at runtime with "GLIBC_2.38 not found" when the trixie-built
 # libpq is loaded. Verified empirically.

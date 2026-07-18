@@ -24,7 +24,7 @@ jobs:
     name: fmt + clippy
     runs-on: ubuntu-latest
     container:
-      image: senzing/senzingsdk-runtime:4.3.2
+      image: senzing/senzingsdk-runtime:4.3.3
       options: --user root
     steps:
       - name: Checkout code
@@ -61,7 +61,7 @@ jobs:
     name: Build (release)
     runs-on: ubuntu-latest
     container:
-      image: senzing/senzingsdk-runtime:4.3.2
+      image: senzing/senzingsdk-runtime:4.3.3
       options: --user root
     steps:
       - name: Checkout code
@@ -97,7 +97,7 @@ jobs:
     name: Integration Tests
     runs-on: ubuntu-latest
     container:
-      image: senzing/senzingsdk-runtime:4.3.2
+      image: senzing/senzingsdk-runtime:4.3.3
       options: --user root
     services:
       postgres:
