@@ -21,4 +21,7 @@ clap.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+# The shared runtime module (logging init + signal handler) used by every bin.
+tracing-subscriber.workspace = true
+ctrlc.workspace = true
 num_cpus.workspace = true

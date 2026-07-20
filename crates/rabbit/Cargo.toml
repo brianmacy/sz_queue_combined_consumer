@@ -22,8 +22,6 @@ futures-lite.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-ctrlc.workspace = true
 
 [dev-dependencies]
 # The integration test spawns the binary and drives a real RabbitMQ/engine.

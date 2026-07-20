@@ -1,0 +1,29 @@
+[package]
+name = "sz_sqs_combined_consumer"
+description = "Senzing combined load + redo driver, Amazon SQS backend (standard queues; one redo% knob). Shares the engine-processing core with the RabbitMQ driver."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sz_sqs_combined_consumer"
+path = "src/main.rs"
+
+[dependencies]
+sz-combined-consumer-core.workspace = true
+sz-rust-sdk.workspace = true
+tokio.workspace = true
+# SQS client. NO lapin here — this bin never compiles the AMQP stack.
+aws-config.workspace = true
+aws-sdk-sqs.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ctrlc.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+sz-rust-sdk.workspace = true

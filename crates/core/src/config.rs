@@ -137,30 +137,39 @@ pub struct Config {
     pub debug_trace: bool,
 }
 
+/// Reads and validates `SENZING_ENGINE_CONFIGURATION_JSON` from the environment.
+/// Shared by every backend binary (the RabbitMQ [`Config::resolve`] path and the
+/// SQS binary's own arg handling) so the required-env + valid-JSON checks stay in
+/// one place. Returns a loud, user-facing error string on failure.
+pub fn engine_config_from_env() -> Result<String, String> {
+    let engine_config = std::env::var("SENZING_ENGINE_CONFIGURATION_JSON")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            concat!(
+                "The environment variable SENZING_ENGINE_CONFIGURATION_JSON must be set ",
+                "with a proper JSON configuration.\n",
+                "Please see https://senzing.zendesk.com/hc/en-us/articles/",
+                "360038774134-G2Module-Configuration-and-the-Senzing-API"
+            )
+            .to_string()
+        })?;
+
+    // Validate the engine config as JSON at startup (both sibling drivers'
+    // behavior; a malformed blob otherwise fails deep inside Sz_init).
+    if serde_json::from_str::<serde_json::Value>(&engine_config).is_err() {
+        return Err("SENZING_ENGINE_CONFIGURATION_JSON is not valid JSON".to_string());
+    }
+    Ok(engine_config)
+}
+
 impl Config {
     /// Resolves the configuration from parsed [`Args`] plus the environment.
     ///
     /// Returns an error message string for any missing/invalid value so the
     /// caller can print it and exit non-zero (loud failure).
     pub fn resolve(args: Args) -> Result<Self, String> {
-        let engine_config = std::env::var("SENZING_ENGINE_CONFIGURATION_JSON")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                concat!(
-                    "The environment variable SENZING_ENGINE_CONFIGURATION_JSON must be set ",
-                    "with a proper JSON configuration.\n",
-                    "Please see https://senzing.zendesk.com/hc/en-us/articles/",
-                    "360038774134-G2Module-Configuration-and-the-Senzing-API"
-                )
-                .to_string()
-            })?;
-
-        // Validate the engine config as JSON at startup (both sibling drivers'
-        // behavior; a malformed blob otherwise fails deep inside Sz_init).
-        if serde_json::from_str::<serde_json::Value>(&engine_config).is_err() {
-            return Err("SENZING_ENGINE_CONFIGURATION_JSON is not valid JSON".to_string());
-        }
+        let engine_config = engine_config_from_env()?;
 
         if args.redo_percent > 100 {
             return Err(format!(

@@ -1,6 +1,10 @@
 [workspace]
-resolver = "2"
-members = ["crates/core", "crates/rabbit"]
+# resolver "3" is MSRV-aware: it selects dependency versions compatible with the
+# workspace rust-version (1.88), so the fast-moving AWS SDK (whose newest releases
+# require rustc 1.94+) resolves to the latest 1.88-compatible versions instead of
+# failing the build.
+resolver = "3"
+members = ["crates/core", "crates/rabbit", "crates/sqs"]
 
 [workspace.package]
 version = "0.2.0"
@@ -22,6 +26,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ctrlc = { version = "3", features = ["termination"] }
 num_cpus = "1"
 libc = "0.2"
+# SQS backend (crates/sqs only). aws-sdk-sqs is Apache-2.0.
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-sqs = "1"
 
 # sz-combined-consumer-core: the broker-agnostic engine-processing library shared
 # by every backend binary (RabbitMQ, SQS, ...).

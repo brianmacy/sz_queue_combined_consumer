@@ -31,6 +31,7 @@ pub mod file_loader;
 pub mod pure_redoer;
 pub mod record;
 pub mod redo;
+pub mod runtime;
 pub mod stats;
 pub mod worker;
 
