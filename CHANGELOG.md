@@ -1,18 +1,21 @@
 # Changelog
 
-## Unreleased — remove count_redo anti-pattern; shutdown wedge fix; config/license diagnostics (2026-07-17)
+## Unreleased — remove count_redo anti-pattern; config/license diagnostics (2026-07-17)
 
 * **`src/combined.rs`, `src/pure_redoer.rs` — removed `count_redo_records()`.** It issued
   `COUNT(*) FROM SYS_EVAL_QUEUE` (a full table scan) once per stats interval, which dominated
   DB user-CPU at scale. The redo-backlog gauge now reports `None` with a
   `TODO(reporting)` to restore it via a cheap source (engine redo counters or a DB-side
   estimate) rather than a full scan.
-* **`src/main.rs` — shutdown wedge fix (both `run_combined` and `run_pure_redoer`).** On the
-  leak-on-exit path (a worker still stuck in an uninterruptible libSz FFI call at shutdown),
-  force `std::process::exit(255)` instead of returning `ExitCode`. Returning would run the
-  tokio-runtime and `Arc<env>` drops, which can wedge on the stuck thread so the process never
-  exits and the container never restarts; a hard exit lets the OS reclaim everything and
-  restart-on-failure bring up a clean instance.
+* **`tests/integration_test.rs` — send SIGTERM via the `kill(2)` syscall, not the `kill`
+  binary (the actual reason Integration Tests had never gone green).** The
+  `senzing/senzingsdk-runtime` CI container ships NO `kill` executable on PATH, so the
+  `sigterm()` helper's `Command::new("kill")` failed with ENOENT — and the swallowed
+  `let _ = …` meant SIGTERM was silently never sent, so all four spawn-a-binary-and-SIGTERM
+  e2e tests hung to the 30s SIGKILL. `sigterm()` now calls `libc::kill()` directly and asserts
+  the syscall succeeds (no silent failure). This — not native teardown — was the root cause;
+  the `teardown_and_exit` hardening below (merged from `main`, PR #5) is retained as defensive
+  belt-and-suspenders for a genuinely wedging teardown in production.
 * **`src/config_reload.rs` — `reconcile()` keys off the registered DEFAULT changing**
   (`get_default_config_id()` vs an adopted-default sentinel), **not** `get_active_config_id()`.
   On the settings-JSON init path the engine returns `get_active_config_id()==0` even after a
@@ -50,6 +53,26 @@
 * Wired into `src/worker.rs` (`process_load`, `process_redo`) and `src/redo.rs` (fetcher loop).
 * Uses `SzEnvironment::reinitialize` (documented thread-safe; existing engine handles stay valid).
 * No new dep; env knob `SENZING_CONFIG_RELOAD_SECS` (default 60, `0` disables periodic; error-path stays on).
+
+## Unreleased — bound native teardown on shutdown (issue #4, merged from main / PR #5)
+
+* **`src/main.rs` — bound the native teardown and guarantee a prompt process exit
+  on every shutdown path.** The four e2e integration tests hung >30s on SIGTERM
+  and were SIGKILLed (never exiting 0). Root cause: on the CLEAN shutdown path
+  (all engine threads joined) both `run_combined` and `run_pure_redoer` called
+  `SzEnvironmentCore::destroy_global_instance()`, which invokes `Sz_destroy()` —
+  an uninterruptible native FFI call with no timeout that BLOCKS indefinitely once
+  the worker threads that made engine calls have exited (the engine's per-thread
+  DB connections / native state outlive them). This teardown was never exercised
+  in CI before: the sibling drivers have no spawn-binary + SIGTERM e2e tests, and
+  this suite only began running once PR #3 fixed the submodule checkout. The fix
+  runs `destroy_global_instance()` on a dedicated thread bounded by
+  `TEARDOWN_GRACE` (5s), then `std::process::exit(code)` with the correct code
+  (0 on clean success). Because we exit rather than return, the tokio-runtime drop
+  and `Arc<env>` drops (other candidate wedges called out in the issue) are also
+  bypassed. stdout is flushed first so the e2e-scraped "Processed total ..." line
+  is never lost. The not-joined leak-on-exit path likewise hard-exits with the
+  correct code.
 
 ## 0.1.0 (unreleased)
 
