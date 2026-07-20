@@ -23,7 +23,11 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use sz_combined_consumer_core::config::{Args, Config};
 use sz_combined_consumer_core::stats::RUNNING;
-use sz_combined_consumer_core::{INSTANCE_NAME, combined, file_loader, pure_redoer, stats};
+use sz_combined_consumer_core::{INSTANCE_NAME, file_loader, pure_redoer, stats};
+
+/// RabbitMQ ingestion loop (AMQP-specific; lives in this bin so `lapin` never
+/// compiles into the SQS binary).
+mod combined;
 
 /// Upper bound on the native environment teardown at shutdown.
 ///

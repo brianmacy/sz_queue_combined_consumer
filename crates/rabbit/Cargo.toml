@@ -15,6 +15,11 @@ path = "src/main.rs"
 sz-combined-consumer-core.workspace = true
 sz-rust-sdk.workspace = true
 tokio.workspace = true
+# lapin + futures-lite are RabbitMQ-only and live ONLY in this bin (combined.rs),
+# so the SQS binary never compiles them.
+lapin.workspace = true
+futures-lite.workspace = true
+anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -25,8 +30,4 @@ ctrlc.workspace = true
 # libc: send SIGTERM via kill(2) (the senzingsdk-runtime CI container has no
 # `kill` executable on PATH — Command::new("kill") would fail ENOENT).
 libc.workspace = true
-lapin.workspace = true
-tokio.workspace = true
-futures-lite.workspace = true
-anyhow.workspace = true
 sz-rust-sdk.workspace = true

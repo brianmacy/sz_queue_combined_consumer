@@ -2133,8 +2133,6 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
- "futures-lite",
- "lapin",
  "num_cpus",
  "serde_json",
  "sz-rust-sdk",
