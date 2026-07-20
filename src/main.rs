@@ -23,7 +23,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use sz_rabbit_combined_consumer::config::{Args, Config};
 use sz_rabbit_combined_consumer::stats::RUNNING;
-use sz_rabbit_combined_consumer::{INSTANCE_NAME, combined, pure_redoer, stats};
+use sz_rabbit_combined_consumer::{INSTANCE_NAME, combined, file_loader, pure_redoer, stats};
 
 /// Upper bound on the native environment teardown at shutdown.
 ///
@@ -117,10 +117,47 @@ fn main() -> ExitCode {
         }
     };
 
-    if config.redo_percent == 100 {
+    if config.input_file.is_some() {
+        run_file_loader(config, env)
+    } else if config.redo_percent == 100 {
         run_pure_redoer(config, env)
     } else {
         run_combined(config, env)
+    }
+}
+
+/// File-input mode: pure `std::thread` loader reading JSONL from a single file
+/// (no AMQP, no tokio). Graceful shutdown via ctrlc, same as the pure redoer.
+fn run_file_loader(config: Config, env: Arc<SzEnvironmentCore>) -> ExitCode {
+    if let Err(e) = ctrlc::set_handler(|| {
+        tracing::warn!("Graceful shutdown requested");
+        RUNNING.store(false, Ordering::Relaxed);
+    }) {
+        tracing::warn!("Could not install signal handler: {e}");
+    }
+
+    let (workers_clean, result) = file_loader::run(&config, env);
+
+    let code = match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e:#}");
+            255
+        }
+    };
+
+    // Use-after-free guard: destroy the environment only if every worker
+    // finished within the grace; either way exit via the bounded teardown so a
+    // wedged native teardown cannot overrun the SIGTERM grace (issue #4).
+    if workers_clean {
+        teardown_and_exit(code);
+    } else {
+        tracing::warn!(
+            "worker still in an uninterruptible engine call at shutdown; skipping \
+             native teardown and forcing process exit"
+        );
+        let _ = std::io::stdout().flush();
+        std::process::exit(code as i32);
     }
 }
 

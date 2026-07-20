@@ -28,6 +28,7 @@
 pub mod combined;
 pub mod config;
 pub mod config_reload;
+pub mod file_loader;
 pub mod pure_redoer;
 pub mod record;
 pub mod redo;

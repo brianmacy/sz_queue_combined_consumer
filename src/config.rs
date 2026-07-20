@@ -47,6 +47,17 @@ pub struct Args {
     #[arg(short = 'q', long = "queue", env = "SENZING_RABBITMQ_QUEUE")]
     pub queue: Option<String>,
 
+    /// Load records from a single JSONL file instead of RabbitMQ (one JSON
+    /// record per line). Mutually exclusive with `--url`/`--queue`; file mode is
+    /// a pure loader (redo% is ignored).
+    #[arg(short = 'f', long = "file", env = "SENZING_INPUT_FILE")]
+    pub input_file: Option<String>,
+
+    /// In file mode, skip the first N physical lines before loading (resume an
+    /// interrupted load). Ignored unless `--file` is set.
+    #[arg(long = "skip-lines", env = "SENZING_SKIP_LINES", default_value_t = 0)]
+    pub skip_lines: u64,
+
     /// Share (%) of worker capacity preferring redo, in [0, 100].
     #[arg(
         long = "redo-percent",
@@ -108,10 +119,14 @@ pub struct Args {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub engine_config: String,
-    /// `Some` iff redo% < 100 (validated).
+    /// `Some` iff redo% < 100 AND not file mode (validated).
     pub url: Option<String>,
-    /// `Some` iff redo% < 100 (validated).
+    /// `Some` iff redo% < 100 AND not file mode (validated).
     pub queue: Option<String>,
+    /// `Some` selects file-input mode (pure loader) instead of RabbitMQ.
+    pub input_file: Option<String>,
+    /// File mode: physical lines to skip before loading (resume support).
+    pub skip_lines: u64,
     pub redo_percent: u8,
     pub threads: usize,
     pub prefetch: u16,
@@ -160,9 +175,25 @@ impl Config {
             args.threads_per_process
         };
 
-        let url = args.url.filter(|s| !s.is_empty());
-        let queue = args.queue.filter(|s| !s.is_empty());
-        validate_topology(threads, args.redo_percent, url.as_deref(), queue.as_deref())?;
+        let input_file = args.input_file.filter(|s| !s.is_empty());
+        let mut url = args.url.filter(|s| !s.is_empty());
+        let mut queue = args.queue.filter(|s| !s.is_empty());
+
+        if input_file.is_some() {
+            // File mode: pure loader from a file; AMQP topology does not apply.
+            if url.is_some() || queue.is_some() {
+                eprintln!(
+                    "warning: --file is set; ignoring --url/--queue (file mode is a pure loader)"
+                );
+                url = None;
+                queue = None;
+            }
+            if threads == 0 {
+                return Err("file mode requires at least 1 worker thread".to_string());
+            }
+        } else {
+            validate_topology(threads, args.redo_percent, url.as_deref(), queue.as_deref())?;
+        }
 
         let prefetch = args
             .prefetch
@@ -172,6 +203,8 @@ impl Config {
             engine_config,
             url,
             queue,
+            input_file,
+            skip_lines: args.skip_lines,
             redo_percent: args.redo_percent,
             threads,
             prefetch,

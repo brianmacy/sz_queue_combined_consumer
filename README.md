@@ -67,6 +67,8 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_THREADS_PER_PROCESS` (`--threads-per-process`) | **12** | worker pool size (0 → CPU count, compat foot-gun) |
 | `SENZING_AMQP_URL` (`-u`/`--url`) | required iff redo% < 100 | RabbitMQ URL |
 | `SENZING_RABBITMQ_QUEUE` (`-q`/`--queue`) | required iff redo% < 100 | source queue (must exist; passive declare) |
+| `SENZING_INPUT_FILE` (`-f`/`--file`) | none | load JSONL (one JSON record per line) from a single file instead of RabbitMQ. Pure loader (redo% ignored); mutually exclusive with `--url`/`--queue`. Exits 0 at EOF. |
+| `SENZING_SKIP_LINES` (`--skip-lines`) | 0 | file mode only: skip the first N physical lines. Resumes an interrupted load — the driver prints a safe `--skip-lines` offset (contiguous-completion watermark) at shutdown. |
 | `SENZING_PREFETCH` (`--prefetch`) | threads + 2 | `basic_qos` prefetch |
 | `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | diagnostic MQ depth probe cadence (not a correctness poll) |
 | `SENZING_REDO_SLEEP_TIME_IN_SECONDS` (`--redo-sleep-secs`) | 60 | fetcher pause on empty redo queue (auto-shortened to 2 s while redo is still in flight, for cascade drain) |
@@ -157,6 +159,22 @@ docker run --rm \
 the split topology on the same binary. **Benchmark parity:** the driver is part
 of the measured system; never compare engine versions across different drivers
 — validate at 0%/100% against the siblings first, then re-baseline.
+
+### File input (no RabbitMQ)
+
+Load a JSONL file directly — one JSON record per line — instead of consuming a
+queue:
+
+```console
+sz_rabbit_combined_consumer --file /data/records.jsonl
+```
+
+File mode is a pure loader (no redo processing; drain redo separately with a
+`--redo-percent 100` run). It runs to end-of-file and exits 0. Blank lines are
+skipped and unparseable lines are dead-lettered (logged and counted) without
+aborting the load. On completion — or on SIGTERM — it prints a safe resume
+offset; restart with `--skip-lines N` to continue where it stopped
+(`add_record` is idempotent, so an interrupted run is safe to resume).
 
 ## License
 

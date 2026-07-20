@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — file-input load mode + --skip-lines (2026-07-20)
+
+* **`src/file_loader.rs` (new) — load JSONL records from a single file instead of
+  RabbitMQ.** Selected by `--file`/`SENZING_INPUT_FILE` (mutually exclusive with
+  `--url`/`--queue`). Reuses the shared `worker::worker_loop` pool (load-preferring,
+  no redo): a reader thread feeds each line as a `LoadItem` keyed by absolute line
+  number; a consumer thread counts outcomes. Blank lines are skipped; unparseable
+  lines are dead-lettered (logged + counted) without aborting. Runs to EOF and exits
+  0. Pure `std::thread` shape (no AMQP, no tokio), same graceful-shutdown/bounded-
+  teardown exit path as the pure redoer.
+* **`--skip-lines N`/`SENZING_SKIP_LINES` — resume an interrupted load.** Skips the
+  first N physical lines. Because workers complete out of order, the driver tracks a
+  contiguous-completion watermark and prints a SAFE `--skip-lines` offset at
+  shutdown, so a resume never skips an unprocessed line (at most a few in-flight
+  lines past the watermark are reprocessed — `add_record` is idempotent).
+* Tests: `ResumeTracker` unit tests (watermark advance / out-of-order / stale) plus
+  `e2e_file_loader` (spawns the binary in file mode, asserts clean EOF exit, correct
+  add count, and dead-lettering of a malformed line).
+
 ## Unreleased — remove count_redo anti-pattern; config/license diagnostics (2026-07-17)
 
 * **`src/combined.rs`, `src/pure_redoer.rs` — removed `count_redo_records()`.** It issued
