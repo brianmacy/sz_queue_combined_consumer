@@ -1,0 +1,27 @@
+[package]
+name = "sz-combined-consumer-core"
+description = "Broker-agnostic Senzing load + redo engine-processing core (worker pool, redo mixing, stats, live config reload, file loader) shared by the RabbitMQ and SQS driver binaries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "sz_combined_consumer_core"
+path = "src/lib.rs"
+
+[dependencies]
+sz-rust-sdk.workspace = true
+tokio.workspace = true
+# lapin is a TEMPORARY core dependency: combined.rs (the AMQP run loop) still
+# lives here in the workspace-skeleton phase. It moves to crates/rabbit behind
+# the MessageSource trait in the next phase, at which point this line is removed
+# so the SQS binary never compiles lapin.
+lapin.workspace = true
+futures-lite.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+num_cpus.workspace = true

@@ -21,9 +21,9 @@ use clap::Parser;
 use sz_rust_sdk::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use sz_rabbit_combined_consumer::config::{Args, Config};
-use sz_rabbit_combined_consumer::stats::RUNNING;
-use sz_rabbit_combined_consumer::{INSTANCE_NAME, combined, file_loader, pure_redoer, stats};
+use sz_combined_consumer_core::config::{Args, Config};
+use sz_combined_consumer_core::stats::RUNNING;
+use sz_combined_consumer_core::{INSTANCE_NAME, combined, file_loader, pure_redoer, stats};
 
 /// Upper bound on the native environment teardown at shutdown.
 ///

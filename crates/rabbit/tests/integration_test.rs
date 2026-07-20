@@ -34,8 +34,8 @@
 
 use std::sync::Arc;
 
-use sz_rabbit_combined_consumer::config::{redo_preferring_count, validate_topology};
-use sz_rabbit_combined_consumer::record::{ErrorClass, ParseError, classify_error, parse_record};
+use sz_combined_consumer_core::config::{redo_preferring_count, validate_topology};
+use sz_combined_consumer_core::record::{ErrorClass, ParseError, classify_error, parse_record};
 use sz_rust_sdk::prelude::*;
 
 const INSTANCE: &str = "sz_rabbit_combined_consumer_it";

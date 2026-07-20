@@ -1,0 +1,32 @@
+[package]
+name = "sz_rabbit_combined_consumer"
+description = "Senzing combined load + redo driver, RabbitMQ backend (one redo% knob; subsumes sz_rabbit_consumer and sz_simple_redoer)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sz_rabbit_combined_consumer"
+path = "src/main.rs"
+
+[dependencies]
+sz-combined-consumer-core.workspace = true
+sz-rust-sdk.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ctrlc.workspace = true
+
+[dev-dependencies]
+# The integration test spawns the binary and drives a real RabbitMQ/engine.
+# libc: send SIGTERM via kill(2) (the senzingsdk-runtime CI container has no
+# `kill` executable on PATH — Command::new("kill") would fail ENOENT).
+libc.workspace = true
+lapin.workspace = true
+tokio.workspace = true
+futures-lite.workspace = true
+anyhow.workspace = true
+sz-rust-sdk.workspace = true

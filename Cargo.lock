@@ -2128,6 +2128,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sz-combined-consumer-core"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-lite",
+ "lapin",
+ "num_cpus",
+ "serde_json",
+ "sz-rust-sdk",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sz-rust-sdk"
 version = "0.1.0"
 source = "git+https://github.com/brianmacy/sz-rust-sdk?rev=b595ca4#b595ca48339288f47ae9d6fbb01005fef8cbb64b"
@@ -2150,8 +2165,7 @@ dependencies = [
  "futures-lite",
  "lapin",
  "libc",
- "num_cpus",
- "serde_json",
+ "sz-combined-consumer-core",
  "sz-rust-sdk",
  "tokio",
  "tracing",
