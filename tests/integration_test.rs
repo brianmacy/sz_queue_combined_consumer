@@ -360,11 +360,23 @@ fn driver_bin() -> &'static str {
 }
 
 /// Send SIGTERM to a child pid (the driver's graceful-shutdown trigger).
+///
+/// Uses the `kill(2)` syscall directly rather than shelling out to a `kill`
+/// binary. The `senzing/senzingsdk-runtime` CI container ships NO `kill`
+/// executable anywhere on PATH (util-linux provides none; no procps/busybox),
+/// so `Command::new("kill")` fails with ENOENT. The previous `let _ = ...`
+/// swallowed that error, so SIGTERM was silently never sent and every
+/// spawn-a-binary-and-SIGTERM e2e test hung to the 30s SIGKILL — the reason CI
+/// had never gone green. Fail LOUDLY if the syscall reports an error.
 fn sigterm(pid: u32) {
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .status();
+    // SAFETY: kill(2) with a valid pid and signal number; no memory involved.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(
+        rc,
+        0,
+        "kill(pid={pid}, SIGTERM) failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 /// Wait up to `grace` for the child to exit; SIGKILL + reap if it overruns.

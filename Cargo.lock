@@ -2149,6 +2149,7 @@ dependencies = [
  "ctrlc",
  "futures-lite",
  "lapin",
+ "libc",
  "num_cpus",
  "serde_json",
  "sz-rust-sdk",

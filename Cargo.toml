@@ -28,6 +28,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ctrlc = { version = "3", features = ["termination"] }
 num_cpus = "1"
 
+[dev-dependencies]
+# Test-only: send SIGTERM to a spawned driver via the kill(2) syscall instead of
+# shelling out to a `kill` binary. The senzingsdk-runtime CI container ships no
+# `kill` executable on PATH, so Command::new("kill") fails with ENOENT (see the
+# sigterm() helper in tests/integration_test.rs). Already in the tree at 0.2.186.
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = true
