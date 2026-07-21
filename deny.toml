@@ -19,6 +19,29 @@ ignore = [
     # Mitigation: We don't parse RFC 2822 formatted data in our code path
     # Plan: Monitor upstream releases, upgrade when tcp-stream/p12-keystore updates
     "RUSTSEC-2026-0009",
+
+    # === rustls-webpki 0.101.7 (SQS backend only) ===
+    # Chain: crates/sqs -> aws-config/aws-sdk-sqs -> aws-smithy-http-client 1.1.9
+    #        -> rustls 0.21 -> rustls-webpki 0.101.7.
+    # Blocked by MSRV: the patched TLS stack (rustls 0.23 / rustls-webpki
+    # 0.103.13+) arrives via aws-smithy-http-client >= 1.2.0, which requires
+    # rustc 1.94; this workspace pins rust-version = 1.88, so the MSRV-aware
+    # resolver selects aws-smithy-http-client 1.1.9 (rustls 0.21). Affects the
+    # SQS binary only — the RabbitMQ binary's rustls stack is already >= 0.103.13.
+    # Plan: drop these three once the workspace MSRV moves to >= 1.94 (then the
+    # newest AWS SDK + patched rustls resolve automatically).
+    #
+    # RUSTSEC-2026-0104 — reachable panic parsing a CRL. NOT APPLICABLE: the AWS
+    # SDK TLS client does not use CRLs (advisory: "applications that do not use
+    # CRLs are not affected").
+    "RUSTSEC-2026-0104",
+    # RUSTSEC-2026-0098 / -0099 — webpki over-accepts certificate nameConstraints
+    # (URI names / wildcard certs). Low practical risk here: the SQS client
+    # connects only to AWS-controlled *.amazonaws.com endpoints via the public CA
+    # hierarchy; exploitation needs a crafted cert chaining to a trusted CA with
+    # abusive nameConstraints (a MITM scenario), not reachable for AWS endpoints.
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
 ]
 
 [licenses]

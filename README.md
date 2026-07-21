@@ -2,7 +2,7 @@
 
 Combined Senzing **load + redo** driver in Rust. One binary runs both roles —
 the load role of [`sz_rabbit_consumer_rust`](../sz_rabbit_consumer_rust)
-(RabbitMQ → `add_record`) and the redo role of
+(queue → `add_record`) and the redo role of
 [`sz_simple_redoer_rust`](../sz_simple_redoer_rust) (`get_redo_record` →
 `process_redo_record`) — in a single worker pool, governed by a single
 `SENZING_REDO_PERCENT` knob. It does **not** replace those standalone drivers;
@@ -11,6 +11,30 @@ and redo. Like its siblings, the container is **distroless** (no interpreter,
 no shell) and glue-layer errors surface at compile time.
 
 Design document: `~/.claude/plans/dbperf_combined_consumer_design.md`.
+
+## Workspace / backends
+
+This is a Cargo **workspace** so the shared engine-processing core is written
+once and each message backend is a separate binary that pulls **only** its own
+client (compile-time backend selection — no runtime switch, no feature flags):
+
+| Crate | Kind | Backend | Backend dep |
+|---|---|---|---|
+| `sz-combined-consumer-core` | lib | — (worker pool, redo, stats, config reload, file loader) | none |
+| `sz_rabbit_combined_consumer` | bin | RabbitMQ | `lapin` |
+| `sz_sqs_combined_consumer` | bin | Amazon SQS (standard queues) | `aws-sdk-sqs` |
+
+`cargo build -p sz_rabbit_combined_consumer` never compiles the AWS SDK, and
+`cargo build -p sz_sqs_combined_consumer` never compiles `lapin`. Both binaries
+also support the shared **file-input** mode (`--file`, below) and the pure
+redoer (`--redo-percent 100`). The SQS binary takes `--queue-url` /
+`SENZING_SQS_QUEUE_URL` (plus `--visibility-timeout`, `--wait-time`,
+`--max-messages`); credentials/region come from the standard AWS provider chain.
+Its visibility timeout MUST exceed the worst-case record processing time or SQS
+will redeliver an in-progress record.
+
+> NOTE: the repository is being renamed to `sz_queue_combined_consumer` to
+> reflect the multi-backend scope (the binaries keep their per-backend names).
 
 ## Why combined
 
@@ -135,11 +159,16 @@ compare/scoring buffers with `MADV_DONTNEED` on release, tracked in
 ## Build
 
 ```console
-cargo build --release           # needs libSz at SENZING_LIB_PATH (default /opt/senzing/er/lib)
-cargo test                      # unit tests
-docker build -t brian/sz_rabbit_combined_consumer .                      # both DB backends
-docker build --build-arg WITH_MSSQL=0    -t brian/sz_rabbit_combined_consumer:pg .
-docker build --build-arg WITH_POSTGRES=0 -t brian/sz_rabbit_combined_consumer:mssql .
+# needs libSz at SENZING_LIB_PATH (default /opt/senzing/er/lib)
+cargo build --release --workspace                       # everything
+cargo build --release -p sz_rabbit_combined_consumer    # RabbitMQ bin only (no AWS SDK)
+cargo build --release -p sz_sqs_combined_consumer       # SQS bin only (no lapin)
+cargo test  --workspace --lib --bins                    # unit tests (no infra)
+
+# Docker: BIN selects the backend binary; WITH_POSTGRES/WITH_MSSQL the DB closure.
+docker build --build-arg BIN=sz_rabbit_combined_consumer -t brian/sz_rabbit_combined_consumer .        # both DB backends
+docker build --build-arg BIN=sz_sqs_combined_consumer    -t brian/sz_sqs_combined_consumer .
+docker build --build-arg BIN=sz_rabbit_combined_consumer --build-arg WITH_MSSQL=0 -t brian/sz_rabbit_combined_consumer:pg .
 ```
 
 ## Run

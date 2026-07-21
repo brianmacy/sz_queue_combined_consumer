@@ -87,11 +87,13 @@ jobs:
           key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-build-
 
-      - name: Build release
-        run: cargo build --release
+      - name: Build release (whole workspace — both backend bins + core)
+        run: cargo build --release --workspace
 
-      - name: Run unit tests
-        run: cargo test --bins
+      - name: Run unit tests (core lib + bin unit tests; no infra)
+        # --lib + --bins only: the integration test (which needs RabbitMQ + a
+        # Senzing engine) runs in the dedicated `integration` job below.
+        run: cargo test --workspace --lib --bins
 
   integration:
     name: Integration Tests
@@ -225,10 +227,10 @@ jobs:
       - name: Run integration tests
         # --test-threads=1: the Senzing engine is a process-global singleton;
         # parallel get_instance() calls race its init. Serialize the suite.
-        run: cargo test --test integration_test -- --nocapture --test-threads=1
+        run: cargo test -p sz_rabbit_combined_consumer --test integration_test -- --nocapture --test-threads=1
 
   docker:
-    name: Docker build (${{ matrix.backend }})
+    name: Docker build (${{ matrix.bin }} / ${{ matrix.backend }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -243,11 +245,26 @@ jobs:
           # `docker build --build-arg WITH_MSSQL=1 --build-arg WITH_POSTGRES=0`
           # and the "both" default both succeed. (An earlier "SHA1 apt-key"
           # claim carried over from the sibling CI was incorrect.)
-          - backend: postgres
+          # Both queue backends (BIN) x the DB-driver closure. BIN selects which
+          # workspace binary is built: the RabbitMQ image never pulls the AWS SDK
+          # and the SQS image never pulls lapin (cargo build -p ${BIN}).
+          - bin: sz_rabbit_combined_consumer
+            backend: postgres
             args: "WITH_POSTGRES=1 WITH_MSSQL=0"
-          - backend: mssql
+          - bin: sz_rabbit_combined_consumer
+            backend: mssql
             args: "WITH_POSTGRES=0 WITH_MSSQL=1"
-          - backend: both
+          - bin: sz_rabbit_combined_consumer
+            backend: both
+            args: "WITH_POSTGRES=1 WITH_MSSQL=1"
+          - bin: sz_sqs_combined_consumer
+            backend: postgres
+            args: "WITH_POSTGRES=1 WITH_MSSQL=0"
+          - bin: sz_sqs_combined_consumer
+            backend: mssql
+            args: "WITH_POSTGRES=0 WITH_MSSQL=1"
+          - bin: sz_sqs_combined_consumer
+            backend: both
             args: "WITH_POSTGRES=1 WITH_MSSQL=1"
     steps:
       - name: Checkout code
@@ -258,6 +275,6 @@ jobs:
 
       - name: Build image
         run: |
-          BUILD_ARGS=""
+          BUILD_ARGS="--build-arg BIN=${{ matrix.bin }}"
           for kv in ${{ matrix.args }}; do BUILD_ARGS="$BUILD_ARGS --build-arg $kv"; done
-          docker build $BUILD_ARGS -t sz_rabbit_combined_consumer:${{ matrix.backend }} .
+          docker build $BUILD_ARGS -t ${{ matrix.bin }}:${{ matrix.backend }} .

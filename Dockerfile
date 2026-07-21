@@ -48,19 +48,18 @@ ENV LD_LIBRARY_PATH=/opt/senzing/er/lib
 
 WORKDIR /app
 
-# Dependency-cache layer: build dependencies against a dummy main + lib so that
-# source edits do not re-fetch/re-compile the dependency graph. This crate has a
-# lib target (src/lib.rs) in addition to the binary, so both dummies are needed.
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src \
- && echo "fn main() {}" > src/main.rs \
- && echo "" > src/lib.rs \
- && cargo build --release \
- && rm -rf src
+# Which workspace binary to build: sz_rabbit_combined_consumer (RabbitMQ, default)
+# or sz_sqs_combined_consumer (Amazon SQS). `cargo build -p ${BIN}` compiles only
+# that bin + its deps, so the RabbitMQ image never pulls the AWS SDK and the SQS
+# image never pulls lapin.
+ARG BIN=sz_rabbit_combined_consumer
 
-# Build the real binary.
-COPY src ./src
-RUN touch src/main.rs src/lib.rs && cargo build --release
+# Build the selected binary from the workspace. (The single-crate dummy-src
+# dep-cache trick does not translate cleanly to a multi-crate workspace; the CI
+# target cache covers incremental speedups for the non-Docker jobs.)
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo build --release -p "${BIN}"
 
 # ===========================================================================
 # CANONICAL SENZING SECTION — keep byte-identical across the sibling repos
@@ -237,8 +236,11 @@ ENV LD_LIBRARY_PATH=/opt/senzing/er/lib
 ENV MALLOC_MMAP_THRESHOLD_=131072 \
     MALLOC_TRIM_THRESHOLD_=131072
 
-LABEL org.opencontainers.image.title="sz_rabbit_combined_consumer" \
-      org.opencontainers.image.description="Combined Senzing RabbitMQ load + redo driver (Rust)" \
+# Re-declare in this stage (ARGs do not cross FROM boundaries). Selects which
+# built binary is installed + labeled; must match the builder-stage BIN.
+ARG BIN=sz_rabbit_combined_consumer
+LABEL org.opencontainers.image.title="${BIN}" \
+      org.opencontainers.image.description="Combined Senzing load + redo driver (Rust): ${BIN}" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 # Files-only NSS — STANDARD PRACTICE for these distroless service containers.
@@ -252,6 +254,8 @@ LABEL org.opencontainers.image.title="sz_rabbit_combined_consumer" \
 # the sibling sz_rabbit_consumer_rust / sz_simple_redoer_rust images.)
 COPY nsswitch.conf /etc/nsswitch.conf
 
-COPY --from=builder /app/target/release/sz_rabbit_combined_consumer /usr/local/bin/sz_rabbit_combined_consumer
+# Fixed install path so the exec-form ENTRYPOINT need not interpolate ${BIN}
+# (which it cannot). The image tag distinguishes the RabbitMQ vs SQS backend.
+COPY --from=builder /app/target/release/${BIN} /usr/local/bin/sz-consumer
 
-ENTRYPOINT ["/usr/local/bin/sz_rabbit_combined_consumer"]
+ENTRYPOINT ["/usr/local/bin/sz-consumer"]
