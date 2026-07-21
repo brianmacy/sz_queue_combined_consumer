@@ -241,6 +241,17 @@ LABEL org.opencontainers.image.title="sz_rabbit_combined_consumer" \
       org.opencontainers.image.description="Combined Senzing RabbitMQ load + redo driver (Rust)" \
       org.opencontainers.image.licenses="Apache-2.0"
 
+# Files-only NSS — STANDARD PRACTICE for these distroless service containers.
+# The cc-debian13 base ships Debian defaults (passwd/group: compat, netgroup: nis).
+# Under the msodbc18 / krb5 / GSSAPI per-connection lookup path at high worker
+# concurrency, compat+nis route getpwnam/getgrnam/netgroup through NIS/SunRPC
+# (clntudp/authdes) and serialize every worker thread on the glibc NSS global
+# rwlock — a dominant, silent throughput bottleneck (CPU half-idle, negative
+# scaling). This container reaches the datastore/AMQP by IP with SQL auth and
+# never needs NIS/LDAP, so files-only removes the convoy. (Apply identically to
+# the sibling sz_rabbit_consumer_rust / sz_simple_redoer_rust images.)
+COPY nsswitch.conf /etc/nsswitch.conf
+
 COPY --from=builder /app/target/release/sz_rabbit_combined_consumer /usr/local/bin/sz_rabbit_combined_consumer
 
 ENTRYPOINT ["/usr/local/bin/sz_rabbit_combined_consumer"]

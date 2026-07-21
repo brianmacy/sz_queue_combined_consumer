@@ -81,6 +81,9 @@ pub fn fetcher_loop(
     let sleep_dur = Duration::from_secs(redo_sleep_secs);
 
     while RUNNING.load(Ordering::Relaxed) {
+        // Periodic live-config-reload check (throttled process-globally; this is
+        // the redo reader thread — see config_reload).
+        crate::config_reload::poll(&env);
         let record = match engine.get_redo_record() {
             Ok(record) => record,
             Err(e) => {

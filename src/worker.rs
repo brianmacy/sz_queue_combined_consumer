@@ -358,6 +358,9 @@ fn process_load(ctx: &WorkerCtx, engine: &dyn SzEngine, load: &LoadSide, item: L
         info,
     } = item;
 
+    // Live-config-reload check (throttled process-globally; see config_reload).
+    crate::config_reload::poll(&ctx.env);
+
     {
         let mut started = load.started.lock().unwrap_or_else(PoisonError::into_inner);
         started.insert(delivery_tag);
@@ -371,7 +374,15 @@ fn process_load(ctx: &WorkerCtx, engine: &dyn SzEngine, load: &LoadSide, item: L
             Action::RejectNoRequeue
         }
         Ok(body_str) => {
-            match engine.add_record(&info.data_source, &info.record_id, body_str, ctx.add_flags) {
+            let mut result =
+                engine.add_record(&info.data_source, &info.record_id, body_str, ctx.add_flags);
+            if result.is_err() && crate::config_reload::reinit_if_stale(&ctx.env) {
+                // The registered default config drifted; the engine has been
+                // reinitialized (handles stay valid) — retry the record once.
+                result =
+                    engine.add_record(&info.data_source, &info.record_id, body_str, ctx.add_flags);
+            }
+            match result {
                 Ok(resp) => Action::Ack(if ctx.want_info { Some(resp) } else { None }),
                 Err(e) => match classify_error(&e) {
                     ErrorClass::BadInputOrTimeout => Action::RejectNoRequeue,
@@ -411,6 +422,9 @@ fn process_load(ctx: &WorkerCtx, engine: &dyn SzEngine, load: &LoadSide, item: L
 fn process_redo(ctx: &WorkerCtx, engine: &dyn SzEngine, redo: &RedoSide, job: RedoJob) -> bool {
     let (id, record) = job;
 
+    // Live-config-reload check (throttled process-globally; see config_reload).
+    crate::config_reload::poll(&ctx.env);
+
     REDO_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut map) = redo.in_flight.lock() {
         map.insert(id, (Instant::now(), record.clone()));
@@ -418,7 +432,12 @@ fn process_redo(ctx: &WorkerCtx, engine: &dyn SzEngine, redo: &RedoSide, job: Re
 
     let t0 = Instant::now();
     let mut keep_going = true;
-    match engine.process_redo_record(&record, ctx.redo_flags) {
+    let mut redo_result = engine.process_redo_record(&record, ctx.redo_flags);
+    if redo_result.is_err() && crate::config_reload::reinit_if_stale(&ctx.env) {
+        // Registered default config drifted; engine reinitialized — retry once.
+        redo_result = engine.process_redo_record(&record, ctx.redo_flags);
+    }
+    match redo_result {
         Ok(result) => {
             let count = REDOS_PROCESSED.fetch_add(1, Ordering::Relaxed) + 1;
             if ctx.want_info && !result.is_empty() {

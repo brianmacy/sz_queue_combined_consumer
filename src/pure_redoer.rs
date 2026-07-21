@@ -40,6 +40,8 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
         "Pure redoer (redo% = 100): {n_workers} workers, no AMQP connection, \
          no tokio runtime"
     );
+    // Log active-config-id vs default at startup (diagnostic; see combined.rs).
+    crate::config_reload::log_startup_config(&env);
 
     // Channel capacity |B| + 2 with |B| = N at this endpoint (design §2.3):
     // small on purpose — fetched-but-unprocessed redo records are lost on
@@ -132,15 +134,13 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
             Err(e) => warn!("Could not retrieve engine stats: {e}"),
         }
 
-        // Monitoring ONLY (one table scan per interval); emptiness is always
-        // detected by the fetcher's get_redo_record() coming back empty.
-        let backlog = match monitor_engine.count_redo_records() {
-            Ok(n) => Some(n),
-            Err(e) => {
-                warn!("count_redo_records failed: {e}");
-                None
-            }
-        };
+        // TODO(reporting): backlog gauge removed. count_redo_records() =
+        // `COUNT(*) FROM SYS_EVAL_QUEUE` (full table scan) and dominated DB user
+        // CPU at billion-record scale (~25% of total worker_time). Emptiness/drain is
+        // already detected by the fetcher's get_redo_record() coming back empty.
+        // Restore backlog via a cheap source (engine redo counters or DB-side
+        // metadata rowcount) — do NOT reintroduce the COUNT(*) scan.
+        let backlog: Option<i64> = None;
 
         let now = Instant::now();
         let dt = now.duration_since(last_status_at).as_secs_f64().max(0.001);

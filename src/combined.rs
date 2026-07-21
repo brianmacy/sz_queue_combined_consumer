@@ -100,6 +100,17 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
         config.redo_percent,
         config.prefetch
     );
+    // DIAGNOSTIC: license as seen right after engine init (before any config
+    // reload / reinitialize). Compare against "LICENSE AFTER REINIT" to prove
+    // whether reinitialize() drops the init-JSON license -> demo recordLimit.
+    match env.get_product().and_then(|p| p.get_license()) {
+        Ok(lic) => tracing::info!("LICENSE AFTER INIT: {lic}"),
+        Err(e) => tracing::warn!("get_license after init failed: {e}"),
+    }
+    // Log the engine's active-config-id vs the registered default at startup, so we
+    // can see whether the first reconcile reinit is real (active != default) — keyed
+    // on get_active_config_id(), the engine's true state.
+    crate::config_reload::log_startup_config(&env);
     let url = config
         .url
         .clone()
@@ -235,14 +246,20 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to install SIGTERM handler")?;
 
-    // --- Stats thread (blocking get_stats / count_redo_records) --------------
+    // --- Stats thread (blocking get_stats only) ------------------------------
+    // NOTE: redo backlog is NO LONGER polled here. count_redo_records() issues a
+    // `COUNT(*) FROM SYS_EVAL_QUEUE` FULL TABLE SCAN; at billion-record scale (30M+ queue
+    // rows) each scan cost ~300+ CPU-sec on the DB, and with one call per stats
+    // interval across the whole consumer fleet it dominated DB user CPU (~25% of
+    // total worker_time on the live MSSQL run). Emptiness/drain is already
+    // detected by the fetcher's get_redo_record() returning empty, so the count
+    // was pure monitoring cost. Removed.
     let stats_env = env.clone();
     let (stats_req_tx, stats_req_rx) = std::sync::mpsc::channel::<()>();
     let (stats_resp_tx, mut stats_resp_rx) = mpsc::channel::<StatsPayload>(1);
-    let want_backlog = config.redo_percent > 0;
     let stats_handle = std::thread::Builder::new()
         .name("sz-stats".to_string())
-        .spawn(move || stats_loop(stats_env, stats_req_rx, stats_resp_tx, want_backlog))
+        .spawn(move || stats_loop(stats_env, stats_req_rx, stats_resp_tx))
         .context("failed to spawn stats thread")?;
 
     // --- Main event loop -----------------------------------------------------
@@ -740,14 +757,18 @@ async fn monitor_long_records(
     }
 }
 
-/// Dedicated thread owning one engine handle for blocking `get_stats()` (and
-/// `count_redo_records()` when redo% > 0 — monitoring ONLY, one table scan per
-/// stats interval; NEVER a loop/emptiness condition).
+/// Dedicated thread owning one engine handle for blocking `get_stats()`.
+///
+/// TODO(reporting): reinstate a redo-backlog gauge WITHOUT count_redo_records().
+/// count_redo_records() = `COUNT(*) FROM SYS_EVAL_QUEUE` (full table scan) and
+/// dominated DB user CPU at billion-record scale. Reintroduce backlog via a cheap source
+/// (e.g. engine get_stats redo counters, or a DB-side metadata rowcount like
+/// sys.dm_db_partition_stats / pg_class.reltuples) so `redo_backlog` /
+/// `redo_backlog_slope` come back for reporting at ~zero DB cost.
 fn stats_loop(
     env: Arc<SzEnvironmentCore>,
     req_rx: std::sync::mpsc::Receiver<()>,
     resp_tx: mpsc::Sender<StatsPayload>,
-    want_backlog: bool,
 ) {
     let engine = match env.get_engine() {
         Ok(e) => e,
@@ -764,17 +785,9 @@ fn stats_loop(
                 None
             }
         };
-        let redo_backlog = if want_backlog {
-            match engine.count_redo_records() {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    tracing::warn!("count_redo_records failed: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // TODO(reporting): backlog gauge removed with count_redo_records (full
+        // COUNT(*) scan). Restore via a cheap source — see stats_loop doc.
+        let redo_backlog = None;
         if resp_tx
             .blocking_send(StatsPayload {
                 engine_stats,
