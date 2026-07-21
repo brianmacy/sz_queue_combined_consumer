@@ -9,7 +9,10 @@ members = ["crates/core", "crates/rabbit", "crates/sqs"]
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+# Bumped 1.88 -> 1.94.1 so the MSRV-aware resolver selects the current AWS SDK
+# (aws-smithy-http-client >= 1.2 uses rustls 0.23 / rustls-webpki 0.103.13+),
+# clearing RUSTSEC-2026-0098/-0099/-0104 without deny.toml ignores.
+rust-version = "1.94.1"
 authors = ["Brian Macy"]
 license = "Apache-2.0"
 
@@ -27,8 +30,15 @@ ctrlc = { version = "3", features = ["termination"] }
 num_cpus = "1"
 libc = "0.2"
 # SQS backend (crates/sqs only). aws-sdk-sqs is Apache-2.0.
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-sqs = "1"
+# default-features = false drops the SDK's legacy `rustls` feature (hyper-0.14 +
+# rustls 0.21 -> vulnerable rustls-webpki 0.101.7). We keep only the MODERN
+# HTTPS client (`default-https-client` = rustls-aws-lc, rustls 0.23 /
+# rustls-webpki 0.103.13). This also drops aws-config's `sso` + `credentials-
+# process` providers (they transitively re-pull the legacy stack); the standard
+# provider chain (env vars, ~/.aws profile, IMDS/ECS role, web-identity) is
+# unaffected. Re-add those features if SSO / credential_process auth is needed.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 
 # sz-combined-consumer-core: the broker-agnostic engine-processing library shared
 # by every backend binary (RabbitMQ, SQS, ...).
