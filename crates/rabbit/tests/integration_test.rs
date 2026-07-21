@@ -34,8 +34,8 @@
 
 use std::sync::Arc;
 
-use sz_rabbit_combined_consumer::config::{redo_preferring_count, validate_topology};
-use sz_rabbit_combined_consumer::record::{ErrorClass, ParseError, classify_error, parse_record};
+use sz_combined_consumer_core::config::{redo_preferring_count, validate_topology};
+use sz_combined_consumer_core::record::{ErrorClass, ParseError, classify_error, parse_record};
 use sz_rust_sdk::prelude::*;
 
 const INSTANCE: &str = "sz_rabbit_combined_consumer_it";
@@ -587,6 +587,78 @@ fn e2e_pure_redoer_100pct() {
     );
     // Singleton intentionally left initialized (see the note on the earlier
     // real-engine tests).
+}
+
+/// FILE-INPUT e2e: the driver loads JSONL records from a single file (no AMQP),
+/// dead-letters a malformed line, and exits 0 at EOF reporting the resume
+/// watermark. Unlike the queue paths this needs no broker and no SIGTERM — file
+/// mode runs to end-of-file and self-terminates.
+#[test]
+fn e2e_file_loader() {
+    let Some(_engine_cfg) = engine_config() else {
+        eprintln!("SKIP e2e_file_loader: engine config not set");
+        return;
+    };
+
+    // 15 valid TEST records + one malformed line (missing DATA_SOURCE) that must
+    // be dead-lettered without failing the load.
+    const N_VALID: usize = 15;
+    let mut lines = make_records("E2E_FILE", N_VALID);
+    lines.push(r#"{"RECORD_ID":"E2E_FILE_BAD","NAME_FULL":"No Data Source"}"#.to_string());
+
+    let file_path = std::env::temp_dir().join(format!("sz_e2e_file_{}.jsonl", std::process::id()));
+    std::fs::write(&file_path, lines.join("\n") + "\n").expect("write input file");
+
+    let out_path = std::env::temp_dir().join(format!("sz_e2e_file_{}.out", std::process::id()));
+    let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
+
+    // File mode: no AMQP env; the binary reads the file and exits at EOF (no
+    // SIGTERM needed).
+    let mut child = Command::new(driver_bin())
+        .env("SENZING_THREADS_PER_PROCESS", "2")
+        .env(
+            "SENZING_INPUT_FILE",
+            file_path.to_str().expect("utf-8 path"),
+        )
+        .env_remove("SENZING_RABBITMQ_QUEUE")
+        .env_remove("SENZING_AMQP_URL")
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn file-loader driver binary");
+
+    let status = wait_bounded(&mut child, Duration::from_secs(60));
+
+    let mut stdout = String::new();
+    let _ = std::fs::File::open(&out_path).and_then(|mut f| f.read_to_string(&mut stdout));
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&file_path);
+
+    let status = status.expect("file loader did not exit within bound");
+    assert!(
+        status.success(),
+        "file loader exited non-zero: {status:?}\n{stdout}"
+    );
+
+    let total_line = stdout
+        .lines()
+        .find(|l| l.starts_with("Processed total of "))
+        .unwrap_or_else(|| panic!("file loader never printed its total\n{stdout}"));
+    let adds: usize = total_line
+        .trim_start_matches("Processed total of ")
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse add count from {total_line:?}"));
+    assert_eq!(
+        adds, N_VALID,
+        "expected {N_VALID} valid records loaded, got {adds}\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dead-lettered"),
+        "expected the malformed line to be dead-lettered\n{stdout}"
+    );
+    eprintln!("e2e_file_loader: loaded {adds}/{N_VALID} records, 1 dead-lettered, clean EOF exit");
 }
 
 // ==========================================================================

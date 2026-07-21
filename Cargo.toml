@@ -1,21 +1,19 @@
-[package]
-name = "sz_rabbit_combined_consumer"
+[workspace]
+# resolver "3" is MSRV-aware: it selects dependency versions compatible with the
+# workspace rust-version (1.88), so the fast-moving AWS SDK (whose newest releases
+# require rustc 1.94+) resolves to the latest 1.88-compatible versions instead of
+# failing the build.
+resolver = "3"
+members = ["crates/core", "crates/rabbit", "crates/sqs"]
+
+[workspace.package]
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Brian Macy"]
-description = "Combined RabbitMQ load + redo Senzing driver (one redo% knob; subsumes sz_rabbit_consumer and sz_simple_redoer)"
 license = "Apache-2.0"
 
-[[bin]]
-name = "sz_rabbit_combined_consumer"
-path = "src/main.rs"
-
-[lib]
-name = "sz_rabbit_combined_consumer"
-path = "src/lib.rs"
-
-[dependencies]
+[workspace.dependencies]
 sz-rust-sdk = { git = "https://github.com/brianmacy/sz-rust-sdk", rev = "b595ca4" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 lapin = "4"
@@ -27,13 +25,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ctrlc = { version = "3", features = ["termination"] }
 num_cpus = "1"
-
-[dev-dependencies]
-# Test-only: send SIGTERM to a spawned driver via the kill(2) syscall instead of
-# shelling out to a `kill` binary. The senzingsdk-runtime CI container ships no
-# `kill` executable on PATH, so Command::new("kill") fails with ENOENT (see the
-# sigterm() helper in tests/integration_test.rs). Already in the tree at 0.2.186.
 libc = "0.2"
+# SQS backend (crates/sqs only). aws-sdk-sqs is Apache-2.0.
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-sqs = "1"
+
+# sz-combined-consumer-core: the broker-agnostic engine-processing library shared
+# by every backend binary (RabbitMQ, SQS, ...).
+sz-combined-consumer-core = { path = "crates/core" }
 
 [profile.release]
 opt-level = 3

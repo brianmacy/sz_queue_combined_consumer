@@ -25,12 +25,13 @@
 //! handle — see the reference drivers and the dbperf-faq
 //! `architecture/consumer-redoer-concurrency` article.
 
-pub mod combined;
 pub mod config;
 pub mod config_reload;
+pub mod file_loader;
 pub mod pure_redoer;
 pub mod record;
 pub mod redo;
+pub mod runtime;
 pub mod stats;
 pub mod worker;
 

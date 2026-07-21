@@ -1,0 +1,27 @@
+[package]
+name = "sz-combined-consumer-core"
+description = "Broker-agnostic Senzing load + redo engine-processing core (worker pool, redo mixing, stats, live config reload, file loader) shared by the RabbitMQ and SQS driver binaries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "sz_combined_consumer_core"
+path = "src/lib.rs"
+
+[dependencies]
+sz-rust-sdk.workspace = true
+# tokio: the shared worker pool uses tokio::sync channels + Notify (no runtime is
+# built here — the backend bins own the runtime). No lapin / no AMQP in core, so
+# a backend bin that does not need AMQP (e.g. SQS) never compiles it.
+tokio.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+# The shared runtime module (logging init + signal handler) used by every bin.
+tracing-subscriber.workspace = true
+ctrlc.workspace = true
+num_cpus.workspace = true

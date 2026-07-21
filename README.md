@@ -2,7 +2,7 @@
 
 Combined Senzing **load + redo** driver in Rust. One binary runs both roles —
 the load role of [`sz_rabbit_consumer_rust`](../sz_rabbit_consumer_rust)
-(RabbitMQ → `add_record`) and the redo role of
+(queue → `add_record`) and the redo role of
 [`sz_simple_redoer_rust`](../sz_simple_redoer_rust) (`get_redo_record` →
 `process_redo_record`) — in a single worker pool, governed by a single
 `SENZING_REDO_PERCENT` knob. It does **not** replace those standalone drivers;
@@ -11,6 +11,30 @@ and redo. Like its siblings, the container is **distroless** (no interpreter,
 no shell) and glue-layer errors surface at compile time.
 
 Design document: `~/.claude/plans/dbperf_combined_consumer_design.md`.
+
+## Workspace / backends
+
+This is a Cargo **workspace** so the shared engine-processing core is written
+once and each message backend is a separate binary that pulls **only** its own
+client (compile-time backend selection — no runtime switch, no feature flags):
+
+| Crate | Kind | Backend | Backend dep |
+|---|---|---|---|
+| `sz-combined-consumer-core` | lib | — (worker pool, redo, stats, config reload, file loader) | none |
+| `sz_rabbit_combined_consumer` | bin | RabbitMQ | `lapin` |
+| `sz_sqs_combined_consumer` | bin | Amazon SQS (standard queues) | `aws-sdk-sqs` |
+
+`cargo build -p sz_rabbit_combined_consumer` never compiles the AWS SDK, and
+`cargo build -p sz_sqs_combined_consumer` never compiles `lapin`. Both binaries
+also support the shared **file-input** mode (`--file`, below) and the pure
+redoer (`--redo-percent 100`). The SQS binary takes `--queue-url` /
+`SENZING_SQS_QUEUE_URL` (plus `--visibility-timeout`, `--wait-time`,
+`--max-messages`); credentials/region come from the standard AWS provider chain.
+Its visibility timeout MUST exceed the worst-case record processing time or SQS
+will redeliver an in-progress record.
+
+> NOTE: the repository is being renamed to `sz_queue_combined_consumer` to
+> reflect the multi-backend scope (the binaries keep their per-backend names).
 
 ## Why combined
 
@@ -67,6 +91,8 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_THREADS_PER_PROCESS` (`--threads-per-process`) | **12** | worker pool size (0 → CPU count, compat foot-gun) |
 | `SENZING_AMQP_URL` (`-u`/`--url`) | required iff redo% < 100 | RabbitMQ URL |
 | `SENZING_RABBITMQ_QUEUE` (`-q`/`--queue`) | required iff redo% < 100 | source queue (must exist; passive declare) |
+| `SENZING_INPUT_FILE` (`-f`/`--file`) | none | load JSONL (one JSON record per line) from a single file instead of RabbitMQ. Pure loader (redo% ignored); mutually exclusive with `--url`/`--queue`. Exits 0 at EOF. |
+| `SENZING_SKIP_LINES` (`--skip-lines`) | 0 | file mode only: skip the first N physical lines. Resumes an interrupted load — the driver prints a safe `--skip-lines` offset (contiguous-completion watermark) at shutdown. |
 | `SENZING_PREFETCH` (`--prefetch`) | threads + 2 | `basic_qos` prefetch |
 | `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | diagnostic MQ depth probe cadence (not a correctness poll) |
 | `SENZING_REDO_SLEEP_TIME_IN_SECONDS` (`--redo-sleep-secs`) | 60 | fetcher pause on empty redo queue (auto-shortened to 2 s while redo is still in flight, for cascade drain) |
@@ -133,11 +159,16 @@ compare/scoring buffers with `MADV_DONTNEED` on release, tracked in
 ## Build
 
 ```console
-cargo build --release           # needs libSz at SENZING_LIB_PATH (default /opt/senzing/er/lib)
-cargo test                      # unit tests
-docker build -t brian/sz_rabbit_combined_consumer .                      # both DB backends
-docker build --build-arg WITH_MSSQL=0    -t brian/sz_rabbit_combined_consumer:pg .
-docker build --build-arg WITH_POSTGRES=0 -t brian/sz_rabbit_combined_consumer:mssql .
+# needs libSz at SENZING_LIB_PATH (default /opt/senzing/er/lib)
+cargo build --release --workspace                       # everything
+cargo build --release -p sz_rabbit_combined_consumer    # RabbitMQ bin only (no AWS SDK)
+cargo build --release -p sz_sqs_combined_consumer       # SQS bin only (no lapin)
+cargo test  --workspace --lib --bins                    # unit tests (no infra)
+
+# Docker: BIN selects the backend binary; WITH_POSTGRES/WITH_MSSQL the DB closure.
+docker build --build-arg BIN=sz_rabbit_combined_consumer -t brian/sz_rabbit_combined_consumer .        # both DB backends
+docker build --build-arg BIN=sz_sqs_combined_consumer    -t brian/sz_sqs_combined_consumer .
+docker build --build-arg BIN=sz_rabbit_combined_consumer --build-arg WITH_MSSQL=0 -t brian/sz_rabbit_combined_consumer:pg .
 ```
 
 ## Run
@@ -157,6 +188,22 @@ docker run --rm \
 the split topology on the same binary. **Benchmark parity:** the driver is part
 of the measured system; never compare engine versions across different drivers
 — validate at 0%/100% against the siblings first, then re-baseline.
+
+### File input (no RabbitMQ)
+
+Load a JSONL file directly — one JSON record per line — instead of consuming a
+queue:
+
+```console
+sz_rabbit_combined_consumer --file /data/records.jsonl
+```
+
+File mode is a pure loader (no redo processing; drain redo separately with a
+`--redo-percent 100` run). It runs to end-of-file and exits 0. Blank lines are
+skipped and unparseable lines are dead-lettered (logged and counted) without
+aborting the load. On completion — or on SIGTERM — it prints a safe resume
+offset; restart with `--skip-lines N` to continue where it stopped
+(`add_record` is idempotent, so an interrupted run is safe to resume).
 
 ## License
 

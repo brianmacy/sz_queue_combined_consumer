@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased — multi-backend workspace + Amazon SQS driver (2026-07-21)
+
+* **Cargo workspace.** Split the single crate into `crates/core`
+  (`sz-combined-consumer-core`, lib — worker pool, redo fetcher, stats, live
+  config reload, file loader, shared `runtime` bring-up/shutdown) plus one thin
+  binary crate per message backend. Compile-time backend selection: each bin
+  pulls ONLY its own client — `cargo build -p sz_rabbit_combined_consumer` never
+  compiles the AWS SDK; `cargo build -p sz_sqs_combined_consumer` never compiles
+  `lapin` (verified via `cargo tree`). No feature flags, no runtime switch.
+* **`crates/sqs` (`sz_sqs_combined_consumer`, new) — Amazon SQS backend**
+  (standard queues). Long-poll `ReceiveMessage` → shared worker pool →
+  `DeleteMessage` on success; bad data is deleted (drop), fatal/shutdown leaves
+  messages un-deleted so the visibility timeout redelivers (at-least-once).
+  Receipt-handle strings map to synthetic `u64` correlation ids for the shared
+  worker code. `--queue-url`, `--visibility-timeout` (must exceed worst-case
+  processing time), `--wait-time`, `--max-messages`. Credentials/region via the
+  standard AWS provider chain.
+* **`crates/rabbit` (`sz_rabbit_combined_consumer`)** — the AMQP loop moved here
+  from core; behavior unchanged. Both bins share the file loader and pure redoer.
+* Workspace uses **resolver "3"** (MSRV-aware) so the AWS SDK resolves to the
+  latest versions compatible with `rust-version = 1.88`.
+* `deny.toml`: the MSRV-1.88-pinned AWS TLS stack (`aws-smithy-http-client 1.1.9`
+  → rustls 0.21 → `rustls-webpki 0.101.7`) trips RUSTSEC-2026-0098/-0099/-0104;
+  ignored with justification (0104 N/A — no CRLs; 0098/0099 low risk vs AWS
+  endpoints). Drop these when the workspace MSRV moves to >= 1.94 (which lets the
+  patched rustls stack resolve). SQS binary only.
+* CI: workspace build/test; the Docker matrix builds BOTH binaries (`BIN` arg) ×
+  the DB-driver closure. Integration tests run against `sz_rabbit_combined_consumer`.
+* Repository being renamed to `sz_queue_combined_consumer` (binaries keep their
+  per-backend names).
+
+## Unreleased — file-input load mode + --skip-lines (2026-07-20)
+
+* **`src/file_loader.rs` (new) — load JSONL records from a single file instead of
+  RabbitMQ.** Selected by `--file`/`SENZING_INPUT_FILE` (mutually exclusive with
+  `--url`/`--queue`). Reuses the shared `worker::worker_loop` pool (load-preferring,
+  no redo): a reader thread feeds each line as a `LoadItem` keyed by absolute line
+  number; a consumer thread counts outcomes. Blank lines are skipped; unparseable
+  lines are dead-lettered (logged + counted) without aborting. Runs to EOF and exits
+  0. Pure `std::thread` shape (no AMQP, no tokio), same graceful-shutdown/bounded-
+  teardown exit path as the pure redoer.
+* **`--skip-lines N`/`SENZING_SKIP_LINES` — resume an interrupted load.** Skips the
+  first N physical lines. Because workers complete out of order, the driver tracks a
+  contiguous-completion watermark and prints a SAFE `--skip-lines` offset at
+  shutdown, so a resume never skips an unprocessed line (at most a few in-flight
+  lines past the watermark are reprocessed — `add_record` is idempotent).
+* Tests: `ResumeTracker` unit tests (watermark advance / out-of-order / stale) plus
+  `e2e_file_loader` (spawns the binary in file mode, asserts clean EOF exit, correct
+  add count, and dead-lettering of a malformed line).
+
 ## Unreleased — remove count_redo anti-pattern; config/license diagnostics (2026-07-17)
 
 * **`src/combined.rs`, `src/pure_redoer.rs` — removed `count_redo_records()`.** It issued

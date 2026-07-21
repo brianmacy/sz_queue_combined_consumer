@@ -31,14 +31,14 @@ use lapin::{Connection, ConnectionProperties};
 use sz_rust_sdk::prelude::*;
 use tokio::sync::{Notify, mpsc};
 
-use crate::config::Config;
-use crate::record::{RecordInfo, parse_record};
-use crate::redo::fetcher_loop;
-use crate::stats::{
+use sz_combined_consumer_core::config::Config;
+use sz_combined_consumer_core::record::{RecordInfo, parse_record};
+use sz_combined_consumer_core::redo::fetcher_loop;
+use sz_combined_consumer_core::stats::{
     self, ADDS_PROCESSED, ADDS_REJECTED, Ewma, FloorGuard, GuardTransition, RUNNING,
     SAMPLE_REDO_RECORDS,
 };
-use crate::worker::{
+use sz_combined_consumer_core::worker::{
     Action, Class, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
     WorkerCtx, add_record_flags, monitor_redo_in_flight, redo_flags, worker_loop,
 };
@@ -110,7 +110,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
     // Log the engine's active-config-id vs the registered default at startup, so we
     // can see whether the first reconcile reinit is real (active != default) — keyed
     // on get_active_config_id(), the engine's true state.
-    crate::config_reload::log_startup_config(&env);
+    sz_combined_consumer_core::config_reload::log_startup_config(&env);
     let url = config
         .url
         .clone()
@@ -233,7 +233,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
     let mut consumer = channel
         .basic_consume(
             queue.as_str().into(),
-            crate::INSTANCE_NAME.into(),
+            sz_combined_consumer_core::INSTANCE_NAME.into(),
             BasicConsumeOptions::default(),
             FieldTable::default(),
         )
