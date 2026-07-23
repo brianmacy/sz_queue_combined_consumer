@@ -17,7 +17,7 @@
 # binary name in the final COPY, and the ENTRYPOINT differ.
 
 ARG SENZING_RUNTIME_IMAGE=senzing/senzingsdk-runtime:4.3.3
-ARG RUST_IMAGE=rust:1.88
+ARG RUST_IMAGE=rust:1.94.1
 
 # Global build args (declared before the first FROM so the backend-libs stage
 # and every per-stage ARG below inherit the same defaults). Must be 1 or 0.

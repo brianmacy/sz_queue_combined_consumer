@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — bump MSRV to 1.94.1 + modern AWS TLS (drops advisory ignores) (2026-07-21)
+
+* **MSRV `1.88` → `1.94.1`** (`rust-version`, CI toolchain pins, Dockerfile
+  `rust:1.94.1`). The MSRV-aware resolver now selects the current AWS SDK
+  (`aws-sdk-sqs 1.103`, `aws-config 1.9`, `aws-smithy-http-client 1.2`).
+* **Modern TLS only — vulnerability cleared.** The SQS SDK crates are pulled with
+  `default-features = false` + `default-https-client` (the `rustls-aws-lc` stack:
+  rustls 0.23 / `rustls-webpki 0.103.13`), dropping the SDK's legacy `rustls`
+  feature (hyper-0.14 + rustls 0.21 → the vulnerable `rustls-webpki 0.101.7`).
+  The whole legacy stack (`rustls 0.21`, `hyper 0.14`, `aws-sdk-sso`, ...) leaves
+  the graph, so **RUSTSEC-2026-0098/-0099/-0104 no longer apply and their
+  `deny.toml` ignores are removed** — `cargo deny` is clean with no suppressions.
+* Side effect: aws-config's `sso` + `credentials-process` providers are dropped
+  (they re-pull the legacy stack). The standard provider chain (env vars, `~/.aws`
+  profile, IMDS/ECS role, web-identity) is unaffected; re-add those features if
+  SSO / `credential_process` auth is required.
+* Verified on the 1.94.1 toolchain: build + clippy `-D warnings` + fmt + full
+  `cargo deny` (no ignores) + workspace unit tests, both bins' dep isolation.
+
 ## Unreleased — multi-backend workspace + Amazon SQS driver (2026-07-21)
 
 * **Cargo workspace.** Split the single crate into `crates/core`

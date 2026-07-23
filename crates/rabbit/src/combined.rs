@@ -73,7 +73,7 @@ struct StatsPayload {
 pub struct RunOutcome {
     /// `true` only if EVERY engine thread (workers + redo fetcher) actually
     /// finished before the shutdown grace elapsed. When `false`, `main` must
-    /// SKIP `destroy_global_instance()` (leak-on-exit over use-after-free).
+    /// SKIP the native environment `destroy()` (leak-on-exit over use-after-free).
     pub all_workers_joined: bool,
     /// `Some(message)` if shutting down due to a non-recoverable error.
     pub fatal: Option<String>,

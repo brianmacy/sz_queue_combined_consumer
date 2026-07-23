@@ -94,21 +94,33 @@ pub enum ErrorClass {
     Fatal,
 }
 
-/// Classifies a Senzing engine error (identical to `sz_rabbit_consumer_rust`):
+/// EAS_ERR_ERROR_WHEN_RUNNING_DQM (`SENZ0082`): a data-quality-management plugin
+/// error, e.g. an invalid name like `**`. The SDK's generated mapping classifies
+/// native code 82 as `SzError::Unknown` with NO error category, so neither
+/// `is_bad_input()` nor `is_retryable()` catches it; we match on the structured
+/// native error code instead (never on the message string). Treated as bad input
+/// (dead-letter/drop), not fatal.
+const SENZ_DQM_ERROR_CODE: i64 = 82;
+
+/// Classifies a Senzing engine error (identical policy to
+/// `sz_rabbit_consumer_rust`), using the SDK's structured error-category API —
+/// NOT message-substring matching:
 ///
-/// * `SzBadInputError` / `SzRetryTimeoutExceededError` -> dead-letter/drop.
-/// * Any error whose message contains `SENZ0082` (DQM plugin error, e.g. an
-///   invalid name like `**`) -> dead-letter/drop, even though the SDK may not
-///   map it to `BadInput`.
+/// * `err.is_bad_input()` — `BadInput` / `NotFound` / `UnknownDataSource` — and
+///   `err.is_retryable()` — `Retryable` / `DatabaseConnectionLost` /
+///   `DatabaseTransient` / `RetryTimeoutExceeded` (the last is `SENZ0010`, the
+///   engine's retry-timeout, native code 10) -> dead-letter/drop, keep going.
+///   Correctly classifying `SENZ0010` as retryable (not fatal) is the point of
+///   moving to the SDK's fixed error mappings: the stale pin mis-mapped it to
+///   `Configuration` and crash-restarted the consumer.
+/// * `SENZ0082` (native code 82) maps to `Unknown` with no category, so it is
+///   matched by its structured native error code -> dead-letter/drop.
 /// * Everything else -> fatal (graceful shutdown).
 pub fn classify_error(err: &SzError) -> ErrorClass {
-    if matches!(
-        err,
-        SzError::BadInput { .. } | SzError::RetryTimeoutExceeded { .. }
-    ) {
+    if err.is_bad_input() || err.is_retryable() {
         return ErrorClass::BadInputOrTimeout;
     }
-    if err.to_string().contains("SENZ0082") {
+    if err.error_code() == Some(SENZ_DQM_ERROR_CODE) {
         return ErrorClass::BadInputOrTimeout;
     }
     ErrorClass::Fatal
@@ -148,6 +160,7 @@ pub fn logging_id(record: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sz_rust_sdk::error::{ErrorContext, SzComponent};
 
     #[test]
     fn parses_data_source_and_record_id() {
@@ -195,20 +208,48 @@ mod tests {
 
     #[test]
     fn retry_timeout_is_dead_lettered() {
+        // SENZ0010 (RetryTimeoutExceeded) is RETRYABLE, so it must be
+        // dead-lettered/dropped and NOT treated as fatal. Regression guard for
+        // the stale-pin bug that mis-mapped SENZ0010 to a fatal Configuration
+        // error and crash-restarted the consumer.
         let e = SzError::retry_timeout_exceeded("timeout");
+        assert!(e.is_retryable(), "RetryTimeoutExceeded must be retryable");
         assert_eq!(classify_error(&e), ErrorClass::BadInputOrTimeout);
+        assert_ne!(classify_error(&e), ErrorClass::Fatal);
+    }
+
+    #[test]
+    fn retryable_database_errors_are_dead_lettered() {
+        for e in [
+            SzError::database_connection_lost("conn lost"),
+            SzError::database_transient("deadlock"),
+        ] {
+            assert_eq!(classify_error(&e), ErrorClass::BadInputOrTimeout);
+        }
     }
 
     #[test]
     fn senz0082_is_dead_lettered() {
-        let e = SzError::unknown("Error: SENZ0082 invalid name");
+        // A real SENZ0082 arrives as SzError::Unknown carrying native error code
+        // 82 (no category); classify_error matches the structured code, not the
+        // message text.
+        let e = SzError::Unknown(ErrorContext::with_code(
+            "EAS_ERR_ERROR_WHEN_RUNNING_DQM '**'",
+            82,
+            SzComponent::Engine,
+        ));
+        assert_eq!(e.error_code(), Some(82));
         assert_eq!(classify_error(&e), ErrorClass::BadInputOrTimeout);
     }
 
     #[test]
     fn other_errors_are_fatal() {
+        // Database (unrecoverable, not retryable) and an uncategorized Unknown
+        // with no matching code both stay fatal.
         let e = SzError::database("connection lost");
         assert_eq!(classify_error(&e), ErrorClass::Fatal);
+        let u = SzError::unknown("some unmapped internal error");
+        assert_eq!(classify_error(&u), ErrorClass::Fatal);
     }
 
     #[test]

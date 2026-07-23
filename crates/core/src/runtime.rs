@@ -22,7 +22,7 @@ use crate::{file_loader, pure_redoer};
 
 /// Upper bound on the native environment teardown at shutdown.
 ///
-/// `SzEnvironmentCore::destroy_global_instance()` calls `Sz_destroy()`, an
+/// `SzEnvironmentCore::destroy()` calls `Sz_destroy()`, an
 /// uninterruptible native FFI call with no timeout that can BLOCK indefinitely on
 /// the SIGTERM shutdown path once the worker threads that made engine calls have
 /// exited. We run it on a dedicated thread and wait only up to this bound; past
@@ -91,8 +91,23 @@ pub fn teardown_and_exit(code: u8) -> ! {
     let spawned = std::thread::Builder::new()
         .name("sz-teardown".to_string())
         .spawn(move || {
-            if let Err(e) = SzEnvironmentCore::destroy_global_instance() {
-                tracing::warn!("error destroying Senzing environment: {e}");
+            // Ownership-based teardown (replaces the removed
+            // `destroy_global_instance()`): reacquire the process singleton and
+            // consume it. `destroy()` first removes the global reference, then
+            // `Arc::try_unwrap`s — native `Sz_destroy()` only runs when this is
+            // the SOLE remaining reference. We are only ever called AFTER all
+            // worker/fetcher threads (and their `Arc<SzEnvironmentCore>` clones)
+            // have joined, so this clone plus the singleton are the only two refs
+            // and try_unwrap succeeds. If a clone somehow survived, destroy()
+            // returns an error (logged) and safely skips the native call rather
+            // than risking a use-after-free.
+            match SzEnvironmentCore::get_existing_instance() {
+                Ok(env) => {
+                    if let Err(e) = env.destroy() {
+                        tracing::warn!("error destroying Senzing environment: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("no Senzing environment to destroy: {e}"),
             }
             let _ = done_tx.send(());
         });

@@ -40,11 +40,11 @@ use crate::stats::{
     WORKER_FATAL, start_time,
 };
 
-/// Bit 62, historically the Senzing `SZ_WITH_INFO` flag. INERT at the engine
-/// level in this SDK (`add_record` / `process_redo_record` unconditionally call
-/// the WithInfo helpers regardless of flags); retained for parity with both
-/// sibling drivers. `--info` gates whether the (always-returned) payload is
-/// PRINTED.
+/// Bit 62, the Senzing `SZ_WITH_INFO` flag (equals `SzFlags::WITH_INFO`). As of
+/// sz-rust-sdk v4.3.1 this flag is HONORED: with it set, `add_record` /
+/// `process_redo_record` call the with-info FFI entry point and return the info
+/// payload; without it they return `SZ_NO_INFO` (empty string). `--info` gates
+/// whether the flag is passed (and thus whether the payload is produced/PRINTED).
 pub const SZ_WITH_INFO_BITS: u64 = 1 << 62;
 
 /// Flags for `add_record` (consumer parity; observably a no-op at the engine).
@@ -52,7 +52,7 @@ pub fn add_record_flags(info: bool) -> Option<SzFlags> {
     if info {
         Some(SzFlags::from_bits_retain(SZ_WITH_INFO_BITS))
     } else {
-        Some(SzFlags::ADD_RECORD_DEFAULT)
+        Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS)
     }
 }
 
@@ -453,36 +453,39 @@ fn process_redo(ctx: &WorkerCtx, engine: &dyn SzEngine, redo: &RedoSide, job: Re
                 info!("Stats: {count} redo records processed, {rate:.1}/sec");
             }
         }
-        Err(SzError::BadInput { .. }) | Err(SzError::RetryTimeoutExceeded { .. }) => {
-            // Redo records are engine-internal; there is no queue to reject
-            // to, so log loudly and drop (redoer parity).
-            warn!(
-                "REDO FAILED due to bad data or timeout [worker {}]: {}",
-                ctx.worker_id,
-                logging_id(&record)
-            );
-            REDOS_DROPPED.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(e) => {
-            error!(
-                "FATAL error processing redo record [worker {}]: {e} [{}]",
-                ctx.worker_id,
-                logging_id(&record)
-            );
-            ERRORS.fetch_add(1, Ordering::Relaxed);
-            WORKER_FATAL.store(true, Ordering::Relaxed);
-            RUNNING.store(false, Ordering::Relaxed);
-            if let Some(load) = &ctx.load {
-                // Durable fatal for the async side (mixed mode).
-                let _ = load.result_tx.blocking_send(Outcome {
-                    delivery_tag: 0,
-                    info: RecordInfo::empty(),
-                    action: Action::Fatal(e.to_string()),
-                });
-                load.shutdown_notify.notify_waiters();
+        Err(e) => match classify_error(&e) {
+            ErrorClass::BadInputOrTimeout => {
+                // Bad data, SENZ0082, or a retryable/timeout error (incl.
+                // SENZ0010). Redo records are engine-internal; there is no queue
+                // to reject to, so log loudly and drop (redoer parity).
+                warn!(
+                    "REDO FAILED due to bad data or timeout [worker {}]: {}",
+                    ctx.worker_id,
+                    logging_id(&record)
+                );
+                REDOS_DROPPED.fetch_add(1, Ordering::Relaxed);
             }
-            keep_going = false;
-        }
+            ErrorClass::Fatal => {
+                error!(
+                    "FATAL error processing redo record [worker {}]: {e} [{}]",
+                    ctx.worker_id,
+                    logging_id(&record)
+                );
+                ERRORS.fetch_add(1, Ordering::Relaxed);
+                WORKER_FATAL.store(true, Ordering::Relaxed);
+                RUNNING.store(false, Ordering::Relaxed);
+                if let Some(load) = &ctx.load {
+                    // Durable fatal for the async side (mixed mode).
+                    let _ = load.result_tx.blocking_send(Outcome {
+                        delivery_tag: 0,
+                        info: RecordInfo::empty(),
+                        action: Action::Fatal(e.to_string()),
+                    });
+                    load.shutdown_notify.notify_waiters();
+                }
+                keep_going = false;
+            }
+        },
     }
     REDO_BUSY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
@@ -574,7 +577,10 @@ mod tests {
             add_record_flags(true),
             Some(SzFlags::from_bits_retain(SZ_WITH_INFO_BITS))
         );
-        assert_eq!(add_record_flags(false), Some(SzFlags::ADD_RECORD_DEFAULT));
+        assert_eq!(
+            add_record_flags(false),
+            Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS)
+        );
     }
 
     #[test]

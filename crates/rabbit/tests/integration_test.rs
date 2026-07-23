@@ -130,7 +130,7 @@ fn real_engine_load_path_add_record() {
         &info.data_source,
         &info.record_id,
         body,
-        Some(SzFlags::ADD_RECORD_DEFAULT),
+        Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
     );
     assert!(result.is_ok(), "add_record failed: {:?}", result.err());
 
@@ -138,7 +138,7 @@ fn real_engine_load_path_add_record() {
     let stats = engine.get_stats();
     assert!(stats.is_ok(), "get_stats failed: {:?}", stats.err());
 
-    // NOTE: do NOT call destroy_global_instance() here. The Senzing engine is a
+    // NOTE: do NOT tear the environment down (env.destroy()) here. The Senzing engine is a
     // process-global singleton shared across every test in this binary. Tearing
     // it down mid-suite leaves the singleton's is_initialized flag true while
     // the native engine is gone, so the next test's get_instance() returns a
@@ -172,7 +172,7 @@ fn real_engine_redo_path() {
             &info.data_source,
             &info.record_id,
             &body,
-            Some(SzFlags::ADD_RECORD_DEFAULT),
+            Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
         );
         assert!(r.is_ok(), "add_record (redo seed) failed: {:?}", r.err());
     }
@@ -227,7 +227,7 @@ fn real_engine_bad_record_is_dead_lettered() {
         &info.data_source,
         &info.record_id,
         body,
-        Some(SzFlags::ADD_RECORD_DEFAULT),
+        Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
     ) {
         assert_eq!(
             classify_error(&e),
@@ -528,7 +528,7 @@ fn e2e_pure_redoer_100pct() {
             &info.data_source,
             &info.record_id,
             &rec,
-            Some(SzFlags::ADD_RECORD_DEFAULT),
+            Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
         );
     }
     let backlog_before = engine.count_redo_records().unwrap_or(0);
