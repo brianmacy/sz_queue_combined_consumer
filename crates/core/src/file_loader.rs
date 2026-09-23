@@ -34,7 +34,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -95,10 +95,12 @@ impl ResumeTracker {
 
 /// Append-only JSONL sink for rejected input lines. Opened lazily on the first
 /// write so a clean load creates no file. Every write is one original line +
-/// `\n`, flushed immediately (a SIGTERM must not lose rejects).
+/// `\n` in a single unbuffered `write_all` (a SIGTERM must not lose rejects,
+/// and a buffered writer would re-emit retained bytes after a failed flush,
+/// duplicating a line).
 struct RejectSink {
     path: PathBuf,
-    writer: Option<BufWriter<File>>,
+    file: Option<File>,
     written: u64,
 }
 
@@ -106,7 +108,7 @@ impl RejectSink {
     fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
-            writer: None,
+            file: None,
             written: 0,
         }
     }
@@ -121,17 +123,21 @@ impl RejectSink {
 
     /// Appends `line` (no trailing newline expected) as one JSONL record.
     fn write_line(&mut self, line: &[u8]) -> std::io::Result<()> {
-        if self.writer.is_none() {
-            let file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)?;
-            self.writer = Some(BufWriter::new(file));
+        if self.file.is_none() {
+            self.file = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
         }
-        let w = self.writer.as_mut().expect("writer opened above");
-        w.write_all(line)?;
-        w.write_all(b"\n")?;
-        w.flush()?;
+        let mut buf = Vec::with_capacity(line.len() + 1);
+        buf.extend_from_slice(line);
+        buf.push(b'\n');
+        self.file
+            .as_mut()
+            .expect("file opened above")
+            .write_all(&buf)?;
         self.written += 1;
         Ok(())
     }
@@ -301,12 +307,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
         "File load: {rejected} record(s) dead-lettered ({written} written to {reject_path}); \
          safe resume with --skip-lines {watermark}"
     );
-    if written != rejected as u64 {
-        warn!(
-            "{} rejected record(s) could NOT be written to {reject_path}; see log for the bodies",
-            (rejected as u64).saturating_sub(written)
-        );
-    }
+    let unwritten = (rejected as u64).saturating_sub(written);
 
     let result = match &read_result {
         Ok(lines) => {
@@ -314,6 +315,14 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
             if WORKER_FATAL.load(Ordering::Relaxed) {
                 Err(anyhow::anyhow!(
                     "a worker reported a fatal engine error during file load"
+                ))
+            } else if unwritten != 0 {
+                // The load itself completed, but rejects exist only in the log
+                // (e.g. a mistyped --reject-file directory). Exit non-zero so
+                // the operator notices before the log rotates away.
+                Err(anyhow::anyhow!(
+                    "{unwritten} rejected record(s) could NOT be written to {reject_path}; \
+                     their bodies are in the log"
                 ))
             } else {
                 Ok(())
