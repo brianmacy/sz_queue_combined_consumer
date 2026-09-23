@@ -29,9 +29,8 @@ client (compile-time backend selection — no runtime switch, no feature flags):
 also support the shared **file-input** mode (`--file`, below) and the pure
 redoer (`--redo-percent 100`). The SQS binary takes `--queue-url` /
 `SENZING_SQS_QUEUE_URL` (plus `--visibility-timeout`, `--wait-time`,
-`--max-messages`); credentials/region come from the standard AWS provider chain.
-Its visibility timeout MUST exceed the worst-case record processing time or SQS
-will redeliver an in-progress record.
+`--max-messages`, `--prefetch`, `--dead-letter-queue-url`); credentials/region
+come from the standard AWS provider chain. See [SQS specifics](#sqs-specifics).
 
 > NOTE: the repository is being renamed to `sz_queue_combined_consumer` to
 > reflect the multi-backend scope (the binaries keep their per-backend names).
@@ -94,7 +93,14 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_INPUT_FILE` (`-f`/`--file`) | none | load JSONL (one JSON record per line) from a single file instead of RabbitMQ. Pure loader (redo% ignored); mutually exclusive with `--url`/`--queue`. Exits 0 at EOF. |
 | `SENZING_SKIP_LINES` (`--skip-lines`) | 0 | file mode only: skip the first N physical lines. Resumes an interrupted load — the driver prints a safe `--skip-lines` offset (contiguous-completion watermark) at shutdown. |
 | `SENZING_REJECT_FILE` (`--reject-file`) | `<input>.rejected.jsonl` | file mode only: JSONL file that receives every rejected input line **verbatim** (unparseable, engine bad input, retry timeout, SENZ0082). Created lazily on the first reject, opened in append mode. Reprocess with `--file <reject file>`. |
-| `SENZING_PREFETCH` (`--prefetch`) | threads + 2 | `basic_qos` prefetch |
+| `SENZING_PREFETCH` (`--prefetch`) | RabbitMQ: threads + 2; SQS: threads | RabbitMQ: `basic_qos` prefetch. SQS: extra messages held beyond the worker count (in-flight cap = threads + prefetch) |
+| `SENZING_SQS_QUEUE_URL` (`-q`/`--queue-url`) | required iff redo% < 100 | SQS binary only: source queue URL |
+| `SENZING_SQS_DEAD_LETTER_QUEUE_URL` (`--dead-letter-queue-url`) | discovered | SQS binary only: where rejected records are sent. Default: the source queue's `RedrivePolicy` → `deadLetterTargetArn` → `GetQueueUrl`. Printed at startup as `DeadLetter: <url>`. |
+| `SENZING_SQS_ALLOW_NO_DLQ` (`--allow-no-dlq`) | off | SQS binary only: start even when no DLQ can be resolved. Rejects are then **deleted** (lost); the log names them with their body. Without it, no DLQ = refuse to start. |
+| `SENZING_SQS_VISIBILITY_TIMEOUT` (`--visibility-timeout`) | 2 × LONG_RECORD | SQS binary only: initial visibility on receive. Long records are extended automatically (below). |
+| `SENZING_SQS_WAIT_TIME` (`--wait-time`) | 20 | SQS binary only: long-poll seconds (0..=20) |
+| `SENZING_SQS_MAX_MESSAGES` (`--max-messages`) | 10 | SQS binary only: receive batch size (1..=10); further capped by free in-flight room |
+| `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_ENDPOINT_URL`, … | provider chain | SQS binary only: standard AWS SDK resolution (env, `~/.aws`, IMDS/ECS role, web identity). SSO / `credential_process` are not compiled in (see Cargo.toml). |
 | `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | diagnostic MQ depth probe cadence (not a correctness poll) |
 | `SENZING_REDO_SLEEP_TIME_IN_SECONDS` (`--redo-sleep-secs`) | 60 | fetcher pause on empty redo queue (auto-shortened to 2 s while redo is still in flight, for cascade drain) |
 | `LONG_RECORD` (`--long-record`) | 300 | long-record threshold, seconds; stats cadence = LONG_RECORD/2 |
@@ -103,15 +109,59 @@ verbatim-compatible with the sibling drivers.
 | `-t`/`--debugTrace` | off | engine debug trace |
 
 Validation is loud (exit 1): redo% ∉ [0,100]; redo% < 100 without URL/queue;
-0 < redo% < 100 with fewer than 2 threads.
+0 < redo% < 100 with fewer than 2 threads; `LONG_RECORD` < 1. Exit codes:
+**1** = configuration/validation failure at startup, **255** = fatal runtime
+error (engine/DB/broker) after an orderly teardown, **0** = clean shutdown or
+file EOF. (The standalone drivers disagreed with each other here; the combined
+driver uses this one convention for both binaries.)
+
+## SQS specifics
+
+* **Dead-letter queue.** SQS has no reject verb, and an explicit `DeleteMessage`
+  never triggers the redrive policy. So a rejected record (engine bad input,
+  `SENZ0010` retry timeout, `SENZ0082`, unparseable body) is **`SendMessage`d
+  to the DLQ verbatim, then deleted** from the source — `sz_sqs_consumer-v4`
+  parity, `Sending to deadletter: DS : ID` on stdout. The DLQ is resolved once
+  at startup: `--dead-letter-queue-url` if set, else discovered from the source
+  queue's `RedrivePolicy`. **No DLQ = refuse to start** unless `--allow-no-dlq`.
+  If the DLQ send fails the source message is left alone (visibility expiry
+  redelivers it); nothing is deleted that was not preserved first.
+* **FIFO queues.** A `.fifo` DLQ gets `MessageGroupId` (the source message's
+  group, else `DATA_SOURCE`) and `MessageDeduplicationId` (the source
+  `MessageId`, else `DS-ID`).
+* **Long records.** Every `LONG_RECORD/2` seconds a record still processing past
+  `LONG_RECORD × (n+1)` has its visibility extended to `(n+2) × LONG_RECORD`
+  (`ChangeMessageVisibility`, capped at the SQS 12 h maximum) and is logged as
+  `Extended visibility (… min, extended n times): DS : ID`. When every worker
+  is on such a record: `All N threads are stuck on long running records`.
+* **Settle.** Deletes are batched (`DeleteMessageBatch`, 10 per call, flushed
+  every second and at shutdown). A fatal engine error leaves the message
+  un-deleted so SQS redelivers it. Messages still in a worker at SIGTERM are
+  printed as `Still processing (… min): DS : ID` and left for redelivery.
+* **Stats.** Same `Processed N adds, R records per second`, `Engine stats:` and
+  `Combined stats:` lines as the RabbitMQ binary; `mq_depth` is the source
+  queue's `ApproximateNumberOfMessages`.
+* **IAM.** On the source queue: `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
+  `sqs:ChangeMessageVisibility`, `sqs:GetQueueAttributes`. On the DLQ:
+  `sqs:SendMessage`, `sqs:GetQueueUrl` (discovery only).
 
 ## Failure handling
 
 * **Poison MQ record** (bad JSON / missing DATA_SOURCE/RECORD_ID / non-UTF-8 /
   engine BadInput / SENZ0082 / long-record give-up) → dead-letter
   (`basic_reject`, no requeue) + loud warn, keep running.
-* **Poison redo record** (BadInput / retry timeout) → warn + drop (no queue to
-  reject to; counted as `redos_dropped`).
+* **Poison redo record** (BadInput / retry timeout / SENZ0082) → warn (with the
+  engine error text) + drop (no queue to reject to; counted as
+  `redos_dropped`). SENZ0082 on a redo record is dropped rather than fatal on
+  purpose: a DQM-rejected value can never succeed, and a fatal would wedge the
+  redo queue on that one record.
+* **File mode** has no queue: rejects go verbatim to the JSONL reject file
+  (`--reject-file`, see above). **SQS** sends them to the dead-letter queue
+  (see [SQS specifics](#sqs-specifics)).
+* **Database connection lost / transient DB error** → **fatal** (orderly
+  shutdown, exit 255), never dead-lettered: the database is unhealthy, not the
+  record. Deliveries stay unacked / un-deleted so the broker redelivers them
+  once the process is restarted.
 * **Fatal errors** (Database, NotInitialized, License, …) → orderly teardown,
   non-zero exit. Graceful shutdown drains in-flight work within a 10 s grace;
   deliveries still inside a worker are dead-lettered (the engine call may still
