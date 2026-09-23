@@ -17,8 +17,8 @@ authors = ["Brian Macy"]
 license = "Apache-2.0"
 
 [workspace.dependencies]
-# Pinned by commit (supply-chain rule: rev, not a movable tag). b6be5cb = tag v4.3.1.
-sz-rust-sdk = { git = "https://github.com/brianmacy/sz-rust-sdk", rev = "b6be5cb1c8a2db77ba122b9e518e794c6baa76a1" }
+# Pinned by commit (supply-chain rule: rev, not a movable tag). 2787281 = tag v4.3.2.
+sz-rust-sdk = { git = "https://github.com/brianmacy/sz-rust-sdk", rev = "278728123d4bbf566758c7031f3cf7b39ed427c8" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 lapin = "4"
 futures-lite = "2"
