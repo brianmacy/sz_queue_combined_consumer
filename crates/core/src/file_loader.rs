@@ -18,15 +18,24 @@
 //! a resume never skips an unprocessed line; at most a few still-in-flight lines
 //! past the watermark are reprocessed (idempotent).
 //!
+//! ## Reject file
+//! A file has no dead-letter queue, so every rejected line — unparseable JSON,
+//! engine bad-input, retry timeout, SENZ0082 — is appended VERBATIM to a JSONL
+//! side file (`--reject-file`, default `<input>.rejected.jsonl`) so it can be
+//! reprocessed later simply by pointing `--file` at it. The file is created
+//! lazily on the first reject (a clean load leaves nothing behind) and opened
+//! in append mode so a resumed run adds to it. WHY each record was rejected is
+//! in the application log (the worker logs the engine error text).
+//!
 //! ## redo
 //! File mode is a PURE loader — it does not process the engine redo queue
 //! (`redo%` is ignored, with a warning). Drain redo separately with a
 //! `redo% = 100` run once the file load completes.
 
-use std::collections::HashSet;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -84,6 +93,76 @@ impl ResumeTracker {
     }
 }
 
+/// Append-only JSONL sink for rejected input lines. Opened lazily on the first
+/// write so a clean load creates no file. Every write is one original line +
+/// `\n` in a single unbuffered `write_all` (a SIGTERM must not lose rejects,
+/// and a buffered writer would re-emit retained bytes after a failed flush,
+/// duplicating a line).
+struct RejectSink {
+    path: PathBuf,
+    file: Option<File>,
+    written: u64,
+}
+
+impl RejectSink {
+    fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            file: None,
+            written: 0,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Appends `line` (no trailing newline expected) as one JSONL record.
+    fn write_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+        if self.file.is_none() {
+            self.file = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
+        }
+        let mut buf = Vec::with_capacity(line.len() + 1);
+        buf.extend_from_slice(line);
+        buf.push(b'\n');
+        self.file
+            .as_mut()
+            .expect("file opened above")
+            .write_all(&buf)?;
+        self.written += 1;
+        Ok(())
+    }
+}
+
+/// Bodies of lines dispatched to workers but not yet reported back, keyed by
+/// line number, so an engine reject can be written to the reject file
+/// verbatim. Bounded by workers + work-channel capacity.
+type InFlightBodies = Arc<Mutex<HashMap<u64, Vec<u8>>>>;
+
+/// Writes one rejected line to the sink and counts it. A sink I/O failure is
+/// logged loudly (with the line so it is not lost silently) but does not abort
+/// the load — the add itself already failed; stopping would lose more.
+fn reject_line(sink: &Arc<Mutex<RejectSink>>, line_no: u64, body: &[u8]) {
+    ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+    let mut sink = sink.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Err(e) = sink.write_line(body) {
+        warn!(
+            "cannot write rejected line {line_no} to {:?}: {e}; record follows: {}",
+            sink.path(),
+            String::from_utf8_lossy(body)
+        );
+    }
+}
+
 /// Runs the file loader to EOF (or SIGTERM) and returns
 /// `(workers_clean, result)` mirroring [`crate::pure_redoer::run`], so `main`
 /// can share the bounded-teardown exit path.
@@ -98,10 +177,14 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
         .expect("file_loader::run requires an input file (validated at startup)");
     let skip = config.skip_lines;
     let n_workers = config.threads;
+    let reject_path = config
+        .reject_file
+        .clone()
+        .expect("file_loader::run requires a reject file (resolved at startup)");
 
     info!(
         "File loader: reading {path:?} with {n_workers} workers (skip-lines: {skip}); \
-         redo is NOT processed in file mode"
+         rejected lines are appended to {reject_path:?}; redo is NOT processed in file mode"
     );
     if config.redo_percent != 0 {
         warn!(
@@ -158,16 +241,28 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
 
     // --- Result consumer (counts outcomes; maintains the resume watermark) ---
     let resume = Arc::new(Mutex::new(ResumeTracker::new(skip + 1)));
+    let sink = Arc::new(Mutex::new(RejectSink::new(&reject_path)));
+    let in_flight: InFlightBodies = Arc::new(Mutex::new(HashMap::new()));
     let consumer_resume = resume.clone();
+    let consumer_sink = sink.clone();
+    let consumer_in_flight = in_flight.clone();
     let consumer = std::thread::Builder::new()
         .name("sz-file-result".to_string())
-        .spawn(move || result_consumer(result_rx, want_info, consumer_resume));
+        .spawn(move || {
+            result_consumer(
+                result_rx,
+                want_info,
+                consumer_resume,
+                consumer_sink,
+                consumer_in_flight,
+            )
+        });
 
     // Drop our extra result sender so the channel closes once all workers exit.
     drop(result_tx);
 
     // --- Reader: skip, then feed each line to the worker pool ----------------
-    let read_result = read_and_feed(Path::new(&path), skip, &work_tx, &resume);
+    let read_result = read_and_feed(Path::new(&path), skip, &work_tx, &resume, &sink, &in_flight);
 
     // EOF / stop: closing work_tx lets idle workers observe end-of-stream.
     drop(work_tx);
@@ -200,13 +295,19 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
     let adds = ADDS_PROCESSED.load(Ordering::Relaxed);
     let rejected = ADDS_REJECTED.load(Ordering::Relaxed);
     let errors = ERRORS.load(Ordering::Relaxed);
+    let written = sink
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .written();
 
     // "Processed total of N adds ..." keeps the prefix the e2e tests / tooling
     // scrape; the resume hint is file-mode specific.
     println!("Processed total of {adds} adds, 0 redo records (0 redo dropped, {errors} errors)");
     println!(
-        "File load: {rejected} record(s) dead-lettered; safe resume with --skip-lines {watermark}"
+        "File load: {rejected} record(s) dead-lettered ({written} written to {reject_path}); \
+         safe resume with --skip-lines {watermark}"
     );
+    let unwritten = (rejected as u64).saturating_sub(written);
 
     let result = match &read_result {
         Ok(lines) => {
@@ -214,6 +315,14 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
             if WORKER_FATAL.load(Ordering::Relaxed) {
                 Err(anyhow::anyhow!(
                     "a worker reported a fatal engine error during file load"
+                ))
+            } else if unwritten != 0 {
+                // The load itself completed, but rejects exist only in the log
+                // (e.g. a mistyped --reject-file directory). Exit non-zero so
+                // the operator notices before the log rotates away.
+                Err(anyhow::anyhow!(
+                    "{unwritten} rejected record(s) could NOT be written to {reject_path}; \
+                     their bodies are in the log"
                 ))
             } else {
                 Ok(())
@@ -227,13 +336,16 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
 /// Reads `path`, skips the first `skip` physical lines, and feeds each remaining
 /// non-blank line to the worker pool as a [`LoadItem`] keyed by absolute line
 /// number. Blank and unparseable lines are completed immediately (blank =
-/// skipped, unparseable = dead-lettered) so the resume watermark can advance
-/// past them. Returns the total physical line count read (including skipped).
+/// skipped, unparseable = written to the reject file) so the resume watermark
+/// can advance past them. Returns the total physical line count read
+/// (including skipped).
 fn read_and_feed(
     path: &Path,
     skip: u64,
     work_tx: &mpsc::Sender<LoadItem>,
     resume: &Arc<Mutex<ResumeTracker>>,
+    sink: &Arc<Mutex<RejectSink>>,
+    in_flight: &InFlightBodies,
 ) -> Result<u64> {
     let file = File::open(path).with_context(|| format!("cannot open input file {path:?}"))?;
     let reader = BufReader::new(file);
@@ -262,22 +374,31 @@ fn read_and_feed(
 
         match parse_record(trimmed.as_bytes()) {
             Ok(info) => {
+                let body = trimmed.as_bytes().to_vec();
+                in_flight
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(line_no, body.clone());
                 let item = LoadItem {
                     delivery_tag: line_no,
-                    body: trimmed.as_bytes().to_vec(),
+                    body,
                     info,
                 };
                 // Backpressure: blocks when the work channel is full. An Err
                 // means every worker has exited (e.g. fatal) — stop reading.
                 if work_tx.blocking_send(item).is_err() {
                     warn!("worker pool closed; stopping file read at line {line_no}");
+                    in_flight
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&line_no);
                     break;
                 }
             }
             Err(e) => {
-                // Bad record: dead-letter (log + count), do not stop the load.
-                warn!("dead-lettering unparseable record at line {line_no}: {e}");
-                ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+                // Bad record: reject (log + count + side file), do not stop.
+                warn!("REJECTING unparseable record at line {line_no}: {e}");
+                reject_line(sink, line_no, trimmed.as_bytes());
                 complete(resume, line_no);
             }
         }
@@ -286,19 +407,26 @@ fn read_and_feed(
 }
 
 /// Drains worker outcomes, updates the global add counters, prints WithInfo
-/// responses when requested, and advances the resume watermark. Exits when all
-/// worker result senders have dropped (channel closed).
+/// responses when requested, writes engine rejects to the reject file, and
+/// advances the resume watermark. Exits when all worker result senders have
+/// dropped (channel closed).
 fn result_consumer(
     mut result_rx: mpsc::Receiver<Outcome>,
     want_info: bool,
     resume: Arc<Mutex<ResumeTracker>>,
+    sink: Arc<Mutex<RejectSink>>,
+    in_flight: InFlightBodies,
 ) {
     while let Some(outcome) = result_rx.blocking_recv() {
         let Outcome {
             delivery_tag,
-            info: _,
+            info,
             action,
         } = outcome;
+        let body = in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&delivery_tag);
         match action {
             Action::Ack(maybe_info) => {
                 if want_info && let Some(resp) = maybe_info {
@@ -308,7 +436,22 @@ fn result_consumer(
                 complete(&resume, delivery_tag);
             }
             Action::RejectNoRequeue => {
-                ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+                // The worker already logged WHY (engine error text); log WHERE.
+                warn!(
+                    "REJECTING line {delivery_tag} ({} : {}) -> {:?}",
+                    info.data_source,
+                    info.record_id,
+                    sink.lock().unwrap_or_else(PoisonError::into_inner).path()
+                );
+                match body {
+                    Some(body) => reject_line(&sink, delivery_tag, &body),
+                    None => {
+                        // Cannot happen (inserted before dispatch); count it
+                        // and say so rather than lose the reject silently.
+                        ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+                        warn!("no in-flight body for rejected line {delivery_tag}; not written");
+                    }
+                }
                 complete(&resume, delivery_tag);
             }
             Action::Fatal(msg) => {
@@ -349,6 +492,42 @@ mod tests {
         // 7 done -> now 6,7,8 contiguous -> jumps to 8.
         t.complete(7);
         assert_eq!(t.watermark(), 8);
+    }
+
+    #[test]
+    fn reject_sink_is_lazy_appends_and_counts() {
+        let dir = std::env::temp_dir().join(format!("sz_reject_sink_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("in.jsonl.rejected.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        let mut sink = RejectSink::new(&path);
+        assert!(
+            !path.exists(),
+            "sink must not create the file until first write"
+        );
+        assert_eq!(sink.written(), 0);
+
+        sink.write_line(br#"{"A":1}"#).expect("write 1");
+        sink.write_line(br#"{"B":2}"#).expect("write 2");
+        assert_eq!(sink.written(), 2);
+        drop(sink);
+
+        // A second sink (resumed run) appends rather than truncating.
+        let mut sink2 = RejectSink::new(&path);
+        sink2.write_line(br#"{"C":3}"#).expect("write 3");
+        drop(sink2);
+
+        let content = std::fs::read_to_string(&path).expect("read back");
+        assert_eq!(content, "{\"A\":1}\n{\"B\":2}\n{\"C\":3}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reject_sink_reports_unwritable_path() {
+        let mut sink = RejectSink::new("/nonexistent-dir-for-sz-test/x.jsonl");
+        assert!(sink.write_line(b"{}").is_err());
+        assert_eq!(sink.written(), 0);
     }
 
     #[test]

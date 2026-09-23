@@ -7,7 +7,7 @@ resolver = "3"
 members = ["crates/core", "crates/rabbit", "crates/sqs"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Bumped 1.88 -> 1.94.1 so the MSRV-aware resolver selects the current AWS SDK
 # (aws-smithy-http-client >= 1.2 uses rustls 0.23 / rustls-webpki 0.103.13+),
@@ -17,7 +17,8 @@ authors = ["Brian Macy"]
 license = "Apache-2.0"
 
 [workspace.dependencies]
-sz-rust-sdk = { git = "https://github.com/brianmacy/sz-rust-sdk", tag = "v4.3.1" }
+# Pinned by commit (supply-chain rule: rev, not a movable tag). b6be5cb = tag v4.3.1.
+sz-rust-sdk = { git = "https://github.com/brianmacy/sz-rust-sdk", rev = "b6be5cb1c8a2db77ba122b9e518e794c6baa76a1" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
 lapin = "4"
 futures-lite = "2"

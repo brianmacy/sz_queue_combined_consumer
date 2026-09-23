@@ -19,11 +19,18 @@ tokio.workspace = true
 aws-config.workspace = true
 aws-sdk-sqs.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 ctrlc.workspace = true
 
 [dev-dependencies]
+# tests/sqs_e2e.rs spawns the binary against a real SQS API (ElasticMQ in CI)
+# and drives queues with the same SDK. libc: SIGTERM via kill(2) (the
+# senzingsdk-runtime CI container has no `kill` executable on PATH).
 libc.workspace = true
 sz-rust-sdk.workspace = true
+aws-config.workspace = true
+aws-sdk-sqs.workspace = true
+tokio.workspace = true

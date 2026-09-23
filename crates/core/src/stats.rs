@@ -5,9 +5,107 @@
 //! `Sz_init`), mirroring `sz_simple_redoer_rust`'s style. Both run paths (the
 //! mixed tokio path and the pure-redoer path) share them.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+use sz_rust_sdk::prelude::*;
+
+/// Throughput reporting interval, in processed load records (consumer parity:
+/// `Processed N adds, R records per second` every 10 000 adds).
+pub const THROUGHPUT_INTERVAL: u64 = 10_000;
+
+/// Emits the sibling drivers' `Processed N adds, R records per second` line
+/// every [`THROUGHPUT_INTERVAL`] adds. Backend-agnostic: the caller feeds it
+/// the running add count after each settled add.
+pub struct ThroughputTicker {
+    last_at: Instant,
+}
+
+impl Default for ThroughputTicker {
+    fn default() -> Self {
+        Self {
+            last_at: Instant::now(),
+        }
+    }
+}
+
+impl ThroughputTicker {
+    /// Returns the records/sec figure when `processed` just crossed an interval
+    /// boundary (and resets the window), else `None`. `-1` mirrors the Python
+    /// sibling when the window is zero-length.
+    pub fn observe(&mut self, before: u64, processed: u64) -> Option<i64> {
+        if processed > before && processed.is_multiple_of(THROUGHPUT_INTERVAL) {
+            let elapsed = self.last_at.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 {
+                (THROUGHPUT_INTERVAL as f64 / elapsed) as i64
+            } else {
+                -1
+            };
+            self.last_at = Instant::now();
+            Some(speed)
+        } else {
+            None
+        }
+    }
+
+    /// Prints the throughput line if an interval boundary was crossed.
+    pub fn report(&mut self, before: u64, processed: u64) {
+        if let Some(speed) = self.observe(before, processed) {
+            println!("Processed {processed} adds, {speed} records per second");
+        }
+    }
+}
+
+/// Response from the dedicated stats thread (blocking engine calls happen
+/// there, never on an async task).
+pub struct StatsPayload {
+    pub engine_stats: Option<String>,
+    /// `count_redo_records()` — currently always `None`; see [`stats_loop`].
+    pub redo_backlog: Option<i64>,
+}
+
+/// Dedicated thread owning one engine handle for blocking `get_stats()`.
+/// Shared by every async backend (RabbitMQ, SQS); the pure redoer calls
+/// `get_stats` on its own monitor thread instead.
+///
+/// TODO(reporting): reinstate a redo-backlog gauge WITHOUT count_redo_records().
+/// count_redo_records() = `COUNT(*) FROM SYS_EVAL_QUEUE` (full table scan) and
+/// dominated DB user CPU at Sayari scale. Reintroduce backlog via a cheap source
+/// (e.g. engine get_stats redo counters, or a DB-side metadata rowcount like
+/// sys.dm_db_partition_stats / pg_class.reltuples) so `redo_backlog` /
+/// `redo_backlog_slope` come back for reporting at ~zero DB cost.
+pub fn stats_loop(
+    env: Arc<SzEnvironmentCore>,
+    req_rx: std::sync::mpsc::Receiver<()>,
+    resp_tx: tokio::sync::mpsc::Sender<StatsPayload>,
+) {
+    let engine = match env.get_engine() {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("stats thread: failed to get engine: {e}");
+            return;
+        }
+    };
+    while req_rx.recv().is_ok() {
+        let engine_stats = match engine.get_stats() {
+            Ok(stats) => Some(stats),
+            Err(e) => {
+                tracing::warn!("get_stats failed: {e}");
+                None
+            }
+        };
+        if resp_tx
+            .blocking_send(StatsPayload {
+                engine_stats,
+                redo_backlog: None,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
 
 /// Global run flag: flipped to `false` on shutdown (signal or fatal error).
 pub static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -241,6 +339,16 @@ impl FloorGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn throughput_ticker_fires_only_on_interval_boundary_crossings() {
+        let mut t = ThroughputTicker::default();
+        assert_eq!(t.observe(0, 1), None);
+        assert_eq!(t.observe(9_999, 9_999), None, "no progress -> no report");
+        assert!(t.observe(9_999, 10_000).is_some());
+        assert_eq!(t.observe(10_000, 10_001), None);
+        assert!(t.observe(19_999, 20_000).is_some());
+    }
 
     #[test]
     fn ewma_first_sample_is_identity() {
