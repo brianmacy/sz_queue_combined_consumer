@@ -7,30 +7,14 @@ version = 2
 # These are transitive dependencies from lapin -> amq-protocol-tcp -> tcp-stream
 # tracking: https://github.com/lapin-rs/lapin/issues
 ignore = [
-    # rustls-pemfile is unmaintained, should migrate to rustls-pki-types
-    # Blocked by: tcp-stream needs to update its dependencies
-    # Impact: Low - maintenance advisory, not a security vulnerability
-    # Plan: Monitor tcp-stream releases, upgrade when fixed
-    "RUSTSEC-2025-0134",
-
-    # RUSTSEC-2026-0009 (time < 0.3.47 RFC 2822 DoS) ignore REMOVED 2026-09-23:
-    # Cargo.lock now resolves time 0.3.54, and cargo-deny >= 0.19 fails the
-    # advisories check on an ignore that matches no crate.
-
-    # rustls TLS 1.3 handshake messages accepted across encryption-level
-    # boundaries (fixed in rustls >= 0.23.45).
-    # Blocked by: MSRV 1.94.1 — the MSRV-aware resolver locks rustls 0.23.43;
-    #   0.23.45 needs a newer rustc. Lift when the MSRV moves (Dockerfile, CI pins).
-    # Impact: Low here — rustls is only the HTTPS *client* to AWS SQS endpoints
-    #   (aws-smithy-http-client); the flaw concerns accepting malformed server
-    #   handshakes, and the peer is AWS.
-    # Plan: bump MSRV / rust-version, `cargo update -p rustls`, delete this.
-    "RUSTSEC-2026-0285",
-    # NOTE: the rustls-webpki 0.101.7 advisories (RUSTSEC-2026-0098/-0099/-0104)
-    # that the SQS backend tripped under MSRV 1.88 are GONE at MSRV 1.94.1: the
-    # AWS SDK now resolves aws-smithy-http-client >= 1.2 with the modern
-    # rustls-aws-lc stack (rustls 0.23 / rustls-webpki 0.103.13), so the
-    # vulnerable 0.101.7 is no longer in the build graph. No ignore needed.
+    # Empty on purpose (2026-09-23). Previously ignored and now resolved:
+    #   RUSTSEC-2025-0134 rustls-pemfile unmaintained — crate no longer in Cargo.lock.
+    #   RUSTSEC-2026-0009 time < 0.3.47 RFC 2822 DoS — Cargo.lock has time 0.3.54.
+    #   RUSTSEC-2026-0285 rustls TLS 1.3 handshake — Cargo.lock has rustls 0.23.45
+    #     (needs rustc 1.71, well under MSRV 1.94.1; `cargo update -p rustls` alone
+    #     stopped at 0.23.43 only because aws-lc-rs/aws-lc-sys had to move with it).
+    # cargo-deny >= 0.19 FAILS on an ignore that matches no crate, so do not park
+    # stale entries here.
 ]
 
 [licenses]
