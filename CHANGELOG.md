@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased — SQS dead-letter queue restored + sibling parity (2026-09-23)
+All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
+
+## 0.3.0 — SQS dead-letter queue restored + sibling parity (2026-09-23)
 
 Audit of the combined driver against the standalone drivers it subsumed
 (`sz_sqs_consumer-v4`, `sz_rabbit_consumer_rust`, `sz_simple_redoer_rust`).
@@ -49,7 +51,7 @@ Audit of the combined driver against the standalone drivers it subsumed
   `cargo audit` and `cargo deny check` are both clean and `deny.toml` carries
   no advisory ignores (the three stale ones were removed).
 
-## Unreleased — file mode writes rejected records to a JSONL reject file (2026-09-23)
+## 0.3.0 — file mode writes rejected records to a JSONL reject file (2026-09-23)
 
 * **`--reject-file` / `SENZING_REJECT_FILE` (file mode).** A file has no DLQ, so
   engine rejects (bad input, `SENZ0010` retry timeout, `SENZ0082`) and
@@ -82,7 +84,7 @@ Audit of the combined driver against the standalone drivers it subsumed
 * Redo-drop log line now includes the engine error text (`-> {e}`), redoer
   parity; previously only the record id was logged.
 
-## Unreleased — bump MSRV to 1.94.1 + modern AWS TLS (drops advisory ignores) (2026-07-21)
+## 0.3.0 — bump MSRV to 1.94.1 + modern AWS TLS (drops advisory ignores) (2026-07-21)
 
 * **MSRV `1.88` → `1.94.1`** (`rust-version`, CI toolchain pins, Dockerfile
   `rust:1.94.1`). The MSRV-aware resolver now selects the current AWS SDK
@@ -101,7 +103,7 @@ Audit of the combined driver against the standalone drivers it subsumed
 * Verified on the 1.94.1 toolchain: build + clippy `-D warnings` + fmt + full
   `cargo deny` (no ignores) + workspace unit tests, both bins' dep isolation.
 
-## Unreleased — multi-backend workspace + Amazon SQS driver (2026-07-21)
+## 0.3.0 — multi-backend workspace + Amazon SQS driver (2026-07-21)
 
 * **Cargo workspace.** Split the single crate into `crates/core`
   (`sz-combined-consumer-core`, lib — worker pool, redo fetcher, stats, live
@@ -132,7 +134,7 @@ Audit of the combined driver against the standalone drivers it subsumed
 * Repository being renamed to `sz_queue_combined_consumer` (binaries keep their
   per-backend names).
 
-## Unreleased — file-input load mode + --skip-lines (2026-07-20)
+## 0.3.0 — file-input load mode + --skip-lines (2026-07-20)
 
 * **`src/file_loader.rs` (new) — load JSONL records from a single file instead of
   RabbitMQ.** Selected by `--file`/`SENZING_INPUT_FILE` (mutually exclusive with
@@ -151,7 +153,7 @@ Audit of the combined driver against the standalone drivers it subsumed
   `e2e_file_loader` (spawns the binary in file mode, asserts clean EOF exit, correct
   add count, and dead-lettering of a malformed line).
 
-## Unreleased — remove count_redo anti-pattern; config/license diagnostics (2026-07-17)
+## 0.3.0 — remove count_redo anti-pattern; config/license diagnostics (2026-07-17)
 
 * **`src/combined.rs`, `src/pure_redoer.rs` — removed `count_redo_records()`.** It issued
   `COUNT(*) FROM SYS_EVAL_QUEUE` (a full table scan) once per stats interval, which dominated
@@ -187,7 +189,7 @@ Audit of the combined driver against the standalone drivers it subsumed
   submodule (job failed at checkout in ~34s). Added an `Install git` step before checkout so the
   submodule is fetched via native git.
 
-## Unreleased — live config auto-reload (2026-07-16)
+## 0.3.0 — live config auto-reload (2026-07-16)
 
 * **`src/config_reload.rs` (new)** — adopt a new registered DEFAULT engine config WITHOUT a
   process restart, so an operator can bump the config (e.g. apply a
@@ -205,7 +207,7 @@ Audit of the combined driver against the standalone drivers it subsumed
 * Uses `SzEnvironment::reinitialize` (documented thread-safe; existing engine handles stay valid).
 * No new dep; env knob `SENZING_CONFIG_RELOAD_SECS` (default 60, `0` disables periodic; error-path stays on).
 
-## Unreleased — bound native teardown on shutdown (issue #4, merged from main / PR #5)
+## 0.3.0 — bound native teardown on shutdown (issue #4, merged from main / PR #5)
 
 * **`src/main.rs` — bound the native teardown and guarantee a prompt process exit
   on every shutdown path.** The four e2e integration tests hung >30s on SIGTERM
