@@ -2778,7 +2778,7 @@ dependencies = [
 
 [[package]]
 name = "sz-combined-consumer-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2806,7 +2806,7 @@ dependencies = [
 
 [[package]]
 name = "sz_rabbit_combined_consumer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2821,7 +2821,7 @@ dependencies = [
 
 [[package]]
 name = "sz_sqs_combined_consumer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aws-config",
