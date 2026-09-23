@@ -36,15 +36,12 @@ use sz_combined_consumer_core::record::{RecordInfo, parse_record};
 use sz_combined_consumer_core::redo::fetcher_loop;
 use sz_combined_consumer_core::stats::{
     self, ADDS_PROCESSED, ADDS_REJECTED, Ewma, FloorGuard, GuardTransition, RUNNING,
-    SAMPLE_REDO_RECORDS,
+    SAMPLE_REDO_RECORDS, StatsPayload, ThroughputTicker, stats_loop,
 };
 use sz_combined_consumer_core::worker::{
     Action, Class, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
     WorkerCtx, add_record_flags, monitor_redo_in_flight, redo_flags, worker_loop,
 };
-
-/// Throughput reporting interval, in processed load records (consumer parity).
-const STATS_INTERVAL: u64 = 10_000;
 
 /// EWMA smoothing for the redo-backlog slope.
 const SLOPE_EWMA_ALPHA: f64 = 0.3;
@@ -56,15 +53,6 @@ struct InFlight {
     /// Set once we have rejected this delivery to the dead-letter queue so we
     /// do not also ack it when the (now ignored) worker result arrives.
     rejected: bool,
-}
-
-/// Response from the dedicated stats thread (blocking engine calls happen
-/// there, never on the async task).
-struct StatsPayload {
-    engine_stats: Option<String>,
-    /// `count_redo_records()` — requested only when redo% > 0 (monitoring
-    /// ONLY; emptiness is always detected by the fetcher's `get_redo_record`).
-    redo_backlog: Option<i64>,
 }
 
 /// Outcome of [`run`], reported to `main` so it can decide whether tearing
@@ -274,7 +262,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
 
     let mut in_flight: HashMap<u64, InFlight> = HashMap::new();
     let mut processed: u64 = 0;
-    let mut last_rate_at = Instant::now();
+    let mut throughput = ThroughputTicker::default();
     let mut shutting_down = false;
     let mut fatal: Option<String> = None;
     let mut shutdown_deadline: Option<Instant> = None;
@@ -322,16 +310,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
                             fatal = Some(msg);
                             shutting_down = true;
                         }
-                        if processed > before && processed.is_multiple_of(STATS_INTERVAL) {
-                            let elapsed = last_rate_at.elapsed().as_secs_f64();
-                            let speed = if elapsed > 0.0 {
-                                (STATS_INTERVAL as f64 / elapsed) as i64
-                            } else {
-                                -1
-                            };
-                            println!("Processed {processed} adds, {speed} records per second");
-                            last_rate_at = Instant::now();
-                        }
+                        throughput.report(before, processed);
                     }
                     None => {
                         // All workers (and the fetcher) exited.
@@ -753,49 +732,6 @@ async fn monitor_long_records(
             {
                 tracing::error!("basic_reject (long record) failed for {tag}: {e:#}");
             }
-        }
-    }
-}
-
-/// Dedicated thread owning one engine handle for blocking `get_stats()`.
-///
-/// TODO(reporting): reinstate a redo-backlog gauge WITHOUT count_redo_records().
-/// count_redo_records() = `COUNT(*) FROM SYS_EVAL_QUEUE` (full table scan) and
-/// dominated DB user CPU at Sayari scale. Reintroduce backlog via a cheap source
-/// (e.g. engine get_stats redo counters, or a DB-side metadata rowcount like
-/// sys.dm_db_partition_stats / pg_class.reltuples) so `redo_backlog` /
-/// `redo_backlog_slope` come back for reporting at ~zero DB cost.
-fn stats_loop(
-    env: Arc<SzEnvironmentCore>,
-    req_rx: std::sync::mpsc::Receiver<()>,
-    resp_tx: mpsc::Sender<StatsPayload>,
-) {
-    let engine = match env.get_engine() {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!("stats thread: failed to get engine: {e}");
-            return;
-        }
-    };
-    while req_rx.recv().is_ok() {
-        let engine_stats = match engine.get_stats() {
-            Ok(stats) => Some(stats),
-            Err(e) => {
-                tracing::warn!("get_stats failed: {e}");
-                None
-            }
-        };
-        // TODO(reporting): backlog gauge removed with count_redo_records (full
-        // COUNT(*) scan). Restore via a cheap source — see stats_loop doc.
-        let redo_backlog = None;
-        if resp_tx
-            .blocking_send(StatsPayload {
-                engine_stats,
-                redo_backlog,
-            })
-            .is_err()
-        {
-            break;
         }
     }
 }

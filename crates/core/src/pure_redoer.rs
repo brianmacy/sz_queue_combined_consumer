@@ -196,6 +196,18 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
     let dropped = REDOS_DROPPED.load(Ordering::Relaxed);
     let errors = ERRORS.load(Ordering::Relaxed);
     info!("Completed processing {redos} redo records ({dropped} dropped, {errors} errors)");
+    // Redoer parity: final throughput line, then the same "Processed total of"
+    // stdout line every other mode emits (the e2e harness scrapes its prefix).
+    let elapsed = crate::stats::start_time().elapsed().as_secs_f64();
+    let rate = if elapsed > 0.0 {
+        redos as f64 / elapsed
+    } else {
+        0.0
+    };
+    println!("Stats: {redos} redo records processed, {rate:.1}/sec, runtime: {elapsed:.0}s");
+    println!(
+        "Processed total of 0 adds, {redos} redo records ({dropped} redo dropped, {errors} errors)"
+    );
     if let Ok(engine_stats) = monitor_engine.get_stats() {
         println!("Engine stats: {engine_stats}");
     }
