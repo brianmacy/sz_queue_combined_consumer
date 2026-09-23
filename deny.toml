@@ -47,4 +47,9 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # The Senzing Rust SDK is a public git dependency (pinned rev in Cargo.toml).
 # It is not published to crates.io, so its git source must be explicitly allowed.
-allow-git = ["https://github.com/brianmacy/sz-rust-sdk"]
+# Since sz-rust-sdk v4.3.2 the FFI/marshaling layer lives in a sibling repo,
+# sz-rust-sdk-ffi, which the SDK pins by rev in its own Cargo.toml.
+allow-git = [
+    "https://github.com/brianmacy/sz-rust-sdk",
+    "https://github.com/brianmacy/sz-rust-sdk-ffi",
+]

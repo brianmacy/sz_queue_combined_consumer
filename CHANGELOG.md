@@ -2,6 +2,23 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
+## Unreleased — dependency roll-up (2026-09-23)
+
+One change instead of eight Dependabot PRs (each PR fires the full CI matrix).
+Versions are exactly the ones Dependabot proposed, so the 21-day cooldown holds.
+
+* **sz-rust-sdk v4.3.1 → v4.3.2** (`rev = 2787281…`). The SDK moved its
+  FFI/marshaling + error-taxonomy codegen into a sibling crate,
+  `sz-rust-sdk-ffi` (pinned by rev inside the SDK); `deny.toml` `allow-git`
+  now lists that repo. All 62 tests pass unchanged, including the
+  `classify_error` suite (SENZ0010 retry-timeout, DB errors fatal, SENZ0082)
+  and the real-engine / ElasticMQ e2e.
+* Cargo: aws-config 1.9.0 → 1.10.1, aws-sdk-sqs 1.103.0 → 1.105.0,
+  clap 4.6.3 → 4.6.6, libc 0.2.188 → 0.2.189 (plus their semver-compatible
+  transitive bumps).
+* GitHub Actions: actions/checkout 7.0.0 → 7.0.1, actions/cache 5.0.5 → 6.1.0,
+  docker/setup-buildx-action 4.1.0 → 4.3.0 (hash-pinned with tag comments).
+
 ## 0.3.0 — SQS dead-letter queue restored + sibling parity (2026-09-23)
 
 Audit of the combined driver against the standalone drivers it subsumed
