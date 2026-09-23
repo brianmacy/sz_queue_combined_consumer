@@ -9,7 +9,8 @@
   not recover it either. Every rejected line is now appended verbatim to a JSONL
   side file (default `<input>.rejected.jsonl`, created lazily, append mode) for
   reprocessing with `--file`. The end-of-run summary reports how many were
-  written and where.
+  written and where. If any reject could not be written (unwritable path) the
+  run exits non-zero, since those records then exist only in the log.
 * **Rejects are now logged (all backends).** `worker::process_load` logs
   `REJECTING due to bad data or timeout [worker N]: DS : ID -> <engine error>` —
   previously the `BadInputOrTimeout` branch produced no log line at all, so the
