@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased — SQS dead-letter queue restored + sibling parity (2026-09-23)
+
+Audit of the combined driver against the standalone drivers it subsumed
+(`sz_sqs_consumer-v4`, `sz_rabbit_consumer_rust`, `sz_simple_redoer_rust`).
+
+* **FIX (data loss): SQS rejects go to the dead-letter queue again.** The
+  combined SQS backend `DeleteMessage`d rejected records; an explicit delete
+  never triggers the redrive policy, so bad records were destroyed. Restored
+  v4 behaviour: resolve the DLQ at startup (`--dead-letter-queue-url` /
+  `SENZING_SQS_DEAD_LETTER_QUEUE_URL`, else the source queue's `RedrivePolicy`
+  → `deadLetterTargetArn` → `GetQueueUrl` with the owner account id), print
+  `DeadLetter: <url>`, then on reject `SendMessage` the body verbatim to the
+  DLQ and only then delete the source message (`Sending to deadletter: DS : ID`).
+  A failed DLQ send leaves the source message for redelivery. **No DLQ =
+  refuse to start** (exit 255) unless `--allow-no-dlq` / `SENZING_SQS_ALLOW_NO_DLQ`
+  is given, which logs every deleted reject with its body. FIFO DLQs get
+  `MessageGroupId` + `MessageDeduplicationId`.
+* **FIX (correctness): SQS visibility heartbeat.** Records processing past
+  `LONG_RECORD × (n+1)` are extended to `(n+2) × LONG_RECORD` via
+  `ChangeMessageVisibility` (v4 cadence, clamped at 12 h), so a slow record is
+  no longer redelivered mid-`add_record`. `All N threads are stuck …` warning
+  restored.
+* **SQS operational parity:** `DeleteMessageBatch` (10 per call, 1 s flush),
+  `--prefetch` / `SENZING_PREFETCH` overshoot (in-flight cap = threads +
+  prefetch, default threads), receive size capped by free room, throughput
+  line every 10 000 adds, `Engine stats:` + `Combined stats:` status line with
+  `mq_depth` = `ApproximateNumberOfMessages`, redo in-flight long-record
+  monitor in mixed mode, `Still processing (… min): DS : ID` shutdown dump.
+* **core:** stats thread (`stats::stats_loop`, `StatsPayload`) and the
+  throughput line (`stats::ThroughputTicker`) moved from the RabbitMQ crate into
+  core so both async backends share them (RabbitMQ output unchanged).
+* **pure redoer:** now prints the final `Stats: N redo records processed,
+  R/sec, runtime: Ts` and the `Processed total of 0 adds, N redo records (…)`
+  stdout line every other mode emits.
+* **tests:** `crates/sqs/tests/sqs_e2e.rs` against ElasticMQ (new CI service
+  container): both a parse reject and an engine reject land verbatim in the
+  discovered DLQ with the source drained; no-DLQ refuses to start, `--allow-no-dlq`
+  starts and names the deleted reject. Unit tests for ARN parsing, redrive
+  policy parsing, FIFO detection, the heartbeat thresholds, and the new args.
+* **docs:** README SQS section (DLQ semantics, FIFO, heartbeat, IAM, env rows),
+  exit-code convention (1 config / 255 fatal) documented; `DOCKER_NOTES.md`
+  restored from `sz_rabbit_consumer_rust` (the Dockerfile referenced it).
+
 ## Unreleased — file mode writes rejected records to a JSONL reject file (2026-09-23)
 
 * **`--reject-file` / `SENZING_REJECT_FILE` (file mode).** A file has no DLQ, so
