@@ -120,6 +120,16 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
+      # SQS-compatible API for the SQS e2e suite (crates/sqs/tests/sqs_e2e.rs):
+      # supports RedrivePolicy, GetQueueUrl, ChangeMessageVisibility and
+      # DeleteMessageBatch. Single small image, no license, no AWS account.
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.6.11
+        options: >-
+          --health-cmd "wget -q -O /dev/null http://localhost:9324/?Action=ListQueues || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     env:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
@@ -137,6 +147,12 @@ jobs:
       # Slash-form libpq DSN for the truth-set test's psql scoped entity-count
       # query (distinct from the engine's colon-form connection string above).
       IT_PG_DSN: postgresql://senzing:senzing@postgres:5432/G2
+      # SQS e2e: point the standard AWS provider chain at ElasticMQ. The suite
+      # is gated on AWS_ENDPOINT_URL and skips when it is unset.
+      AWS_ENDPOINT_URL: http://elasticmq:9324
+      AWS_ACCESS_KEY_ID: elasticmq
+      AWS_SECRET_ACCESS_KEY: elasticmq
+      AWS_REGION: elasticmq
     steps:
       # The senzingsdk-runtime image ships without git, so actions/checkout falls
       # back to the GitHub REST tarball download, which cannot fetch submodules
@@ -228,6 +244,9 @@ jobs:
         # --test-threads=1: the Senzing engine is a process-global singleton;
         # parallel get_instance() calls race its init. Serialize the suite.
         run: cargo test -p sz_rabbit_combined_consumer --test integration_test -- --nocapture --test-threads=1
+
+      - name: Run SQS e2e tests (ElasticMQ)
+        run: cargo test -p sz_sqs_combined_consumer --test sqs_e2e -- --nocapture --test-threads=1
 
   docker:
     name: Docker build (${{ matrix.bin }} / ${{ matrix.backend }})
