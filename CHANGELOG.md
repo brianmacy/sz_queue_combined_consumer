@@ -42,6 +42,12 @@ Audit of the combined driver against the standalone drivers it subsumed
 * **docs:** README SQS section (DLQ semantics, FIFO, heartbeat, IAM, env rows),
   exit-code convention (1 config / 255 fatal) documented; `DOCKER_NOTES.md`
   restored from `sz_rabbit_consumer_rust` (the Dockerfile referenced it).
+* **deps / supply chain:** `sz-rust-sdk` pinned by commit
+  (`rev = b6be5cb…`, = tag v4.3.1) instead of a movable tag. `cargo update`:
+  h2 0.4.19, rustls 0.23.45 (+ aws-lc-rs 1.18.1 / aws-lc-sys 0.45.0 /
+  rustls-webpki 0.103.15) clearing RUSTSEC-2026-0258 and RUSTSEC-2026-0285;
+  `cargo audit` and `cargo deny check` are both clean and `deny.toml` carries
+  no advisory ignores (the three stale ones were removed).
 
 ## Unreleased — file mode writes rejected records to a JSONL reject file (2026-09-23)
 
