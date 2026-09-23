@@ -21,6 +21,7 @@ use sz_rust_sdk::prelude::*;
 
 use sz_combined_consumer_core::config::{
     Config, DEFAULT_LONG_RECORD_SECS, DEFAULT_REDO_PERCENT, engine_config_from_env,
+    resolve_reject_file,
 };
 use sz_combined_consumer_core::runtime;
 
@@ -75,6 +76,11 @@ struct Args {
     #[arg(long = "skip-lines", env = "SENZING_SKIP_LINES", default_value_t = 0)]
     skip_lines: u64,
 
+    /// File mode: JSONL file receiving every rejected input line verbatim for
+    /// later reprocessing (default `<input file>.rejected.jsonl`).
+    #[arg(long = "reject-file", env = "SENZING_REJECT_FILE")]
+    reject_file: Option<String>,
+
     /// Share (%) of worker capacity preferring redo, in [0, 100].
     #[arg(long = "redo-percent", env = "SENZING_REDO_PERCENT", default_value_t = DEFAULT_REDO_PERCENT)]
     redo_percent: u8,
@@ -96,7 +102,15 @@ struct Args {
     redo_sleep_secs: u64,
 
     /// Seconds before a record is considered long-running.
-    #[arg(long = "long-record", env = "LONG_RECORD", default_value_t = DEFAULT_LONG_RECORD_SECS)]
+    /// Must be >= 1: at 0 every in-flight record is instantly "stuck" and the
+    /// monitor would dead-letter the whole queue (sibling drivers fell back to
+    /// the default on 0/garbage; clap rejects it at startup here).
+    #[arg(
+        long = "long-record",
+        env = "LONG_RECORD",
+        default_value_t = DEFAULT_LONG_RECORD_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     long_record: u64,
 
     /// Print the WithInfo response for each processed record.
@@ -175,6 +189,10 @@ fn build_config(args: &Args) -> Result<Config, String> {
         engine_config,
         url: None,
         queue: None,
+        reject_file: resolve_reject_file(
+            args.input_file.as_deref().filter(|s| !s.is_empty()),
+            args.reject_file.clone(),
+        ),
         input_file: args.input_file.clone().filter(|s| !s.is_empty()),
         skip_lines: args.skip_lines,
         redo_percent: args.redo_percent,

@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — file mode writes rejected records to a JSONL reject file (2026-09-23)
+
+* **`--reject-file` / `SENZING_REJECT_FILE` (file mode).** A file has no DLQ, so
+  engine rejects (bad input, `SENZ0010` retry timeout, `SENZ0082`) and
+  unparseable lines were previously only *counted* in file mode — the record was
+  gone and, because the resume watermark advanced past it, `--skip-lines` could
+  not recover it either. Every rejected line is now appended verbatim to a JSONL
+  side file (default `<input>.rejected.jsonl`, created lazily, append mode) for
+  reprocessing with `--file`. The end-of-run summary reports how many were
+  written and where.
+* **Rejects are now logged (all backends).** `worker::process_load` logs
+  `REJECTING due to bad data or timeout [worker N]: DS : ID -> <engine error>` —
+  previously the `BadInputOrTimeout` branch produced no log line at all, so the
+  engine error text for a rejected record was never recorded anywhere.
+* e2e `e2e_file_loader` now also feeds an unregistered data source (engine
+  bad-input path) and asserts both rejects appear verbatim in the reject file.
+* **FIX (data loss): DB-connection-lost / DB-transient errors are FATAL again.**
+  `classify_error` had widened the drop set from `RetryTimeoutExceeded` (the
+  sibling drivers' policy) to the SDK's whole `is_retryable()` family, which
+  also covers `DatabaseConnectionLost` / `DatabaseTransient`. During a DB outage
+  that dead-lettered every record un-added at full consume rate (RabbitMQ: DLQ;
+  SQS: deleted outright; redo: dropped) and exited 0. Restored to
+  `is_bad_input() || is(RetryTimeoutExceeded) || SENZ0082`; the inverted unit
+  test now asserts Fatal, and the sibling `bad_input_family` /
+  `configuration_license_and_init_errors_are_fatal` tests are restored.
+* **FIX (data loss): `LONG_RECORD` / `--long-record` must be >= 1** (clap range
+  validation). At 0 the long-record monitor treated every in-flight delivery as
+  stuck and dead-lettered the whole queue within one tick. The sibling drivers
+  fell back to 300 on 0/garbage.
+* Redo-drop log line now includes the engine error text (`-> {e}`), redoer
+  parity; previously only the record id was logged.
+
 ## Unreleased — bump MSRV to 1.94.1 + modern AWS TLS (drops advisory ignores) (2026-07-21)
 
 * **MSRV `1.88` → `1.94.1`** (`rust-version`, CI toolchain pins, Dockerfile

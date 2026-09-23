@@ -93,6 +93,7 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_RABBITMQ_QUEUE` (`-q`/`--queue`) | required iff redo% < 100 | source queue (must exist; passive declare) |
 | `SENZING_INPUT_FILE` (`-f`/`--file`) | none | load JSONL (one JSON record per line) from a single file instead of RabbitMQ. Pure loader (redo% ignored); mutually exclusive with `--url`/`--queue`. Exits 0 at EOF. |
 | `SENZING_SKIP_LINES` (`--skip-lines`) | 0 | file mode only: skip the first N physical lines. Resumes an interrupted load — the driver prints a safe `--skip-lines` offset (contiguous-completion watermark) at shutdown. |
+| `SENZING_REJECT_FILE` (`--reject-file`) | `<input>.rejected.jsonl` | file mode only: JSONL file that receives every rejected input line **verbatim** (unparseable, engine bad input, retry timeout, SENZ0082). Created lazily on the first reject, opened in append mode. Reprocess with `--file <reject file>`. |
 | `SENZING_PREFETCH` (`--prefetch`) | threads + 2 | `basic_qos` prefetch |
 | `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | diagnostic MQ depth probe cadence (not a correctness poll) |
 | `SENZING_REDO_SLEEP_TIME_IN_SECONDS` (`--redo-sleep-secs`) | 60 | fetcher pause on empty redo queue (auto-shortened to 2 s while redo is still in flight, for cascade drain) |
@@ -200,10 +201,24 @@ sz_rabbit_combined_consumer --file /data/records.jsonl
 
 File mode is a pure loader (no redo processing; drain redo separately with a
 `--redo-percent 100` run). It runs to end-of-file and exits 0. Blank lines are
-skipped and unparseable lines are dead-lettered (logged and counted) without
-aborting the load. On completion — or on SIGTERM — it prints a safe resume
-offset; restart with `--skip-lines N` to continue where it stopped
-(`add_record` is idempotent, so an interrupted run is safe to resume).
+skipped. On completion — or on SIGTERM — it prints a safe resume offset;
+restart with `--skip-lines N` to continue where it stopped (`add_record` is
+idempotent, so an interrupted run is safe to resume).
+
+**Rejects.** A file has no dead-letter queue, so every rejected line —
+unparseable JSON, engine bad input, retry timeout (`SENZ0010`), `SENZ0082` — is
+appended verbatim to a JSONL reject file (`--reject-file`, default
+`<input>.rejected.jsonl`) and counted, without aborting the load. The file is
+created only when something is rejected. Each reject is logged with its
+`DATA_SOURCE : RECORD_ID`, the line number and the engine error text, so the
+application log says *why* and the reject file holds *what*. Reprocess later by
+pointing `--file` at the reject file (give it its own `--reject-file` so the
+second pass does not append to its own input):
+
+```console
+sz_rabbit_combined_consumer --file /data/records.jsonl.rejected.jsonl \
+    --reject-file /data/records.still-rejected.jsonl
+```
 
 ## License
 

@@ -600,14 +600,27 @@ fn e2e_file_loader() {
         return;
     };
 
-    // 15 valid TEST records + one malformed line (missing DATA_SOURCE) that must
-    // be dead-lettered without failing the load.
+    // 15 valid TEST records + two rejects that must be written verbatim to the
+    // reject file without failing the load: one malformed line (missing
+    // DATA_SOURCE -> parse reject) and one well-formed line naming a data
+    // source that is not registered (engine SzUnknownDataSource -> bad-input
+    // reject through the worker path).
     const N_VALID: usize = 15;
+    const BAD_PARSE: &str = r#"{"RECORD_ID":"E2E_FILE_BAD","NAME_FULL":"No Data Source"}"#;
+    const BAD_ENGINE: &str =
+        r#"{"DATA_SOURCE":"E2E_NO_SUCH_DSRC","RECORD_ID":"E2E_FILE_BAD_DSRC","NAME_FULL":"X Y"}"#;
     let mut lines = make_records("E2E_FILE", N_VALID);
-    lines.push(r#"{"RECORD_ID":"E2E_FILE_BAD","NAME_FULL":"No Data Source"}"#.to_string());
+    lines.push(BAD_PARSE.to_string());
+    lines.push(BAD_ENGINE.to_string());
 
     let file_path = std::env::temp_dir().join(format!("sz_e2e_file_{}.jsonl", std::process::id()));
     std::fs::write(&file_path, lines.join("\n") + "\n").expect("write input file");
+    // Default reject path = <input>.rejected.jsonl; must not pre-exist.
+    let reject_path = std::path::PathBuf::from(format!(
+        "{}.rejected.jsonl",
+        file_path.to_str().expect("utf-8 path")
+    ));
+    let _ = std::fs::remove_file(&reject_path);
 
     let out_path = std::env::temp_dir().join(format!("sz_e2e_file_{}.out", std::process::id()));
     let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
@@ -631,14 +644,27 @@ fn e2e_file_loader() {
 
     let mut stdout = String::new();
     let _ = std::fs::File::open(&out_path).and_then(|mut f| f.read_to_string(&mut stdout));
+    let rejects = std::fs::read_to_string(&reject_path);
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&file_path);
+    let _ = std::fs::remove_file(&reject_path);
 
     let status = status.expect("file loader did not exit within bound");
     assert!(
         status.success(),
         "file loader exited non-zero: {status:?}\n{stdout}"
     );
+
+    // Both rejects land in the reject file, verbatim, one per line, in the
+    // order they completed (parse reject is immediate; engine reject is async,
+    // so compare as a set).
+    let rejects =
+        rejects.unwrap_or_else(|e| panic!("reject file {reject_path:?} unreadable: {e}\n{stdout}"));
+    let mut got: Vec<&str> = rejects.lines().collect();
+    let mut want = vec![BAD_PARSE, BAD_ENGINE];
+    got.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(got, want, "reject file content mismatch\n{stdout}");
 
     let total_line = stdout
         .lines()
@@ -655,10 +681,12 @@ fn e2e_file_loader() {
         "expected {N_VALID} valid records loaded, got {adds}\n{stdout}"
     );
     assert!(
-        stdout.contains("dead-lettered"),
-        "expected the malformed line to be dead-lettered\n{stdout}"
+        stdout.contains("2 record(s) dead-lettered (2 written to "),
+        "expected both rejects counted and written\n{stdout}"
     );
-    eprintln!("e2e_file_loader: loaded {adds}/{N_VALID} records, 1 dead-lettered, clean EOF exit");
+    eprintln!(
+        "e2e_file_loader: loaded {adds}/{N_VALID} records, 2 rejected to {reject_path:?}, clean EOF exit"
+    );
 }
 
 // ==========================================================================

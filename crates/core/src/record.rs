@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use sz_rust_sdk::prelude::SzError;
+use sz_rust_sdk::prelude::{ErrorCategory, SzError};
 
 /// The DATA_SOURCE / RECORD_ID extracted from a message body, used both as
 /// `add_record` arguments and for reject logging.
@@ -87,10 +87,11 @@ pub fn parse_record(body: &[u8]) -> Result<RecordInfo, ParseError> {
 /// How an engine error should be handled.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ErrorClass {
-    /// Bad data, retry timeout, or an unmapped code we treat as bad input
-    /// (e.g. SENZ0082) -> reject to the dead-letter queue / drop the redo.
+    /// Bad data, retry timeout (SENZ0010), or SENZ0082 -> reject to the
+    /// dead-letter queue / reject file / drop the redo.
     BadInputOrTimeout,
-    /// Any other error -> propagate and trigger graceful shutdown.
+    /// Any other error (including DB connection lost / DB transient) ->
+    /// propagate and trigger graceful shutdown.
     Fatal,
 }
 
@@ -103,21 +104,27 @@ pub enum ErrorClass {
 const SENZ_DQM_ERROR_CODE: i64 = 82;
 
 /// Classifies a Senzing engine error (identical policy to
-/// `sz_rabbit_consumer_rust`), using the SDK's structured error-category API —
-/// NOT message-substring matching:
+/// `sz_rabbit_consumer_rust` / `sz_simple_redoer_rust`), using the SDK's
+/// structured error-category API — NOT message-substring matching:
 ///
-/// * `err.is_bad_input()` — `BadInput` / `NotFound` / `UnknownDataSource` — and
-///   `err.is_retryable()` — `Retryable` / `DatabaseConnectionLost` /
-///   `DatabaseTransient` / `RetryTimeoutExceeded` (the last is `SENZ0010`, the
-///   engine's retry-timeout, native code 10) -> dead-letter/drop, keep going.
-///   Correctly classifying `SENZ0010` as retryable (not fatal) is the point of
-///   moving to the SDK's fixed error mappings: the stale pin mis-mapped it to
-///   `Configuration` and crash-restarted the consumer.
+/// * `err.is_bad_input()` — `BadInput` / `NotFound` / `UnknownDataSource` ->
+///   dead-letter/drop, keep going.
+/// * `ErrorCategory::RetryTimeoutExceeded` (`SENZ0010`, the engine's per-record
+///   retry give-up) -> dead-letter/drop, keep going. Correctly classifying
+///   `SENZ0010` this way (not fatal) is why the SDK pin moved to the fixed
+///   error mappings: the stale pin mis-mapped it to `Configuration` and
+///   crash-restarted the consumer.
 /// * `SENZ0082` (native code 82) maps to `Unknown` with no category, so it is
 ///   matched by its structured native error code -> dead-letter/drop.
-/// * Everything else -> fatal (graceful shutdown).
+/// * Everything else -> fatal (graceful shutdown). This DELIBERATELY excludes
+///   the broader `is_retryable()` family (`DatabaseConnectionLost`,
+///   `DatabaseTransient`, generic `Retryable`): those mean the DATABASE is
+///   unhealthy, not the record. A mid-run DB drop must tear the process down so
+///   deliveries stay unacked and the broker redelivers them — dead-lettering
+///   them would shovel every record into the DLQ un-added at full consume rate
+///   for the whole outage (and, for redo, discard the redo record outright).
 pub fn classify_error(err: &SzError) -> ErrorClass {
-    if err.is_bad_input() || err.is_retryable() {
+    if err.is_bad_input() || err.is(ErrorCategory::RetryTimeoutExceeded) {
         return ErrorClass::BadInputOrTimeout;
     }
     if err.error_code() == Some(SENZ_DQM_ERROR_CODE) {
@@ -219,12 +226,40 @@ mod tests {
     }
 
     #[test]
-    fn retryable_database_errors_are_dead_lettered() {
+    fn retryable_database_errors_are_fatal() {
+        // DB-connection-lost / DB-transient are RETRYABLE in the SDK, but they
+        // describe an unhealthy database, not a bad record. They must stay
+        // FATAL (sibling parity): shutting down leaves deliveries unacked for
+        // broker redelivery, whereas dead-lettering would drain the whole
+        // queue into the DLQ un-added for the duration of the outage.
         for e in [
             SzError::database_connection_lost("conn lost"),
             SzError::database_transient("deadlock"),
         ] {
-            assert_eq!(classify_error(&e), ErrorClass::BadInputOrTimeout);
+            assert!(e.is_retryable(), "precondition: SDK marks these retryable");
+            assert_eq!(classify_error(&e), ErrorClass::Fatal, "{e}");
+        }
+    }
+
+    #[test]
+    fn bad_input_family_is_dead_lettered() {
+        for e in [
+            SzError::not_found("no such record"),
+            SzError::unknown_data_source("NOPE"),
+        ] {
+            assert_eq!(classify_error(&e), ErrorClass::BadInputOrTimeout, "{e}");
+        }
+    }
+
+    #[test]
+    fn configuration_license_and_init_errors_are_fatal() {
+        for e in [
+            SzError::configuration("bad config"),
+            SzError::license("expired"),
+            SzError::not_initialized("no init"),
+            SzError::unrecoverable("boom"),
+        ] {
+            assert_eq!(classify_error(&e), ErrorClass::Fatal, "{e}");
         }
     }
 
