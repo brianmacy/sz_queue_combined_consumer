@@ -58,6 +58,13 @@ pub struct Args {
     #[arg(long = "skip-lines", env = "SENZING_SKIP_LINES", default_value_t = 0)]
     pub skip_lines: u64,
 
+    /// In file mode, JSONL file that receives every rejected input line
+    /// verbatim (bad data / retry timeout / unparseable) for later reprocessing.
+    /// Defaults to `<input file>.rejected.jsonl`; appended to, created lazily
+    /// on the first reject. Ignored unless `--file` is set.
+    #[arg(long = "reject-file", env = "SENZING_REJECT_FILE")]
+    pub reject_file: Option<String>,
+
     /// Share (%) of worker capacity preferring redo, in [0, 100].
     #[arg(
         long = "redo-percent",
@@ -100,7 +107,15 @@ pub struct Args {
 
     /// Seconds before a record is considered long-running; stats cadence is
     /// long_record / 2 (both sibling drivers' semantics).
-    #[arg(long = "long-record", env = "LONG_RECORD", default_value_t = DEFAULT_LONG_RECORD_SECS)]
+    /// Must be >= 1: at 0 every in-flight record is instantly "stuck" and the
+    /// monitor would dead-letter the whole queue (sibling drivers fell back to
+    /// the default on 0/garbage; clap rejects it at startup here).
+    #[arg(
+        long = "long-record",
+        env = "LONG_RECORD",
+        default_value_t = DEFAULT_LONG_RECORD_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub long_record: u64,
 
     /// Print the WithInfo response for each processed record. Inert at the
@@ -112,6 +127,21 @@ pub struct Args {
     /// Output Senzing engine debug trace information (verbose logging).
     #[arg(short = 't', long = "debugTrace", default_value_t = false)]
     pub debug_trace: bool,
+}
+
+/// Suffix appended to the input path when `--reject-file` is not given.
+pub const DEFAULT_REJECT_SUFFIX: &str = ".rejected.jsonl";
+
+/// Resolves the file-mode reject path: the explicit `--reject-file` if
+/// non-empty, else `<input_file>` + [`DEFAULT_REJECT_SUFFIX`]. `None` when not
+/// in file mode (queue backends dead-letter to the broker instead).
+pub fn resolve_reject_file(input_file: Option<&str>, explicit: Option<String>) -> Option<String> {
+    let input = input_file?;
+    Some(
+        explicit
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("{input}{DEFAULT_REJECT_SUFFIX}")),
+    )
 }
 
 /// Fully resolved runtime configuration after applying defaults and validating
@@ -127,6 +157,9 @@ pub struct Config {
     pub input_file: Option<String>,
     /// File mode: physical lines to skip before loading (resume support).
     pub skip_lines: u64,
+    /// File mode: JSONL side file receiving rejected lines verbatim. Always
+    /// `Some` in file mode (explicit or derived); `None` otherwise.
+    pub reject_file: Option<String>,
     pub redo_percent: u8,
     pub threads: usize,
     pub prefetch: u16,
@@ -212,6 +245,7 @@ impl Config {
             engine_config,
             url,
             queue,
+            reject_file: resolve_reject_file(input_file.as_deref(), args.reject_file),
             input_file,
             skip_lines: args.skip_lines,
             redo_percent: args.redo_percent,
@@ -285,6 +319,44 @@ pub fn redo_preferring_count(threads: usize, redo_percent: u8) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_record_zero_is_rejected_at_parse() {
+        use clap::Parser;
+        let err = super::Args::try_parse_from(["bin", "--long-record", "0"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        let ok = super::Args::try_parse_from(["bin", "--long-record", "1"]).expect("1 is valid");
+        assert_eq!(ok.long_record, 1);
+    }
+
+    #[test]
+    fn reject_file_is_none_outside_file_mode() {
+        assert_eq!(
+            super::resolve_reject_file(None, Some("x.jsonl".into())),
+            None
+        );
+        assert_eq!(super::resolve_reject_file(None, None), None);
+    }
+
+    #[test]
+    fn reject_file_defaults_to_input_plus_suffix() {
+        assert_eq!(
+            super::resolve_reject_file(Some("/data/in.jsonl"), None),
+            Some("/data/in.jsonl.rejected.jsonl".to_string())
+        );
+        assert_eq!(
+            super::resolve_reject_file(Some("/data/in.jsonl"), Some(String::new())),
+            Some("/data/in.jsonl.rejected.jsonl".to_string())
+        );
+    }
+
+    #[test]
+    fn reject_file_explicit_wins() {
+        assert_eq!(
+            super::resolve_reject_file(Some("/data/in.jsonl"), Some("/out/bad.jsonl".into())),
+            Some("/out/bad.jsonl".to_string())
+        );
+    }
+
     use super::*;
 
     #[test]
