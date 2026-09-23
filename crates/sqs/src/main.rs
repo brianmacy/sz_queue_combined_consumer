@@ -68,6 +68,29 @@ struct Args {
     #[arg(long = "max-messages", env = "SENZING_SQS_MAX_MESSAGES", default_value_t = DEFAULT_MAX_MESSAGES)]
     max_messages: i32,
 
+    /// Dead-letter queue URL for rejected records (bad data / retry timeout /
+    /// unparseable). Default: discovered from the source queue's RedrivePolicy.
+    #[arg(
+        long = "dead-letter-queue-url",
+        env = "SENZING_SQS_DEAD_LETTER_QUEUE_URL"
+    )]
+    dead_letter_queue_url: Option<String>,
+
+    /// Start even if no dead-letter queue can be resolved. Rejected records are
+    /// then DELETED (lost); only the log names them. Off by default on purpose.
+    #[arg(
+        long = "allow-no-dlq",
+        env = "SENZING_SQS_ALLOW_NO_DLQ",
+        default_value_t = false
+    )]
+    allow_no_dlq: bool,
+
+    /// Extra messages to hold beyond the worker count so workers never idle on
+    /// a receive round-trip (in-flight cap = threads + prefetch). Default:
+    /// threads (sz_sqs_consumer-v4 parity).
+    #[arg(long = "prefetch", env = "SENZING_PREFETCH")]
+    prefetch: Option<usize>,
+
     /// Load records from a single JSONL file instead of SQS (pure loader).
     #[arg(short = 'f', long = "file", env = "SENZING_INPUT_FILE")]
     input_file: Option<String>,
@@ -128,6 +151,12 @@ pub struct SqsParams {
     pub visibility_timeout: i32,
     pub wait_time: i32,
     pub max_messages: i32,
+    /// Explicit DLQ URL; `None` = discover from the source RedrivePolicy.
+    pub dead_letter_queue_url: Option<String>,
+    /// Run without any DLQ (rejects are deleted). Loud opt-in.
+    pub allow_no_dlq: bool,
+    /// In-flight overshoot beyond the worker count.
+    pub prefetch: usize,
 }
 
 fn main() -> ExitCode {
@@ -231,11 +260,19 @@ fn sqs_params(args: &Args) -> Result<SqsParams, String> {
             args.visibility_timeout, args.long_record
         );
     }
+    let threads = if args.threads_per_process == 0 {
+        num_cpus_get()
+    } else {
+        args.threads_per_process
+    };
     Ok(SqsParams {
         queue_url,
         visibility_timeout: args.visibility_timeout,
         wait_time: args.wait_time,
         max_messages: args.max_messages,
+        dead_letter_queue_url: args.dead_letter_queue_url.clone().filter(|s| !s.is_empty()),
+        allow_no_dlq: args.allow_no_dlq,
+        prefetch: args.prefetch.unwrap_or(threads),
     })
 }
 
@@ -310,6 +347,44 @@ mod tests {
         assert_eq!(p.queue_url, "https://sqs.example/q");
         assert_eq!(p.wait_time, DEFAULT_WAIT_TIME_SECS);
         assert_eq!(p.max_messages, DEFAULT_MAX_MESSAGES);
+    }
+
+    #[test]
+    fn sqs_params_dlq_override_and_allow_no_dlq_flags() {
+        let p = sqs_params(&args(&["--queue-url", "u"])).unwrap();
+        assert_eq!(
+            p.dead_letter_queue_url, None,
+            "default = discover from RedrivePolicy"
+        );
+        assert!(
+            !p.allow_no_dlq,
+            "running without a DLQ must be an explicit opt-in"
+        );
+
+        let p = sqs_params(&args(&[
+            "--queue-url",
+            "u",
+            "--dead-letter-queue-url",
+            "https://sqs.example/dlq",
+            "--allow-no-dlq",
+        ]))
+        .unwrap();
+        assert_eq!(
+            p.dead_letter_queue_url.as_deref(),
+            Some("https://sqs.example/dlq")
+        );
+        assert!(p.allow_no_dlq);
+    }
+
+    #[test]
+    fn sqs_params_prefetch_defaults_to_thread_count() {
+        let p = sqs_params(&args(&["--queue-url", "u", "--threads-per-process", "7"])).unwrap();
+        assert_eq!(
+            p.prefetch, 7,
+            "v4 parity: in-flight cap = 2 x threads by default"
+        );
+        let p = sqs_params(&args(&["--queue-url", "u", "--prefetch", "0"])).unwrap();
+        assert_eq!(p.prefetch, 0);
     }
 
     #[test]
