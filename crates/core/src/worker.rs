@@ -385,7 +385,16 @@ fn process_load(ctx: &WorkerCtx, engine: &dyn SzEngine, load: &LoadSide, item: L
             match result {
                 Ok(resp) => Action::Ack(if ctx.want_info { Some(resp) } else { None }),
                 Err(e) => match classify_error(&e) {
-                    ErrorClass::BadInputOrTimeout => Action::RejectNoRequeue,
+                    ErrorClass::BadInputOrTimeout => {
+                        // The backend logs WHERE the record went (DLQ / reject
+                        // file); this is the only place the engine error text
+                        // is known, so log WHY here.
+                        warn!(
+                            "REJECTING due to bad data or timeout [worker {}]: {} : {} -> {e}",
+                            ctx.worker_id, info.data_source, info.record_id
+                        );
+                        Action::RejectNoRequeue
+                    }
                     ErrorClass::Fatal => Action::Fatal(e.to_string()),
                 },
             }
@@ -455,11 +464,12 @@ fn process_redo(ctx: &WorkerCtx, engine: &dyn SzEngine, redo: &RedoSide, job: Re
         }
         Err(e) => match classify_error(&e) {
             ErrorClass::BadInputOrTimeout => {
-                // Bad data, SENZ0082, or a retryable/timeout error (incl.
-                // SENZ0010). Redo records are engine-internal; there is no queue
-                // to reject to, so log loudly and drop (redoer parity).
+                // Bad data, SENZ0082, or a SENZ0010 retry timeout. Redo records
+                // are engine-internal; there is no queue to reject to, so log
+                // loudly — WITH the engine error, so the cause is recoverable
+                // from the log — and drop (redoer parity).
                 warn!(
-                    "REDO FAILED due to bad data or timeout [worker {}]: {}",
+                    "REDO FAILED due to bad data or timeout [worker {}]: {} -> {e}",
                     ctx.worker_id,
                     logging_id(&record)
                 );
