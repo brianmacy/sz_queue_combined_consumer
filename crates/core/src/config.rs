@@ -48,8 +48,9 @@ pub struct Args {
     pub queue: Option<String>,
 
     /// Load records from a single JSONL file instead of RabbitMQ (one JSON
-    /// record per line). Mutually exclusive with `--url`/`--queue`; file mode is
-    /// a pure loader (redo% is ignored).
+    /// record per line). Mutually exclusive with `--url`/`--queue`. redo% applies
+    /// as in queue mode; at redo% > 0 the process exits once the file is loaded
+    /// AND the redo queue is drained (redo% = 0: exits at end of file).
     #[arg(short = 'f', long = "file", env = "SENZING_INPUT_FILE")]
     pub input_file: Option<String>,
 
@@ -168,7 +169,7 @@ pub struct Config {
     pub url: Option<String>,
     /// `Some` iff redo% < 100 AND not file mode (validated).
     pub queue: Option<String>,
-    /// `Some` selects file-input mode (pure loader) instead of RabbitMQ.
+    /// `Some` selects file-input mode (load from a JSONL file; redo% applies).
     pub input_file: Option<String>,
     /// File mode: physical lines to skip before loading (resume support).
     pub skip_lines: u64,
@@ -239,17 +240,16 @@ impl Config {
         let mut queue = args.queue.filter(|s| !s.is_empty());
 
         if input_file.is_some() {
-            // File mode: pure loader from a file; AMQP topology does not apply.
+            // File mode: load from a file (redo% applies); AMQP topology does not apply.
             if url.is_some() || queue.is_some() {
-                eprintln!(
-                    "warning: --file is set; ignoring --url/--queue (file mode is a pure loader)"
-                );
+                eprintln!("warning: --file is set; ignoring --url/--queue (file input mode)");
                 url = None;
                 queue = None;
             }
             if threads == 0 {
                 return Err("file mode requires at least 1 worker thread".to_string());
             }
+            validate_split_threads(threads, args.redo_percent)?;
         } else {
             validate_topology(threads, args.redo_percent, url.as_deref(), queue.as_deref())?;
         }
@@ -314,6 +314,13 @@ pub fn validate_topology(
             );
         }
     }
+    validate_split_threads(threads, redo_percent)
+}
+
+/// 0 < redo% < 100 requires at least 2 workers: one worker cannot host both
+/// preference classes and the |B| clamp is ill-defined at N = 1. Shared by the
+/// queue topology check, file mode and the SQS binary.
+pub fn validate_split_threads(threads: usize, redo_percent: u8) -> Result<(), String> {
     if redo_percent > 0 && redo_percent < 100 && threads < 2 {
         return Err(format!(
             "0 < redo% < 100 requires at least 2 worker threads (got {threads}): \
