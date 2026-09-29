@@ -123,6 +123,17 @@ pub enum Class {
     RedoPreferring,
 }
 
+/// Static class of worker `worker_id` given |B| = `redo_pref` redo-preferring
+/// workers: ids `0..redo_pref` prefer redo, the rest prefer load. The ONE split
+/// rule shared by every run path (AMQP, SQS, file) so they cannot drift.
+pub fn worker_class(worker_id: usize, redo_pref: usize) -> Class {
+    if worker_id < redo_pref {
+        Class::RedoPreferring
+    } else {
+        Class::LoadPreferring
+    }
+}
+
 /// The load-side wiring a worker needs (present iff redo% < 100).
 #[derive(Clone)]
 pub struct LoadSide {
@@ -645,6 +656,22 @@ mod tests {
             Some(SzFlags::from_bits_retain(SZ_WITH_INFO_BITS))
         );
         assert_eq!(redo_flags(false), None);
+    }
+
+    #[test]
+    fn worker_class_splits_first_b_ids_to_redo() {
+        let classes: Vec<Class> = (0..5).map(|id| worker_class(id, 2)).collect();
+        assert_eq!(
+            classes,
+            vec![
+                Class::RedoPreferring,
+                Class::RedoPreferring,
+                Class::LoadPreferring,
+                Class::LoadPreferring,
+                Class::LoadPreferring,
+            ]
+        );
+        assert_eq!(worker_class(0, 0), Class::LoadPreferring);
     }
 
     #[test]

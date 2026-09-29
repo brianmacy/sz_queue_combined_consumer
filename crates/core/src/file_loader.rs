@@ -1,7 +1,8 @@
-//! File-input load mode: read newline-delimited JSON (JSONL) records from a
-//! single file and feed them through the SAME worker pool the RabbitMQ path
-//! uses (`worker::worker_loop`, load-preferring, no redo). Selected by
-//! `--file`/`SENZING_INPUT_FILE`; mutually exclusive with the AMQP `--url`.
+//! File-input mode: read newline-delimited JSON (JSONL) records from a single
+//! file and feed them through the SAME worker pool, redo fetcher and split rule
+//! the queue paths use (`worker::worker_loop`, `redo::fetcher_loop`,
+//! `config::redo_preferring_count`). Selected by `--file`/`SENZING_INPUT_FILE`;
+//! mutually exclusive with the AMQP `--url`.
 //!
 //! There is no message broker and therefore no ack/redelivery: a file cannot be
 //! "requeued". Instead, `--skip-lines N`/`SENZING_SKIP_LINES` skips the first N
@@ -27,16 +28,32 @@
 //! in append mode so a resumed run adds to it. WHY each record was rejected is
 //! in the application log (the worker logs the engine error text).
 //!
-//! ## redo
-//! File mode is a PURE loader — it does not process the engine redo queue
-//! (`redo%` is ignored, with a warning). Drain redo separately with a
-//! `redo% = 100` run once the file load completes.
+//! ## redo (shared exactly as in queue mode)
+//! The point of this driver is to do redo IN PARALLEL with load and then
+//! switch to ALL redo when the load is done — file input included. So in file
+//! mode redo% of the threads process redo during the load, every thread moves
+//! to redo at end-of-file, and the process exits when redo is drained.
+//!
+//! * redo% = 0: pure loader — no fetcher, zero redo calls; exits at EOF.
+//! * redo% > 0: |B| = `redo_preferring_count(N, redo%)` workers prefer redo,
+//!   the rest prefer load, all with cross-over (`mixed_loop`), and one redo
+//!   fetcher runs for the whole process — identical to queue mode. While the
+//!   file loads, redo gets its |B|/N share. At EOF the load channel closes, so
+//!   every load-preferring worker falls through to redo: the pool ramps to
+//!   100% redo with no mode switch (the same mechanism as an empty MQ).
+//! * Termination (file mode only — queue mode never exits on idle): once the
+//!   file is exhausted and every dispatched record has reported an outcome, the
+//!   fetcher stops after `redo::DRAIN_EXIT_EMPTY_PROBES` consecutive empty
+//!   `get_redo_record()` probes `--redo-sleep-secs` apart with no redo
+//!   outstanding in this process (see `redo` module docs). That closes the redo
+//!   channel, the workers exit, and the process exits 0.
+//! * SIGTERM / fatal: stop reading and fetching; bounded grace as elsewhere.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -45,12 +62,16 @@ use sz_rust_sdk::prelude::*;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, redo_preferring_count};
 use crate::record::parse_record;
-use crate::stats::{ADDS_PROCESSED, ADDS_REJECTED, ERRORS, RUNNING, WORKER_FATAL};
+use crate::redo::{DrainExit, fetcher_loop};
+use crate::stats::{
+    self, ADDS_PROCESSED, ADDS_REJECTED, ERRORS, REDOS_DROPPED, REDOS_PROCESSED, RUNNING,
+    WORKER_FATAL,
+};
 use crate::worker::{
-    Action, Class, LoadItem, LoadSide, Outcome, SHUTDOWN_GRACE, WorkerCtx, add_record_flags,
-    worker_loop,
+    Action, Class, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
+    WorkerCtx, add_record_flags, monitor_redo_in_flight, redo_flags, worker_class, worker_loop,
 };
 
 /// Progress log cadence, in physical lines read.
@@ -163,9 +184,27 @@ fn reject_line(sink: &Arc<Mutex<RejectSink>>, line_no: u64, body: &[u8]) {
     }
 }
 
-/// Runs the file loader to EOF (or SIGTERM) and returns
-/// `(workers_clean, result)` mirroring [`crate::pure_redoer::run`], so `main`
-/// can share the bounded-teardown exit path.
+/// Worker plan for file mode: the class of each of `threads` workers and
+/// whether a redo side (fetcher + redo channel) exists. Identical to the queue
+/// split: |B| = `redo_preferring_count(threads, redo%)` redo-preferring
+/// workers, a redo side iff redo% > 0.
+pub fn worker_plan(threads: usize, redo_percent: u8) -> (Vec<Class>, bool) {
+    let redo_pref = redo_preferring_count(threads, redo_percent);
+    let classes = (0..threads).map(|id| worker_class(id, redo_pref)).collect();
+    (classes, redo_percent > 0)
+}
+
+/// The load input is done (redo drain may begin to count toward exit) once the
+/// reader has stopped AND every record it dispatched has reported an outcome:
+/// an `add_record` still in flight can enqueue redo.
+fn load_input_done(reader_finished: bool, dispatched: u64, outcomes: u64) -> bool {
+    reader_finished && outcomes >= dispatched
+}
+
+/// Runs file mode to completion (EOF, plus redo drain when redo% > 0) or
+/// SIGTERM, and returns `(workers_clean, result)` mirroring
+/// [`crate::pure_redoer::run`], so `main` can share the bounded-teardown exit
+/// path.
 ///
 /// `workers_clean` is `true` iff every worker thread finished within the
 /// shutdown grace (safe to destroy the environment); `false` means a worker is
@@ -182,15 +221,22 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
         .clone()
         .expect("file_loader::run requires a reject file (resolved at startup)");
 
+    let (classes, redo_enabled) = worker_plan(n_workers, config.redo_percent);
+    let redo_pref = config.redo_pref_workers();
+
     info!(
-        "File loader: reading {path:?} with {n_workers} workers (skip-lines: {skip}); \
-         rejected lines are appended to {reject_path:?}; redo is NOT processed in file mode"
+        "File loader: reading {path:?} with {n_workers} workers (load-preferring: {}, \
+         redo-preferring: {redo_pref}, redo%: {}, skip-lines: {skip}); \
+         rejected lines are appended to {reject_path:?}",
+        n_workers - redo_pref,
+        config.redo_percent
     );
-    if config.redo_percent != 0 {
-        warn!(
-            "redo% = {} is ignored in file mode (pure loader); drain redo separately \
-             with a redo% = 100 run",
-            config.redo_percent
+    if redo_enabled {
+        info!(
+            "redo is processed while the file loads; at EOF all workers drain redo and \
+             the process exits once redo reads empty on {} consecutive probes {}s apart",
+            crate::redo::DRAIN_EXIT_EMPTY_PROBES,
+            config.redo_sleep_secs
         );
     }
     crate::config_reload::log_startup_config(&env);
@@ -206,12 +252,47 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
     let add_flags = add_record_flags(config.info);
     let want_info = config.info;
 
-    // --- Spawn load-preferring workers ---------------------------------------
-    let mut workers = Vec::with_capacity(n_workers);
-    for worker_id in 0..n_workers {
+    let mut handles = Vec::with_capacity(n_workers + 1);
+
+    // --- Redo side (only when redo% > 0; queue-mode shape verbatim) ----------
+    let redo_in_flight: Arc<Mutex<RedoInFlight>> = Arc::new(Mutex::new(HashMap::new()));
+    let input_done = Arc::new(AtomicBool::new(false));
+    let redo_side = if redo_enabled {
+        let (redo_tx, redo_rx) = std::sync::mpsc::sync_channel::<RedoJob>(redo_pref + 2);
+        let fetcher_env = env.clone();
+        let sleep_secs = config.redo_sleep_secs;
+        let drain = DrainExit {
+            input_done: input_done.clone(),
+        };
+        // No result_tx/notify: the main thread polls RUNNING/WORKER_FATAL (the
+        // pure-redoer arrangement), so the result channel closes with the
+        // workers alone.
+        match std::thread::Builder::new()
+            .name("sz-redo-fetcher".to_string())
+            .spawn(move || fetcher_loop(fetcher_env, redo_tx, sleep_secs, None, None, Some(drain)))
+        {
+            Ok(h) => handles.push(h),
+            Err(e) => {
+                RUNNING.store(false, Ordering::Relaxed);
+                return (
+                    true,
+                    Err(anyhow::anyhow!("failed to spawn redo fetcher: {e}")),
+                );
+            }
+        }
+        Some(RedoSide {
+            redo_rx: Arc::new(Mutex::new(redo_rx)),
+            in_flight: redo_in_flight.clone(),
+        })
+    } else {
+        None
+    };
+
+    // --- Spawn workers (queue-mode split) ------------------------------------
+    for (worker_id, class) in classes.into_iter().enumerate() {
         let ctx = WorkerCtx {
             worker_id,
-            class: Class::LoadPreferring,
+            class,
             env: env.clone(),
             load: Some(LoadSide {
                 work_rx: work_rx.clone(),
@@ -219,9 +300,9 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
                 started: started.clone(),
                 shutdown_notify: shutdown_notify.clone(),
             }),
-            redo: None,
+            redo: redo_side.clone(),
             add_flags,
-            redo_flags: None,
+            redo_flags: redo_flags(config.info),
             want_info,
             transform: config.transform.clone(),
         };
@@ -229,24 +310,30 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
             .name(format!("sz-worker-{worker_id}"))
             .spawn(move || worker_loop(ctx))
         {
-            Ok(h) => workers.push(h),
+            Ok(h) => handles.push(h),
             Err(e) => {
                 RUNNING.store(false, Ordering::Relaxed);
+                drop(redo_side);
+                drop(work_tx);
+                let workers_clean = crate::worker::join_workers_bounded(handles);
                 return (
-                    true,
+                    workers_clean,
                     Err(anyhow::anyhow!("failed to spawn worker thread: {e}")),
                 );
             }
         }
     }
+    drop(redo_side);
 
     // --- Result consumer (counts outcomes; maintains the resume watermark) ---
     let resume = Arc::new(Mutex::new(ResumeTracker::new(skip + 1)));
     let sink = Arc::new(Mutex::new(RejectSink::new(&reject_path)));
     let in_flight: InFlightBodies = Arc::new(Mutex::new(HashMap::new()));
+    let outcomes = Arc::new(AtomicU64::new(0));
     let consumer_resume = resume.clone();
     let consumer_sink = sink.clone();
     let consumer_in_flight = in_flight.clone();
+    let consumer_outcomes = outcomes.clone();
     let consumer = std::thread::Builder::new()
         .name("sz-file-result".to_string())
         .spawn(move || {
@@ -256,6 +343,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
                 consumer_resume,
                 consumer_sink,
                 consumer_in_flight,
+                consumer_outcomes,
             )
         });
 
@@ -264,18 +352,72 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
 
     // --- Reader: skip, then feed each line to the worker pool ----------------
     let read_result = read_and_feed(Path::new(&path), skip, &work_tx, &resume, &sink, &in_flight);
+    let dispatched = read_result.as_ref().map_or(0, |r| r.dispatched);
+    if read_result.is_err() {
+        // A broken input is a failed run: stop the fetcher/workers promptly
+        // instead of draining redo first and reporting the error afterwards.
+        RUNNING.store(false, Ordering::Relaxed);
+    }
 
-    // EOF / stop: closing work_tx lets idle workers observe end-of-stream.
+    // EOF / stop: closing work_tx lets the workers observe end-of-stream on the
+    // load channel; with a redo side they now fall through to redo (the ramp).
     drop(work_tx);
+    if redo_enabled {
+        info!(
+            "file input exhausted ({dispatched} record(s) dispatched); ramping all workers to redo"
+        );
+    }
 
-    // --- Bounded join over workers (parity with the other run paths) ---------
-    let join_deadline = Instant::now() + SHUTDOWN_GRACE;
-    while Instant::now() < join_deadline && workers.iter().any(|h| !h.is_finished()) {
+    // --- Wait for the pool: unbounded while running, bounded after a stop ----
+    let monitor_interval = Duration::from_secs((config.long_record_secs / 2).max(1));
+    let mut last_monitor = Instant::now();
+    let mut prev_adds = 0usize;
+    let mut prev_redos = 0usize;
+    let mut stop_deadline: Option<Instant> = None;
+    let mut input_done_set = false;
+    while handles.iter().any(|h| !h.is_finished()) {
+        if !input_done_set
+            && (load_input_done(true, dispatched, outcomes.load(Ordering::Acquire))
+                || !RUNNING.load(Ordering::Relaxed))
+        {
+            input_done.store(true, Ordering::Release);
+            input_done_set = true;
+            if redo_enabled {
+                info!("all file records completed; draining redo");
+            }
+        }
+        if !RUNNING.load(Ordering::Relaxed) {
+            let deadline = *stop_deadline.get_or_insert_with(|| Instant::now() + SHUTDOWN_GRACE);
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        if redo_enabled && last_monitor.elapsed() >= monitor_interval {
+            let dt = last_monitor.elapsed().as_secs_f64().max(0.001);
+            let adds = ADDS_PROCESSED.load(Ordering::Relaxed);
+            let redos = REDOS_PROCESSED.load(Ordering::Relaxed);
+            stats::emit_status_line(&stats::StatusLine {
+                redo_percent: config.redo_percent,
+                load_pref: n_workers - redo_pref,
+                redo_pref,
+                adds,
+                adds_rate: adds.saturating_sub(prev_adds) as f64 / dt,
+                redos,
+                redos_rate: redos.saturating_sub(prev_redos) as f64 / dt,
+                mq_depth: None, // no MQ in file mode
+                redo_backlog: None,
+                redo_backlog_slope: None,
+            });
+            monitor_redo_in_flight(&redo_in_flight, config.long_record_secs, redo_pref);
+            prev_adds = adds;
+            prev_redos = redos;
+            last_monitor = Instant::now();
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let workers_clean = workers.iter().all(|h| h.is_finished());
+    let workers_clean = handles.iter().all(|h| h.is_finished());
     if workers_clean {
-        for h in workers {
+        for h in handles {
             let _ = h.join();
         }
     } else {
@@ -285,7 +427,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
         );
     }
     // The consumer exits once all worker senders have dropped.
-    if let Ok(handle) = consumer {
+    if workers_clean && let Ok(handle) = consumer {
         let _ = handle.join();
     }
 
@@ -295,15 +437,21 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
         .watermark();
     let adds = ADDS_PROCESSED.load(Ordering::Relaxed);
     let rejected = ADDS_REJECTED.load(Ordering::Relaxed);
+    let redos = REDOS_PROCESSED.load(Ordering::Relaxed);
+    let redos_dropped = REDOS_DROPPED.load(Ordering::Relaxed);
     let errors = ERRORS.load(Ordering::Relaxed);
     let written = sink
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .written();
 
-    // "Processed total of N adds ..." keeps the prefix the e2e tests / tooling
-    // scrape; the resume hint is file-mode specific.
-    println!("Processed total of {adds} adds, 0 redo records (0 redo dropped, {errors} errors)");
+    // "Processed total of N adds, M redo records (...)" is the SAME line the
+    // queue paths print (e2e tests / tooling scrape it); the resume hint is
+    // file-mode specific.
+    println!(
+        "Processed total of {adds} adds, {redos} redo records ({redos_dropped} redo dropped, \
+         {errors} errors)"
+    );
     println!(
         "File load: {rejected} record(s) dead-lettered ({written} written to {reject_path}); \
          safe resume with --skip-lines {watermark}"
@@ -311,11 +459,14 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
     let unwritten = (rejected as u64).saturating_sub(written);
 
     let result = match &read_result {
-        Ok(lines) => {
-            info!("File loader finished: {lines} physical line(s) read from {path:?}");
+        Ok(read) => {
+            info!(
+                "File loader finished: {} physical line(s) read from {path:?}",
+                read.lines
+            );
             if WORKER_FATAL.load(Ordering::Relaxed) {
                 Err(anyhow::anyhow!(
-                    "a worker reported a fatal engine error during file load"
+                    "a worker or the redo fetcher reported a fatal engine error in file mode"
                 ))
             } else if unwritten != 0 {
                 // The load itself completed, but rejects exist only in the log
@@ -334,12 +485,18 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
     (workers_clean, result)
 }
 
+/// What [`read_and_feed`] got through: physical lines read (incl. skipped) and
+/// records handed to the worker pool (each owes exactly one [`Outcome`]).
+struct ReadSummary {
+    lines: u64,
+    dispatched: u64,
+}
+
 /// Reads `path`, skips the first `skip` physical lines, and feeds each remaining
 /// non-blank line to the worker pool as a [`LoadItem`] keyed by absolute line
 /// number. Blank and unparseable lines are completed immediately (blank =
 /// skipped, unparseable = written to the reject file) so the resume watermark
-/// can advance past them. Returns the total physical line count read
-/// (including skipped).
+/// can advance past them.
 fn read_and_feed(
     path: &Path,
     skip: u64,
@@ -347,11 +504,12 @@ fn read_and_feed(
     resume: &Arc<Mutex<ResumeTracker>>,
     sink: &Arc<Mutex<RejectSink>>,
     in_flight: &InFlightBodies,
-) -> Result<u64> {
+) -> Result<ReadSummary> {
     let file = File::open(path).with_context(|| format!("cannot open input file {path:?}"))?;
     let reader = BufReader::new(file);
 
     let mut line_no: u64 = 0;
+    let mut dispatched: u64 = 0;
     for line in reader.lines() {
         if !RUNNING.load(Ordering::Relaxed) {
             info!("shutdown requested; stopping file read at line {line_no}");
@@ -395,6 +553,7 @@ fn read_and_feed(
                         .remove(&line_no);
                     break;
                 }
+                dispatched += 1;
             }
             Err(e) => {
                 // Bad record: reject (log + count + side file), do not stop.
@@ -404,19 +563,24 @@ fn read_and_feed(
             }
         }
     }
-    Ok(line_no)
+    Ok(ReadSummary {
+        lines: line_no,
+        dispatched,
+    })
 }
 
 /// Drains worker outcomes, updates the global add counters, prints WithInfo
-/// responses when requested, writes engine rejects to the reject file, and
-/// advances the resume watermark. Exits when all worker result senders have
-/// dropped (channel closed).
+/// responses when requested, writes engine rejects to the reject file,
+/// advances the resume watermark and counts per-record outcomes into
+/// `outcomes` (the input-done signal). Exits when all worker result senders
+/// have dropped (channel closed).
 fn result_consumer(
     mut result_rx: mpsc::Receiver<Outcome>,
     want_info: bool,
     resume: Arc<Mutex<ResumeTracker>>,
     sink: Arc<Mutex<RejectSink>>,
     in_flight: InFlightBodies,
+    outcomes: Arc<AtomicU64>,
 ) {
     while let Some(outcome) = result_rx.blocking_recv() {
         let Outcome {
@@ -424,6 +588,11 @@ fn result_consumer(
             info,
             action,
         } = outcome;
+        // delivery_tag 0 is the engine-init / redo fatal sentinel (lines start
+        // at 1), not a dispatched record.
+        if delivery_tag != 0 {
+            outcomes.fetch_add(1, Ordering::Release);
+        }
         let body = in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -459,7 +628,7 @@ fn result_consumer(
                 // Worker already set WORKER_FATAL + RUNNING=false; record it and
                 // do NOT advance the watermark past this line (it did not load).
                 ERRORS.fetch_add(1, Ordering::Relaxed);
-                warn!("fatal engine error during file load: {msg}");
+                warn!("fatal engine error in file mode: {msg}");
             }
         }
     }
@@ -475,6 +644,46 @@ fn complete(resume: &Arc<Mutex<ResumeTracker>>, line: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Owner ruling 2026-09-29: file mode must share redo exactly like queue
+    /// mode. The old pure loader gave every worker `Class::LoadPreferring` and
+    /// no redo side regardless of redo%.
+    #[test]
+    fn file_mode_worker_plan_matches_queue_split() {
+        // The measured fleet arm: 16 threads, redo% 20 -> |B| = 3.
+        let (classes, redo) = worker_plan(16, 20);
+        assert!(redo, "redo% > 0 must start the redo fetcher in file mode");
+        let b = classes
+            .iter()
+            .filter(|c| **c == Class::RedoPreferring)
+            .count();
+        assert_eq!(b, redo_preferring_count(16, 20));
+        assert_eq!(b, 3);
+        assert!(classes[..3].iter().all(|c| *c == Class::RedoPreferring));
+        assert!(classes[3..].iter().all(|c| *c == Class::LoadPreferring));
+
+        // redo% = 0 keeps the pure loader: no redo side, all load-preferring.
+        let (classes, redo) = worker_plan(12, 0);
+        assert!(!redo);
+        assert!(classes.iter().all(|c| *c == Class::LoadPreferring));
+
+        // redo% = 100: every worker prefers redo; the file still loads via
+        // cross-over whenever the redo channel is empty.
+        let (classes, redo) = worker_plan(4, 100);
+        assert!(redo);
+        assert!(classes.iter().all(|c| *c == Class::RedoPreferring));
+    }
+
+    #[test]
+    fn input_done_waits_for_every_dispatched_outcome() {
+        assert!(!load_input_done(false, 0, 0), "reader still running");
+        assert!(
+            !load_input_done(true, 10, 9),
+            "one add_record still in flight"
+        );
+        assert!(load_input_done(true, 10, 10));
+        assert!(load_input_done(true, 0, 0), "empty file");
+    }
 
     #[test]
     fn watermark_advances_contiguously_and_handles_out_of_order() {

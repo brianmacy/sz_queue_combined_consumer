@@ -589,7 +589,7 @@ fn e2e_pure_redoer_100pct() {
     // real-engine tests).
 }
 
-/// FILE-INPUT e2e: the driver loads JSONL records from a single file (no AMQP),
+/// FILE-INPUT e2e (redo% = 0): the driver loads JSONL records from a single file (no AMQP),
 /// dead-letters a malformed line, and exits 0 at EOF reporting the resume
 /// watermark. Unlike the queue paths this needs no broker and no SIGTERM — file
 /// mode runs to end-of-file and self-terminates.
@@ -625,10 +625,13 @@ fn e2e_file_loader() {
     let out_path = std::env::temp_dir().join(format!("sz_e2e_file_{}.out", std::process::id()));
     let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
 
-    // File mode: no AMQP env; the binary reads the file and exits at EOF (no
-    // SIGTERM needed).
+    // File mode at redo% = 0 (pure loader): no AMQP env; the binary reads the
+    // file and exits at EOF (no SIGTERM needed). redo% > 0 file mode also
+    // drains redo before exiting — covered by
+    // e2e_file_mode_shares_redo_and_exits_when_drained.
     let mut child = Command::new(driver_bin())
         .env("SENZING_THREADS_PER_PROCESS", "2")
+        .env("SENZING_REDO_PERCENT", "0")
         .env(
             "SENZING_INPUT_FILE",
             file_path.to_str().expect("utf-8 path"),
@@ -742,6 +745,8 @@ fn e2e_file_loader_record_transform() {
     let mut child = Command::new(driver_bin())
         .env("SENZING_THREADS_PER_PROCESS", "2")
         .env("SENZING_INPUT_FILE", file_path.to_str().unwrap())
+        // Pure loader: this test is about the transform, not file-mode redo.
+        .env("SENZING_REDO_PERCENT", "0")
         .env(
             "SENZING_RECORD_TRANSFORM_PLUGIN",
             example_transform_plugin(),
@@ -1104,4 +1109,169 @@ fn e2e_truthset_resolution_and_redo_drain() {
          (drained_to_zero={drained_to_zero}), entities stable at {entities_after}, clean shutdown"
     );
     // Singleton intentionally left initialized (see the earlier real-engine tests).
+}
+
+// ==========================================================================
+// FILE MODE SHARES REDO (owner ruling 2026-09-29: a file-mode run that does
+// not process redo is a DEFECT). The demo truth set deterministically yields a
+// non-zero redo backlog (see the truth-set e2e above). File mode at redo% > 0
+// must (a) process that redo itself — the old pure loader hard-coded
+// "0 redo records" and left the backlog behind — and (b) self-terminate only
+// once the redo queue is drained, with no SIGTERM.
+//
+// RECORD_IDs are prefixed per run and the records are deleted again (and the
+// resulting redo drained) before asserting: redo generation depends on store
+// history — measured locally, a prefixed copy loaded next to earlier copies
+// merged into them and generated ZERO redo, which would disarm the redos > 0
+// check. Cleaning up keeps every run starting from the same state.
+// ==========================================================================
+
+#[test]
+fn e2e_file_mode_shares_redo_and_exits_when_drained() {
+    let (Some(engine_cfg), Some(dir)) = (engine_config(), truthset_dir()) else {
+        eprintln!(
+            "SKIP e2e_file_mode_shares_redo_and_exits_when_drained: needs \
+             SENZING_ENGINE_CONFIGURATION_JSON and the demo truth set (git submodule at \
+             truth-sets/truthsets/demo, or IT_TRUTHSET_DIR)"
+        );
+        return;
+    };
+
+    let tag = format!(
+        "FR{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let mut records = Vec::new();
+    for f in ["customers.jsonl", "reference.jsonl", "watchlist.jsonl"] {
+        for line in read_jsonl(&dir.join(f)) {
+            let needle = "\"RECORD_ID\": \"";
+            assert_eq!(
+                line.matches(needle).count(),
+                1,
+                "truth-set line does not carry exactly one {needle:?}: {line}"
+            );
+            records.push(line.replacen(needle, &format!("{needle}{tag}_"), 1));
+        }
+    }
+    let n = records.len();
+
+    let file_path =
+        std::env::temp_dir().join(format!("sz_e2e_file_redo_{}.jsonl", std::process::id()));
+    std::fs::write(&file_path, records.join("\n") + "\n").expect("write input file");
+    let out_path =
+        std::env::temp_dir().join(format!("sz_e2e_file_redo_{}.out", std::process::id()));
+    let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
+
+    // 4 threads at 25% -> |B| = 1 redo-preferring + 3 load-preferring (mixed
+    // dispatch while loading, full-pool redo after EOF). 1 s redo sleep keeps
+    // the two-probe drain exit short.
+    let mut child = Command::new(driver_bin())
+        .env("SENZING_THREADS_PER_PROCESS", "4")
+        .env("SENZING_REDO_PERCENT", "25")
+        .env("SENZING_REDO_SLEEP_TIME_IN_SECONDS", "1")
+        .env(
+            "SENZING_INPUT_FILE",
+            file_path.to_str().expect("utf-8 path"),
+        )
+        .env_remove("SENZING_RABBITMQ_QUEUE")
+        .env_remove("SENZING_AMQP_URL")
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn file-mode driver binary");
+
+    // No SIGTERM: file mode must end on its own once redo is drained.
+    let status = wait_bounded(&mut child, Duration::from_secs(240));
+
+    let mut stdout = String::new();
+    let _ = std::fs::File::open(&out_path).and_then(|mut f| f.read_to_string(&mut stdout));
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&file_path);
+
+    // Read the backlog the run left behind BEFORE cleaning up (cleanup itself
+    // enqueues redo).
+    let env: Arc<SzEnvironmentCore> = SzEnvironmentCore::get_instance(INSTANCE, &engine_cfg, false)
+        .expect("failed to initialize Senzing environment");
+    let engine = env.get_engine().expect("failed to get engine handle");
+    let backlog = engine.count_redo_records();
+
+    // Cleanup, BEFORE asserting so a failure still leaves the store as found:
+    // delete this run's records and drain the redo the deletes enqueue. This
+    // keeps the test repeatable (a later run's copies would otherwise merge into
+    // these entities and generate no redo) and keeps the truth-set test's
+    // scoped entity count unperturbed.
+    let mut cleanup_failures = Vec::new();
+    for r in &records {
+        let info = parse_record(r.as_bytes()).expect("truth-set record parses");
+        if let Err(e) = engine.delete_record(&info.data_source, &info.record_id, None) {
+            cleanup_failures.push(format!(
+                "delete {}/{}: {e}",
+                info.data_source, info.record_id
+            ));
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match engine.get_redo_record() {
+            Ok(rec) if rec.trim().is_empty() => break,
+            Ok(rec) => {
+                if let Err(e) = engine.process_redo_record(&rec, None) {
+                    cleanup_failures.push(format!("cleanup redo: {e}"));
+                    break;
+                }
+            }
+            Err(e) => {
+                cleanup_failures.push(format!("cleanup get_redo_record: {e}"));
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            cleanup_failures.push("cleanup redo drain exceeded 120 s".to_string());
+            break;
+        }
+    }
+
+    let status = status.expect("file-mode driver did not self-terminate within 240 s");
+    assert!(
+        status.success(),
+        "file-mode driver exited non-zero: {status:?}\n{stdout}"
+    );
+
+    let total_line = stdout
+        .lines()
+        .find(|l| l.starts_with("Processed total of "))
+        .unwrap_or_else(|| panic!("driver never printed its total\n{stdout}"));
+    let mut words = total_line
+        .trim_start_matches("Processed total of ")
+        .split_whitespace();
+    let adds: usize = words
+        .next()
+        .and_then(|w| w.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse add count from {total_line:?}"));
+    // "... N adds, M redo records ..." -> skip "adds,".
+    let redos: usize = words
+        .nth(1)
+        .and_then(|w| w.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse redo count from {total_line:?}"));
+    assert_eq!(adds, n, "expected all {n} records loaded\n{stdout}");
+    assert!(
+        redos > 0,
+        "file mode at redo% 25 processed no redo (the pure-loader defect)\n{stdout}"
+    );
+
+    // The drain is the exit condition: nothing may be left behind.
+    let backlog = backlog.expect("count_redo_records failed after file-mode run");
+    assert_eq!(
+        backlog, 0,
+        "file mode exited with {backlog} redo record(s) still queued\n{stdout}"
+    );
+    assert!(
+        cleanup_failures.is_empty(),
+        "test cleanup failed: {cleanup_failures:?}"
+    );
+    eprintln!("e2e file-mode redo share: {adds} adds, {redos} redo, backlog 0, self-exit");
 }

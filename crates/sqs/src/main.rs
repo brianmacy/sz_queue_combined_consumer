@@ -6,7 +6,7 @@
 //! `sz_combined_consumer_core`. `lapin` is never compiled into this binary.
 //!
 //! Modes:
-//! * `--file` — pure file loader (shared core path; no SQS, no tokio).
+//! * `--file` — file loader + redo share (shared core path; no SQS, no tokio).
 //! * redo% = 100 — pure `std::thread` redoer (shared core path; no SQS).
 //! * redo% < 100 — the SQS ingestion loop (this bin's `sqs` module).
 //!
@@ -21,7 +21,7 @@ use sz_rust_sdk::prelude::*;
 
 use sz_combined_consumer_core::config::{
     Config, DEFAULT_LONG_RECORD_SECS, DEFAULT_REDO_PERCENT, engine_config_from_env,
-    resolve_reject_file,
+    resolve_reject_file, validate_split_threads,
 };
 use sz_combined_consumer_core::runtime;
 use sz_combined_consumer_core::transform::TransformHandle;
@@ -92,7 +92,8 @@ struct Args {
     #[arg(long = "prefetch", env = "SENZING_PREFETCH")]
     prefetch: Option<usize>,
 
-    /// Load records from a single JSONL file instead of SQS (pure loader).
+    /// Load records from a single JSONL file instead of SQS (redo% applies; at
+    /// redo% > 0 exits once the file is loaded and redo is drained).
     #[arg(short = 'f', long = "file", env = "SENZING_INPUT_FILE")]
     input_file: Option<String>,
 
@@ -225,11 +226,7 @@ fn build_config(args: &Args) -> Result<Config, String> {
     } else {
         args.threads_per_process
     };
-    if args.redo_percent > 0 && args.redo_percent < 100 && threads < 2 {
-        return Err(format!(
-            "0 < redo% < 100 requires at least 2 worker threads (got {threads})"
-        ));
-    }
+    validate_split_threads(threads, args.redo_percent)?;
     Ok(Config {
         engine_config,
         url: None,
