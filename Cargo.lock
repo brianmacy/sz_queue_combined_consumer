@@ -2785,12 +2785,27 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "libc",
  "num_cpus",
  "serde_json",
+ "sz-record-transform",
+ "sz-record-transform-example",
  "sz-rust-sdk",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sz-record-transform"
+version = "0.3.0"
+
+[[package]]
+name = "sz-record-transform-example"
+version = "0.3.0"
+dependencies = [
+ "serde_json",
+ "sz-record-transform",
 ]
 
 [[package]]
@@ -2826,6 +2841,7 @@ dependencies = [
  "lapin",
  "libc",
  "sz-combined-consumer-core",
+ "sz-record-transform-example",
  "sz-rust-sdk",
  "tokio",
  "tracing",

@@ -24,6 +24,7 @@ use sz_combined_consumer_core::config::{
     resolve_reject_file,
 };
 use sz_combined_consumer_core::runtime;
+use sz_combined_consumer_core::transform::TransformHandle;
 
 mod sqs;
 
@@ -136,6 +137,21 @@ struct Args {
     )]
     long_record: u64,
 
+    /// Shared library implementing the record-transform ABI (sz-record-transform);
+    /// applied to every load record before add_record.
+    #[arg(
+        long = "record-transform-plugin",
+        env = "SENZING_RECORD_TRANSFORM_PLUGIN"
+    )]
+    record_transform_plugin: Option<String>,
+
+    /// Opaque config string passed to the record-transform plugin at init.
+    #[arg(
+        long = "record-transform-config",
+        env = "SENZING_RECORD_TRANSFORM_CONFIG"
+    )]
+    record_transform_config: Option<String>,
+
     /// Print the WithInfo response for each processed record.
     #[arg(short = 'i', long = "info", default_value_t = false)]
     info: bool,
@@ -232,6 +248,10 @@ fn build_config(args: &Args) -> Result<Config, String> {
         long_record_secs: args.long_record,
         info: args.info,
         debug_trace: args.debug_trace,
+        transform: TransformHandle::load(
+            args.record_transform_plugin.as_deref(),
+            args.record_transform_config.as_deref(),
+        )?,
     })
 }
 

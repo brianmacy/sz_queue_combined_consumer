@@ -1,0 +1,12 @@
+[package]
+name = "sz-record-transform"
+description = "C ABI contract (and a Rust export macro) for record-transform plugins loaded by the combined consumer before add_record"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "sz_record_transform"
+path = "src/lib.rs"
