@@ -33,6 +33,7 @@ pub mod record;
 pub mod redo;
 pub mod runtime;
 pub mod stats;
+pub mod transform;
 pub mod worker;
 
 pub use config::{Args, Config};

@@ -66,6 +66,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
             add_flags: None,
             redo_flags: rflags,
             want_info: config.info,
+            transform: Default::default(),
         };
         match std::thread::Builder::new()
             .name(format!("sz-worker-{worker_id}"))

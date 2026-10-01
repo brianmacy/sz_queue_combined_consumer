@@ -299,6 +299,7 @@ pub async fn run(
             add_flags,
             redo_flags: rflags,
             want_info,
+            transform: config.transform.clone(),
         };
         let handle = std::thread::Builder::new()
             .name(format!("sz-worker-{worker_id}"))

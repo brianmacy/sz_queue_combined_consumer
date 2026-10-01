@@ -1,0 +1,18 @@
+[package]
+name = "sz-record-transform-example"
+description = "Example record-transform plugin (cdylib) used by the consumer's tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "sz_record_transform_example"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+sz-record-transform.workspace = true
+serde_json.workspace = true

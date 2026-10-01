@@ -23,6 +23,8 @@ client (compile-time backend selection — no runtime switch, no feature flags):
 | `sz-combined-consumer-core` | lib | — (worker pool, redo, stats, config reload, file loader) | none |
 | `sz_rabbit_combined_consumer` | bin | RabbitMQ | `lapin` |
 | `sz_sqs_combined_consumer` | bin | Amazon SQS (standard queues) | `aws-sdk-sqs` |
+| `sz-record-transform` | lib | — (record-transform plugin C ABI + Rust export macro) | none |
+| `sz-record-transform-example` | cdylib | — (example plugin; used by tests) | none |
 
 `cargo build -p sz_rabbit_combined_consumer` never compiles the AWS SDK, and
 `cargo build -p sz_sqs_combined_consumer` never compiles `lapin`. Both binaries
@@ -93,6 +95,8 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_INPUT_FILE` (`-f`/`--file`) | none | load JSONL (one JSON record per line) from a single file instead of RabbitMQ. Pure loader (redo% ignored); mutually exclusive with `--url`/`--queue`. Exits 0 at EOF. |
 | `SENZING_SKIP_LINES` (`--skip-lines`) | 0 | file mode only: skip the first N physical lines. Resumes an interrupted load — the driver prints a safe `--skip-lines` offset (contiguous-completion watermark) at shutdown. |
 | `SENZING_REJECT_FILE` (`--reject-file`) | `<input>.rejected.jsonl` | file mode only: JSONL file that receives every rejected input line **verbatim** (unparseable, engine bad input, retry timeout, SENZ0082). Created lazily on the first reject, opened in append mode. Reprocess with `--file <reject file>`. |
+| `SENZING_RECORD_TRANSFORM_PLUGIN` (`--record-transform-plugin`) | none | shared library that rewrites every load record before `add_record` (all backends). See [Record transform plugins](#record-transform-plugins). |
+| `SENZING_RECORD_TRANSFORM_CONFIG` (`--record-transform-config`) | empty | opaque string passed to the plugin's init (e.g. JSON) |
 | `SENZING_PREFETCH` (`--prefetch`) | RabbitMQ: threads + 2; SQS: threads | RabbitMQ: `basic_qos` prefetch. SQS: extra messages held beyond the worker count (in-flight cap = threads + prefetch) |
 | `SENZING_SQS_QUEUE_URL` (`-q`/`--queue-url`) | required iff redo% < 100 | SQS binary only: source queue URL |
 | `SENZING_SQS_DEAD_LETTER_QUEUE_URL` (`--dead-letter-queue-url`) | discovered | SQS binary only: where rejected records are sent. Default: the source queue's `RedrivePolicy` → `deadLetterTargetArn` → `GetQueueUrl`. Printed at startup as `DeadLetter: <url>`. |
@@ -144,6 +148,35 @@ driver uses this one convention for both binaries.)
 * **IAM.** On the source queue: `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
   `sqs:ChangeMessageVisibility`, `sqs:GetQueueAttributes`. On the DLQ:
   `sqs:SendMessage`, `sqs:GetQueueUrl` (discovery only).
+
+## Record transform plugins
+
+`--record-transform-plugin <lib.so>` loads a shared library (any language) that
+rewrites each load record before `add_record` — e.g. to add derived features.
+It is `dlopen`ed once at startup (a load/init failure exits 1, before engine
+init) and called concurrently from every worker thread, so the plugin's
+transform MUST be thread-safe on one handle. It runs on the worker side, so it
+applies identically to RabbitMQ, SQS and file mode, and scales with
+`SENZING_THREADS_PER_PROCESS`. Redo records are never transformed.
+
+- **Unchanged** → the original body is loaded (no copy).
+- **Replaced** → the new body is re-parsed and loaded under ITS
+  `DATA_SOURCE`/`RECORD_ID` (a plugin may change either).
+- **Error**, or a replaced body that does not parse → the record is rejected
+  without requeue (DLQ / reject file receives the ORIGINAL body) and the
+  plugin's message is logged.
+
+The C ABI (version 1) is documented in
+[`crates/transform-abi/src/lib.rs`](crates/transform-abi/src/lib.rs). Rust
+plugins depend on `sz-record-transform`, implement `RecordTransform`, and call
+`export_record_transform!(Type, Type::new)`; see
+[`crates/transform-example`](crates/transform-example/src/lib.rs).
+
+```bash
+sz_rabbit_combined_consumer --file records.jsonl \
+    --record-transform-plugin ./libmy_transform.so \
+    --record-transform-config '{"ADDED_FIELD":"Y"}'
+```
 
 ## Failure handling
 
