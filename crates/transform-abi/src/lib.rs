@@ -27,8 +27,9 @@
 //! string when no config is given). No panic/exception may cross the boundary.
 //!
 //! Rust plugins implement [`RecordTransform`] and invoke
-//! [`export_record_transform!`], which generates all five symbols with
-//! `catch_unwind` at every entry point.
+//! [`export_record_transform!`], which generates all five symbols, with
+//! `catch_unwind` around every entry point that runs plugin code
+//! (`sz_rt_create`, `sz_rt_transform`, `sz_rt_destroy`).
 
 use std::borrow::Cow;
 
@@ -182,7 +183,14 @@ macro_rules! export_record_transform {
                 let s =
                     ::std::str::from_utf8(bytes).map_err(|e| format!("input not UTF-8: {e}"))?;
                 $crate::RecordTransform::transform(t, s).map(|c| match c {
-                    ::std::borrow::Cow::Borrowed(_) => None,
+                    // Only the input itself means "unchanged"; a borrowed
+                    // sub-slice is a real change and must not be dropped.
+                    ::std::borrow::Cow::Borrowed(b)
+                        if b.as_ptr() == s.as_ptr() && b.len() == s.len() =>
+                    {
+                        None
+                    }
+                    ::std::borrow::Cow::Borrowed(b) => Some(b.to_owned()),
                     ::std::borrow::Cow::Owned(o) => Some(o),
                 })
             });
