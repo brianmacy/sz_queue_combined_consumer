@@ -157,6 +157,8 @@ pub struct WorkerCtx {
     pub add_flags: Option<SzFlags>,
     pub redo_flags: Option<SzFlags>,
     pub want_info: bool,
+    /// Optional record transform applied before `add_record`.
+    pub transform: crate::transform::TransformHandle,
 }
 
 /// Worker thread entry point: derive an engine handle, then run the dispatch
@@ -373,32 +375,10 @@ fn process_load(ctx: &WorkerCtx, engine: &dyn SzEngine, load: &LoadSide, item: L
             warn!("worker {}: non-UTF-8 message body", ctx.worker_id);
             Action::RejectNoRequeue
         }
-        Ok(body_str) => {
-            let mut result =
-                engine.add_record(&info.data_source, &info.record_id, body_str, ctx.add_flags);
-            if result.is_err() && crate::config_reload::reinit_if_stale(&ctx.env) {
-                // The registered default config drifted; the engine has been
-                // reinitialized (handles stay valid) — retry the record once.
-                result =
-                    engine.add_record(&info.data_source, &info.record_id, body_str, ctx.add_flags);
-            }
-            match result {
-                Ok(resp) => Action::Ack(if ctx.want_info { Some(resp) } else { None }),
-                Err(e) => match classify_error(&e) {
-                    ErrorClass::BadInputOrTimeout => {
-                        // The backend logs WHERE the record went (DLQ / reject
-                        // file); this is the only place the engine error text
-                        // is known, so log WHY here.
-                        warn!(
-                            "REJECTING due to bad data or timeout [worker {}]: {} : {} -> {e}",
-                            ctx.worker_id, info.data_source, info.record_id
-                        );
-                        Action::RejectNoRequeue
-                    }
-                    ErrorClass::Fatal => Action::Fatal(e.to_string()),
-                },
-            }
-        }
+        Ok(body_str) => match apply_transform(ctx, body_str, &info) {
+            None => Action::RejectNoRequeue,
+            Some((body_str, eff)) => add_record_action(ctx, engine, &body_str, &eff),
+        },
     };
     LOAD_BUSY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
@@ -422,6 +402,71 @@ fn process_load(ctx: &WorkerCtx, engine: &dyn SzEngine, load: &LoadSide, item: L
             action,
         })
         .is_ok()
+}
+
+/// Applies the optional record transform. Returns the (possibly rewritten)
+/// body plus the DATA_SOURCE/RECORD_ID to load it under (re-parsed when the
+/// plugin replaced the record, since it may change either), or `None` when the
+/// record must be dead-lettered (the reason is logged here).
+fn apply_transform<'a>(
+    ctx: &WorkerCtx,
+    body: &'a str,
+    info: &RecordInfo,
+) -> Option<(std::borrow::Cow<'a, str>, RecordInfo)> {
+    let Some(t) = &ctx.transform.0 else {
+        return Some((std::borrow::Cow::Borrowed(body), info.clone()));
+    };
+    match t.transform(body) {
+        Err(e) => {
+            warn!(
+                "REJECTING: record transform failed [worker {}]: {} : {} -> {e}",
+                ctx.worker_id, info.data_source, info.record_id
+            );
+            None
+        }
+        Ok(std::borrow::Cow::Borrowed(b)) => Some((std::borrow::Cow::Borrowed(b), info.clone())),
+        Ok(std::borrow::Cow::Owned(o)) => match crate::record::parse_record(o.as_bytes()) {
+            Ok(eff) => Some((std::borrow::Cow::Owned(o), eff)),
+            Err(e) => {
+                warn!(
+                    "REJECTING: transformed record is invalid [worker {}]: {} : {} -> {e}",
+                    ctx.worker_id, info.data_source, info.record_id
+                );
+                None
+            }
+        },
+    }
+}
+
+/// `add_record` with the stale-config retry, mapped to a delivery [`Action`].
+fn add_record_action(
+    ctx: &WorkerCtx,
+    engine: &dyn SzEngine,
+    body_str: &str,
+    info: &RecordInfo,
+) -> Action {
+    let mut result = engine.add_record(&info.data_source, &info.record_id, body_str, ctx.add_flags);
+    if result.is_err() && crate::config_reload::reinit_if_stale(&ctx.env) {
+        // The registered default config drifted; the engine has been
+        // reinitialized (handles stay valid) — retry the record once.
+        result = engine.add_record(&info.data_source, &info.record_id, body_str, ctx.add_flags);
+    }
+    match result {
+        Ok(resp) => Action::Ack(if ctx.want_info { Some(resp) } else { None }),
+        Err(e) => match classify_error(&e) {
+            ErrorClass::BadInputOrTimeout => {
+                // The backend logs WHERE the record went (DLQ / reject
+                // file); this is the only place the engine error text
+                // is known, so log WHY here.
+                warn!(
+                    "REJECTING due to bad data or timeout [worker {}]: {} : {} -> {e}",
+                    ctx.worker_id, info.data_source, info.record_id
+                );
+                Action::RejectNoRequeue
+            }
+            ErrorClass::Fatal => Action::Fatal(e.to_string()),
+        },
+    }
 }
 
 /// Processes one redo record. Redo outcomes are terminal here (no broker

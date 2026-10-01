@@ -223,6 +223,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
             add_flags,
             redo_flags: None,
             want_info,
+            transform: config.transform.clone(),
         };
         match std::thread::Builder::new()
             .name(format!("sz-worker-{worker_id}"))

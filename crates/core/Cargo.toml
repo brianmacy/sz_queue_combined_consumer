@@ -25,3 +25,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 ctrlc.workspace = true
 num_cpus.workspace = true
+# Record-transform plugin ABI + dlopen (libc) for the optional per-record hook.
+sz-record-transform.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+# Built so the transform tests can dlopen the example plugin cdylib.
+sz-record-transform-example = { path = "../transform-example" }

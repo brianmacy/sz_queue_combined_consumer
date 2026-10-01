@@ -4,7 +4,13 @@
 # require rustc 1.94+) resolves to the latest 1.88-compatible versions instead of
 # failing the build.
 resolver = "3"
-members = ["crates/core", "crates/rabbit", "crates/sqs"]
+members = [
+    "crates/core",
+    "crates/rabbit",
+    "crates/sqs",
+    "crates/transform-abi",
+    "crates/transform-example",
+]
 
 [workspace.package]
 version = "0.3.0"
@@ -44,6 +50,8 @@ aws-sdk-sqs = { version = "1", default-features = false, features = ["behavior-v
 # sz-combined-consumer-core: the broker-agnostic engine-processing library shared
 # by every backend binary (RabbitMQ, SQS, ...).
 sz-combined-consumer-core = { path = "crates/core" }
+# Record-transform plugin ABI (no Senzing dependency; plugins depend on it too).
+sz-record-transform = { path = "crates/transform-abi" }
 
 [profile.release]
 opt-level = 3

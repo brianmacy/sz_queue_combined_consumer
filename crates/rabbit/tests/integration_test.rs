@@ -689,6 +689,123 @@ fn e2e_file_loader() {
     );
 }
 
+/// Example record-transform plugin cdylib (built as a dev-dependency into the
+/// same `deps/` directory as this test executable).
+fn example_transform_plugin() -> String {
+    let deps = std::env::current_exe()
+        .expect("current_exe")
+        .parent()
+        .expect("deps dir")
+        .to_path_buf();
+    let p = deps.join("libsz_record_transform_example.so");
+    assert!(p.exists(), "example transform plugin not built at {p:?}");
+    p.to_string_lossy().into_owned()
+}
+
+/// File mode with a record-transform plugin: the plugin rewrites DATA_SOURCE
+/// of records naming an unregistered source to TEST (proving the transformed
+/// body AND its re-parsed DATA_SOURCE reach add_record), and a plugin error
+/// dead-letters only that record, verbatim (original body).
+#[test]
+fn e2e_file_loader_record_transform() {
+    let Some(config) = engine_config() else {
+        eprintln!("SKIP e2e_file_loader_record_transform: engine config not set");
+        return;
+    };
+
+    const N_VALID: usize = 10;
+    const FORCED_ERR: &str = r#"{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_RT_ERR","NAME_FULL":"A B","SZ_RT_FORCE_ERROR":1}"#;
+    let mut lines: Vec<String> = make_records("E2E_RT", N_VALID)
+        .into_iter()
+        .map(|r| {
+            r.replace(
+                r#""DATA_SOURCE":"TEST""#,
+                r#""DATA_SOURCE":"E2E_NO_SUCH_DSRC""#,
+            )
+        })
+        .collect();
+    assert!(
+        lines.iter().all(|l| l.contains("E2E_NO_SUCH_DSRC")),
+        "make_records format changed; test would not exercise the rewrite"
+    );
+    lines.push(FORCED_ERR.to_string());
+
+    let pid = std::process::id();
+    let file_path = std::env::temp_dir().join(format!("sz_e2e_rt_{pid}.jsonl"));
+    std::fs::write(&file_path, lines.join("\n") + "\n").expect("write input file");
+    let reject_path =
+        std::path::PathBuf::from(format!("{}.rejected.jsonl", file_path.to_str().unwrap()));
+    let _ = std::fs::remove_file(&reject_path);
+    let out_path = std::env::temp_dir().join(format!("sz_e2e_rt_{pid}.out"));
+    let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
+
+    let mut child = Command::new(driver_bin())
+        .env("SENZING_THREADS_PER_PROCESS", "2")
+        .env("SENZING_INPUT_FILE", file_path.to_str().unwrap())
+        .env(
+            "SENZING_RECORD_TRANSFORM_PLUGIN",
+            example_transform_plugin(),
+        )
+        .env(
+            "SENZING_RECORD_TRANSFORM_CONFIG",
+            r#"{"DATA_SOURCE":"TEST","SZ_RT_ADDED":"Y"}"#,
+        )
+        .env_remove("SENZING_RABBITMQ_QUEUE")
+        .env_remove("SENZING_AMQP_URL")
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn file-loader driver binary");
+
+    let status = wait_bounded(&mut child, Duration::from_secs(60));
+    let mut stdout = String::new();
+    let _ = std::fs::File::open(&out_path).and_then(|mut f| f.read_to_string(&mut stdout));
+    let rejects = std::fs::read_to_string(&reject_path);
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&file_path);
+    let _ = std::fs::remove_file(&reject_path);
+
+    let status = status.expect("file loader did not exit within bound");
+    assert!(
+        status.success(),
+        "file loader exited non-zero: {status:?}\n{stdout}"
+    );
+    let rejects =
+        rejects.unwrap_or_else(|e| panic!("reject file {reject_path:?} unreadable: {e}\n{stdout}"));
+    assert_eq!(
+        rejects.lines().collect::<Vec<_>>(),
+        vec![FORCED_ERR],
+        "only the plugin-error record may be rejected, verbatim\n{stdout}"
+    );
+    let total_line = stdout
+        .lines()
+        .find(|l| l.starts_with("Processed total of "))
+        .unwrap_or_else(|| panic!("file loader never printed its total\n{stdout}"));
+    let adds: usize = total_line
+        .trim_start_matches("Processed total of ")
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse add count from {total_line:?}"));
+    assert_eq!(adds, N_VALID, "rewritten records must all load\n{stdout}");
+
+    // The transformed body (not just the re-parsed key) reached the engine.
+    // (No env.destroy(): see real_engine_load_path_add_record.)
+    let env: Arc<SzEnvironmentCore> = SzEnvironmentCore::get_instance(INSTANCE, &config, false)
+        .expect("failed to initialize Senzing environment");
+    let engine = env.get_engine().expect("failed to get engine handle");
+    let rec = engine
+        .get_record("TEST", "E2E_RT_0", None)
+        .expect("transformed record must exist under DATA_SOURCE TEST");
+    assert!(
+        rec.contains("SZ_RT_ADDED"),
+        "plugin-added field missing: {rec}"
+    );
+    eprintln!(
+        "e2e_file_loader_record_transform: {adds}/{N_VALID} rewritten+loaded, 1 plugin reject"
+    );
+}
+
 // ==========================================================================
 // TRUTH-SET e2e — real cross-source entity resolution + real redo drain +
 // a correctness signal, all at max allowed volume (<= 500 DSR eval cap).
