@@ -1,7 +1,9 @@
 //! Example record-transform plugin: merges the top-level fields of its JSON
 //! config object into every record. An empty config leaves records unchanged;
 //! a record carrying `"SZ_RT_FORCE_ERROR"` is rejected (exercises the error
-//! path). Used by the consumer's tests; also a template for real plugins.
+//! path); one carrying `"SZ_RT_BORROW_TRIMMED"` returns a borrowed, trimmed
+//! sub-slice (exercises borrowed-but-changed). Used by the consumer's tests;
+//! also a template for real plugins.
 
 use std::borrow::Cow;
 
@@ -34,6 +36,10 @@ impl RecordTransform for MergeFields {
             .ok_or_else(|| "record is not a JSON object".to_string())?;
         if obj.contains_key("SZ_RT_FORCE_ERROR") {
             return Err("forced error".to_string());
+        }
+        if obj.contains_key("SZ_RT_BORROW_TRIMMED") {
+            // A borrowed view that differs from the input: must be loaded.
+            return Ok(Cow::Borrowed(record.trim()));
         }
         if self.fields.is_empty() {
             return Ok(Cow::Borrowed(record));

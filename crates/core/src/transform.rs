@@ -179,6 +179,12 @@ impl RecordTransform for PluginTransform {
                 r
             }
             _ => {
+                // ABI violation (REPLACED with null out, or ERROR that also
+                // wrote out): release any buffer rather than leak it.
+                if !out.is_null() {
+                    // SAFETY: plugin-owned buffer.
+                    unsafe { (self.free)(out) };
+                }
                 // SAFETY: err is null or plugin-owned.
                 Err(unsafe { take_string(self.free, err) }
                     .unwrap_or_else(|| format!("plugin returned {rc} without a message")))
@@ -262,6 +268,18 @@ mod tests {
         assert_eq!(e, "forced error");
         let e = t.transform("not json").unwrap_err();
         assert!(e.contains("not valid JSON"), "{e}");
+    }
+
+    #[test]
+    fn plugin_borrowed_subslice_is_a_change() {
+        let t = load_example("");
+        let rec = "  {\"DATA_SOURCE\":\"TEST\",\"RECORD_ID\":\"1\",\"SZ_RT_BORROW_TRIMMED\":1}  ";
+        let out = t.transform(rec).unwrap();
+        assert!(
+            matches!(out, Cow::Owned(_)),
+            "borrowed sub-slice must not read as unchanged"
+        );
+        assert_eq!(out, rec.trim());
     }
 
     #[test]
