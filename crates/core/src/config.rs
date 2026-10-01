@@ -118,6 +118,21 @@ pub struct Args {
     )]
     pub long_record: u64,
 
+    /// Shared library implementing the record-transform ABI (sz-record-transform);
+    /// applied to every load record before add_record.
+    #[arg(
+        long = "record-transform-plugin",
+        env = "SENZING_RECORD_TRANSFORM_PLUGIN"
+    )]
+    pub record_transform_plugin: Option<String>,
+
+    /// Opaque config string passed to the record-transform plugin at init.
+    #[arg(
+        long = "record-transform-config",
+        env = "SENZING_RECORD_TRANSFORM_CONFIG"
+    )]
+    pub record_transform_config: Option<String>,
+
     /// Print the WithInfo response for each processed record. Inert at the
     /// engine level in this SDK (the WithInfo helper is always called);
     /// print-gating only, matching both sibling drivers.
@@ -168,6 +183,8 @@ pub struct Config {
     pub long_record_secs: u64,
     pub info: bool,
     pub debug_trace: bool,
+    /// Optional per-record transform (loaded at resolve time, fail-fast).
+    pub transform: crate::transform::TransformHandle,
 }
 
 /// Reads and validates `SENZING_ENGINE_CONFIGURATION_JSON` from the environment.
@@ -237,6 +254,11 @@ impl Config {
             validate_topology(threads, args.redo_percent, url.as_deref(), queue.as_deref())?;
         }
 
+        let transform = crate::transform::TransformHandle::load(
+            args.record_transform_plugin.as_deref(),
+            args.record_transform_config.as_deref(),
+        )?;
+
         let prefetch = args
             .prefetch
             .unwrap_or_else(|| u16::try_from(threads.saturating_add(2)).unwrap_or(u16::MAX));
@@ -256,6 +278,7 @@ impl Config {
             long_record_secs: args.long_record,
             info: args.info,
             debug_trace: args.debug_trace,
+            transform,
         })
     }
 
