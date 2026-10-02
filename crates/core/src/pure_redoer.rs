@@ -93,7 +93,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
     let sleep_secs = config.redo_sleep_secs;
     match std::thread::Builder::new()
         .name("sz-redo-fetcher".to_string())
-        .spawn(move || fetcher_loop(fetcher_env, redo_tx, sleep_secs, None, None))
+        .spawn(move || fetcher_loop(fetcher_env, redo_tx, sleep_secs, None, None, None))
     {
         Ok(handle) => handles.push(handle),
         Err(e) => {

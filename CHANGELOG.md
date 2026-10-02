@@ -2,6 +2,31 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
+## Unreleased — file mode shares redo (2026-09-29)
+
+* **File mode no longer ignores redo% (owner ruling: a file run that does not
+  process redo is a defect).** Measured before: 12 × `--file <shard>
+  --threads-per-process 16 --redo-percent 20` each printed `0 redo records` and
+  exited at EOF leaving 146,008 redo on the store.
+* Same machinery as queue mode, not a fork: `redo_preferring_count` split
+  (shared `worker::worker_class`), `redo::fetcher_loop`, `mixed_loop` cross-over,
+  `monitor_redo_in_flight`, and the status line. At EOF the load channel closes
+  and every worker ramps to redo.
+* New file-mode-only exit rule (`redo::DrainExit` / `DrainGate`): after the
+  file is exhausted and every record has an outcome, stop after 2 consecutive
+  empty `get_redo_record()` probes `--redo-sleep-secs` apart with no redo
+  outstanding in the process. Queue mode still never exits on idle.
+* ⚠ Behaviour change: `--file` at the DEFAULT redo% (20) now processes redo and
+  waits for the drain (≈ one `--redo-sleep-secs` tail) before exiting. Pass
+  `--redo-percent 0` for the old pure-loader behaviour.
+* The final `Processed total of X adds, Y redo records (...)` line now reports
+  real redo/dropped counts. File mode now enforces ≥ 2 threads for
+  0 < redo% < 100 (shared `config::validate_split_threads`).
+* Tests: `file_mode_worker_plan_matches_queue_split`,
+  `input_done_waits_for_every_dispatched_outcome`, two `DrainGate` tests,
+  `worker_class_splits_first_b_ids_to_redo`, and the engine e2e
+  `e2e_file_mode_shares_redo_and_exits_when_drained` (truth set, self-cleaning).
+
 ## Unreleased — dependency roll-up (2026-09-23)
 
 One change instead of eight Dependabot PRs (each PR fires the full CI matrix).
