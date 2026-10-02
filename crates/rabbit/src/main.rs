@@ -1,7 +1,7 @@
 //! Entry point for the combined RabbitMQ load + redo Senzing driver.
 //!
 //! Branches on the `redo%` endpoints per the design (§1.1):
-//! * `--file` — pure file loader (no AMQP, no tokio).
+//! * `--file` — file loader + redo share (no AMQP, no tokio).
 //! * redo% = 100 — the tokio runtime is never BUILT and no AMQP connection is
 //!   opened; the pure `std::thread` redoer path runs instead.
 //! * redo% < 100 — the consumer-shaped tokio/lapin path runs (which itself

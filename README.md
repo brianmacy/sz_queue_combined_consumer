@@ -92,7 +92,7 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_THREADS_PER_PROCESS` (`--threads-per-process`) | **12** | worker pool size (0 → CPU count, compat foot-gun) |
 | `SENZING_AMQP_URL` (`-u`/`--url`) | required iff redo% < 100 | RabbitMQ URL |
 | `SENZING_RABBITMQ_QUEUE` (`-q`/`--queue`) | required iff redo% < 100 | source queue (must exist; passive declare) |
-| `SENZING_INPUT_FILE` (`-f`/`--file`) | none | load JSONL (one JSON record per line) from a single file instead of RabbitMQ. Pure loader (redo% ignored); mutually exclusive with `--url`/`--queue`. Exits 0 at EOF. |
+| `SENZING_INPUT_FILE` (`-f`/`--file`) | none | load JSONL (one JSON record per line) from a single file instead of RabbitMQ; mutually exclusive with `--url`/`--queue`. redo% applies as in queue mode. Exits 0 at EOF (redo% = 0) or once the file is loaded and redo is drained (redo% > 0; see *File input*). |
 | `SENZING_SKIP_LINES` (`--skip-lines`) | 0 | file mode only: skip the first N physical lines. Resumes an interrupted load — the driver prints a safe `--skip-lines` offset (contiguous-completion watermark) at shutdown. |
 | `SENZING_REJECT_FILE` (`--reject-file`) | `<input>.rejected.jsonl` | file mode only: JSONL file that receives every rejected input line **verbatim** (unparseable, engine bad input, retry timeout, SENZ0082). Created lazily on the first reject, opened in append mode. Reprocess with `--file <reject file>`. |
 | `SENZING_RECORD_TRANSFORM_PLUGIN` (`--record-transform-plugin`) | none | shared library that rewrites every load record before `add_record` (all backends). See [Record transform plugins](#record-transform-plugins). |
@@ -112,8 +112,9 @@ verbatim-compatible with the sibling drivers.
 | `-i`/`--info` | off | print WithInfo payloads (engine-level no-op; print gating only) |
 | `-t`/`--debugTrace` | off | engine debug trace |
 
-Validation is loud (exit 1): redo% ∉ [0,100]; redo% < 100 without URL/queue;
-0 < redo% < 100 with fewer than 2 threads; `LONG_RECORD` < 1. Exit codes:
+Validation is loud (exit 1): redo% ∉ [0,100]; redo% < 100 without URL/queue
+(queue mode); 0 < redo% < 100 with fewer than 2 threads (queue and file mode);
+`LONG_RECORD` < 1. Exit codes:
 **1** = configuration/validation failure at startup, **255** = fatal runtime
 error (engine/DB/broker) after an orderly teardown, **0** = clean shutdown or
 file EOF. (The standalone drivers disagreed with each other here; the combined
@@ -282,11 +283,21 @@ queue:
 sz_rabbit_combined_consumer --file /data/records.jsonl
 ```
 
-File mode is a pure loader (no redo processing; drain redo separately with a
-`--redo-percent 100` run). It runs to end-of-file and exits 0. Blank lines are
-skipped. On completion — or on SIGTERM — it prints a safe resume offset;
-restart with `--skip-lines N` to continue where it stopped (`add_record` is
-idempotent, so an interrupted run is safe to resume).
+The point of this driver is to do redo in parallel with load and then switch
+to all redo when the load is done, and file input is no exception. File mode
+shares redo exactly like queue mode: `--redo-percent` gives \|B\|
+workers a redo preference while the file loads (one redo fetcher per process),
+and at end-of-file the load channel closes so the whole pool falls through to
+redo. At redo% > 0 the process exits 0 once every record has completed AND
+`get_redo_record()` comes back empty on **2 consecutive probes
+`--redo-sleep-secs` apart** with no redo outstanding in the process — so the
+drain tail costs about one `--redo-sleep-secs` (default 60 s) after redo first
+reads empty. Queue mode never self-exits on idle; this rule is file-mode only.
+At redo% = 0 it is a pure loader and exits at end-of-file. Blank lines are
+skipped; unparseable lines go to the reject file (below) without aborting
+the load. On completion — or on SIGTERM — it prints a safe resume
+offset; restart with `--skip-lines N` to continue where it stopped
+(`add_record` is idempotent, so an interrupted run is safe to resume).
 
 **Rejects.** A file has no dead-letter queue, so every rejected line —
 unparseable JSON, engine bad input, retry timeout (`SENZ0010`), `SENZ0082` — is

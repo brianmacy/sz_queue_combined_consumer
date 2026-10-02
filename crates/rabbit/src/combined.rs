@@ -39,8 +39,8 @@ use sz_combined_consumer_core::stats::{
     SAMPLE_REDO_RECORDS, StatsPayload, ThroughputTicker, stats_loop,
 };
 use sz_combined_consumer_core::worker::{
-    Action, Class, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
-    WorkerCtx, add_record_flags, monitor_redo_in_flight, redo_flags, worker_loop,
+    Action, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
+    WorkerCtx, add_record_flags, monitor_redo_in_flight, redo_flags, worker_class, worker_loop,
 };
 
 /// EWMA smoothing for the redo-backlog slope.
@@ -139,6 +139,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
                     sleep_secs,
                     Some(fetcher_result_tx),
                     Some(fetcher_notify),
+                    None, // queue mode never self-terminates on an empty redo queue
                 )
             })
             .context("failed to spawn redo fetcher thread")?;
@@ -156,11 +157,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
     // --- Spawn engine worker threads -----------------------------------------
     let mut workers = Vec::with_capacity(threads + 1);
     for worker_id in 0..threads {
-        let class = if worker_id < redo_pref {
-            Class::RedoPreferring
-        } else {
-            Class::LoadPreferring
-        };
+        let class = worker_class(worker_id, redo_pref);
         let ctx = WorkerCtx {
             worker_id,
             class,
