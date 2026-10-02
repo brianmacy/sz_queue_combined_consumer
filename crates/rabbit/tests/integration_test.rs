@@ -745,8 +745,9 @@ fn e2e_file_loader_record_transform() {
     let mut child = Command::new(driver_bin())
         .env("SENZING_THREADS_PER_PROCESS", "2")
         .env("SENZING_INPUT_FILE", file_path.to_str().unwrap())
-        // Pure loader: this test is about the transform, not file-mode redo.
-        .env("SENZING_REDO_PERCENT", "0")
+        // Default redo% (20): file mode drains redo before exiting; short probe
+        // interval so the drain tail costs seconds, not the 60 s default.
+        .env("SENZING_REDO_SLEEP_TIME_IN_SECONDS", "2")
         .env(
             "SENZING_RECORD_TRANSFORM_PLUGIN",
             example_transform_plugin(),
