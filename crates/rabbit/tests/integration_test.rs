@@ -40,6 +40,21 @@ use sz_rust_sdk::prelude::*;
 
 const INSTANCE: &str = "sz_rabbit_combined_consumer_it";
 
+/// True when CI demands real infrastructure (`IT_REQUIRE_INFRA=1`): a test that
+/// cannot run then FAILS instead of printing SKIP and passing.
+fn require_infra() -> bool {
+    std::env::var("IT_REQUIRE_INFRA").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Report a skipped test; panic instead when `IT_REQUIRE_INFRA` is set.
+fn skip(reason: std::fmt::Arguments<'_>) {
+    assert!(
+        !require_infra(),
+        "IT_REQUIRE_INFRA set but test cannot run: {reason}"
+    );
+    eprintln!("{reason}");
+}
+
 /// Returns the engine configuration JSON if the environment is fully set up for
 /// a real Senzing test, otherwise `None` (test is skipped).
 fn engine_config() -> Option<String> {
@@ -113,10 +128,10 @@ fn scheduler_topology_validation() {
 #[test]
 fn real_engine_load_path_add_record() {
     let Some(config) = engine_config() else {
-        eprintln!(
+        skip(format_args!(
             "SKIP real_engine_load_path_add_record: SENZING_ENGINE_CONFIGURATION_JSON not set \
              (requires /opt/senzing + an initialized backend)"
-        );
+        ));
         return;
     };
 
@@ -153,7 +168,9 @@ fn real_engine_load_path_add_record() {
 #[test]
 fn real_engine_redo_path() {
     let Some(config) = engine_config() else {
-        eprintln!("SKIP real_engine_redo_path: engine config not set");
+        skip(format_args!(
+            "SKIP real_engine_redo_path: engine config not set"
+        ));
         return;
     };
 
@@ -209,7 +226,9 @@ fn real_engine_redo_path() {
 #[test]
 fn real_engine_bad_record_is_dead_lettered() {
     let Some(config) = engine_config() else {
-        eprintln!("SKIP real_engine_bad_record_is_dead_lettered: engine config not set");
+        skip(format_args!(
+            "SKIP real_engine_bad_record_is_dead_lettered: engine config not set"
+        ));
         return;
     };
 
@@ -406,10 +425,10 @@ fn wait_bounded(
 /// then SIGTERMs and asserts a clean exit that loaded all N records.
 fn run_combined_e2e(redo_percent: u8) {
     let (Some(engine), Some(url)) = (engine_config(), amqp_url()) else {
-        eprintln!(
+        skip(format_args!(
             "SKIP run_combined_e2e({redo_percent}): SENZING_ENGINE_CONFIGURATION_JSON \
              and/or SENZING_AMQP_URL not set (requires the isolated test broker + DB)"
-        );
+        ));
         return;
     };
     let _ = &engine; // inherited into the child via the process environment.
@@ -511,7 +530,9 @@ fn e2e_combined_mixed_20pct() {
 #[test]
 fn e2e_pure_redoer_100pct() {
     let Some(engine_cfg) = engine_config() else {
-        eprintln!("SKIP e2e_pure_redoer_100pct: engine config not set");
+        skip(format_args!(
+            "SKIP e2e_pure_redoer_100pct: engine config not set"
+        ));
         return;
     };
 
@@ -596,7 +617,7 @@ fn e2e_pure_redoer_100pct() {
 #[test]
 fn e2e_file_loader() {
     let Some(_engine_cfg) = engine_config() else {
-        eprintln!("SKIP e2e_file_loader: engine config not set");
+        skip(format_args!("SKIP e2e_file_loader: engine config not set"));
         return;
     };
 
@@ -712,7 +733,9 @@ fn example_transform_plugin() -> String {
 #[test]
 fn e2e_file_loader_record_transform() {
     let Some(config) = engine_config() else {
-        eprintln!("SKIP e2e_file_loader_record_transform: engine config not set");
+        skip(format_args!(
+            "SKIP e2e_file_loader_record_transform: engine config not set"
+        ));
         return;
     };
 
@@ -930,7 +953,7 @@ fn spawn_driver(
 }
 
 /// Resolve the demo truth-set directory: `IT_TRUTHSET_DIR` if set, else the
-/// vendored git submodule at `<crate>/truth-sets/truthsets/demo`. Returns
+/// vendored git submodule at `<workspace>/truth-sets/truthsets/demo`. Returns
 /// `None` (test skips) when neither exists — e.g. the submodule was not checked
 /// out (`git submodule update --init`).
 fn truthset_dir() -> Option<std::path::PathBuf> {
@@ -938,7 +961,7 @@ fn truthset_dir() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(d));
     }
     let submodule =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("truth-sets/truthsets/demo");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../truth-sets/truthsets/demo");
     submodule
         .join("customers.jsonl")
         .exists()
@@ -953,11 +976,11 @@ fn e2e_truthset_resolution_and_redo_drain() {
         truthset_dir(),
         env_nonempty("IT_PG_DSN"),
     ) else {
-        eprintln!(
+        skip(format_args!(
             "SKIP e2e_truthset_resolution_and_redo_drain: needs SENZING_ENGINE_CONFIGURATION_JSON, \
              SENZING_AMQP_URL, IT_PG_DSN (libpq DSN for psql), and the demo truth set (git \
              submodule at truth-sets/truthsets/demo, or IT_TRUTHSET_DIR)"
-        );
+        ));
         return;
     };
 
@@ -1130,11 +1153,11 @@ fn e2e_truthset_resolution_and_redo_drain() {
 #[test]
 fn e2e_file_mode_shares_redo_and_exits_when_drained() {
     let (Some(engine_cfg), Some(dir)) = (engine_config(), truthset_dir()) else {
-        eprintln!(
+        skip(format_args!(
             "SKIP e2e_file_mode_shares_redo_and_exits_when_drained: needs \
              SENZING_ENGINE_CONFIGURATION_JSON and the demo truth set (git submodule at \
              truth-sets/truthsets/demo, or IT_TRUTHSET_DIR)"
-        );
+        ));
         return;
     };
 

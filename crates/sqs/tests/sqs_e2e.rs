@@ -21,10 +21,21 @@ use std::time::{Duration, Instant};
 use aws_sdk_sqs::Client;
 use aws_sdk_sqs::types::QueueAttributeName;
 
+/// Report a skipped test; panic instead when `IT_REQUIRE_INFRA=1` (CI) so a
+/// missing broker/engine can never pass silently.
+fn skip(reason: std::fmt::Arguments<'_>) {
+    let required = std::env::var("IT_REQUIRE_INFRA").is_ok_and(|v| !v.is_empty() && v != "0");
+    assert!(
+        !required,
+        "IT_REQUIRE_INFRA set but test cannot run: {reason}"
+    );
+    eprintln!("{reason}");
+}
+
 fn gate() -> Option<()> {
     for var in ["SENZING_ENGINE_CONFIGURATION_JSON", "AWS_ENDPOINT_URL"] {
         if std::env::var(var).map(|v| v.is_empty()).unwrap_or(true) {
-            eprintln!("SKIP: {var} not set");
+            skip(format_args!("SKIP: {var} not set"));
             return None;
         }
     }
