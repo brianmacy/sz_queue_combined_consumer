@@ -147,6 +147,9 @@ jobs:
       # Slash-form libpq DSN for the truth-set test's psql scoped entity-count
       # query (distinct from the engine's colon-form connection string above).
       IT_PG_DSN: postgresql://senzing:senzing@postgres:5432/G2
+      # A test that cannot run (missing broker/engine/truth set) must FAIL here,
+      # not print SKIP and pass.
+      IT_REQUIRE_INFRA: "1"
       # SQS e2e: point the standard AWS provider chain at ElasticMQ. The suite
       # is gated on AWS_ENDPOINT_URL and skips when it is unset.
       AWS_ENDPOINT_URL: http://elasticmq:9324
