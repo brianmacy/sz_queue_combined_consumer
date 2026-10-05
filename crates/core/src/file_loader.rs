@@ -405,8 +405,6 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
                 redos,
                 redos_rate: redos.saturating_sub(prev_redos) as f64 / dt,
                 mq_depth: None, // no MQ in file mode
-                redo_backlog: None,
-                redo_backlog_slope: None,
             });
             monitor_redo_in_flight(&redo_in_flight, config.long_record_secs, redo_pref);
             prev_adds = adds;

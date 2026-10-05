@@ -2,6 +2,15 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
+## Unreleased — remove redo backlog/slope/floor guard (2026-10-05)
+
+### Removed
+
+* The `redo_backlog` / `redo_backlog_slope` fields of the `Combined stats:`
+  line and the redo-floor (`__REPAIR__` loop) guard warning + raw-record
+  sampling were never functional (the backlog source was always `None` once
+  the `count_redo_records()` scan was dropped) and are removed.
+
 ## Unreleased — file mode shares redo (2026-09-29)
 
 * **File mode no longer ignores redo% (owner ruling: a file run that does not
