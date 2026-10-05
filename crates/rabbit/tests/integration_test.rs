@@ -721,7 +721,11 @@ fn example_transform_plugin() -> String {
         .parent()
         .expect("deps dir")
         .to_path_buf();
-    let p = deps.join("libsz_record_transform_example.so");
+    let p = deps.join(format!(
+        "{}sz_record_transform_example.{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_EXTENSION
+    ));
     assert!(p.exists(), "example transform plugin not built at {p:?}");
     p.to_string_lossy().into_owned()
 }
