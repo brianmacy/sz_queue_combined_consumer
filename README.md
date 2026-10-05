@@ -72,13 +72,9 @@ the redo tail. Here the same capacity flows to whichever work exists:
   emergent.
 * **get_stats** runs on a dedicated thread and is emitted with the mandatory
   `Engine stats:` prefix. A machine-parseable `Combined stats: {...}` JSON line
-  (adds/redos rates, MQ depth, `count_redo_records` backlog + EWMA slope,
-  measured `redo_share_effective`, derived mode) is emitted each stats interval.
-* **Redo-floor guard**: if redo keeps progressing while the backlog stays flat
-  at a small value and the MQ is empty (vacuously true at redo% = 100) for 5
-  consecutive intervals, it warns `redo-floor suspected (possible __REPAIR__
-  loop)` and starts sampling raw redo records so the trigger reason is visible.
-  Stopping remains the operator's call.
+  (adds/redos rates, MQ depth, measured `redo_share_effective`, derived mode)
+  is emitted each stats interval. No redo-backlog field is reported (the
+  `count_redo_records()` table scan is never issued).
 
 ## Configuration
 
@@ -88,7 +84,7 @@ verbatim-compatible with the sibling drivers.
 | Env (CLI) | Default | Meaning |
 |---|---|---|
 | `SENZING_ENGINE_CONFIGURATION_JSON` | required | engine init JSON (validated as JSON at startup) |
-| `SENZING_REDO_PERCENT` (`--redo-percent`) | **20** | ∈ [0,100]; see table above. Size UP until SYS_EVAL_QUEUE stays flat during load (`redo_backlog_slope` ≤ 0). |
+| `SENZING_REDO_PERCENT` (`--redo-percent`) | **20** | ∈ [0,100]; see table above. Size UP until SYS_EVAL_QUEUE stays flat during load. |
 | `SENZING_THREADS_PER_PROCESS` (`--threads-per-process`) | **12** | worker pool size (0 → CPU count, compat foot-gun) |
 | `SENZING_AMQP_URL` (`-u`/`--url`) | required iff redo% < 100 | RabbitMQ URL |
 | `SENZING_RABBITMQ_QUEUE` (`-q`/`--queue`) | required iff redo% < 100 | source queue (must exist; passive declare) |

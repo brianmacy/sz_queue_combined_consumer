@@ -11,8 +11,7 @@
 //!
 //! Added for the combined design: worker preference classes with cross-over
 //! fallback (`worker.rs`), the redo fetcher + tiny bounded redo channel
-//! (`redo.rs`), the `Combined stats:` status line with backlog slope and the
-//! redo-floor guard (`stats.rs`), the diagnostic MQ depth probe, and the
+//! (`redo.rs`), the `Combined stats:` status line (`stats.rs`), the diagnostic MQ depth probe, and the
 //! §6(a)/(b) shutdown split between in-flight-in-worker (DLQ) and
 //! queued-but-unstarted (left unacked for broker requeue) deliveries.
 
@@ -35,16 +34,12 @@ use sz_combined_consumer_core::config::Config;
 use sz_combined_consumer_core::record::{RecordInfo, parse_record};
 use sz_combined_consumer_core::redo::fetcher_loop;
 use sz_combined_consumer_core::stats::{
-    self, ADDS_PROCESSED, ADDS_REJECTED, Ewma, FloorGuard, GuardTransition, RUNNING,
-    SAMPLE_REDO_RECORDS, StatsPayload, ThroughputTicker, stats_loop,
+    self, ADDS_PROCESSED, ADDS_REJECTED, RUNNING, StatsPayload, ThroughputTicker, stats_loop,
 };
 use sz_combined_consumer_core::worker::{
     Action, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
     WorkerCtx, add_record_flags, monitor_redo_in_flight, redo_flags, worker_class, worker_loop,
 };
-
-/// EWMA smoothing for the redo-backlog slope.
-const SLOPE_EWMA_ALPHA: f64 = 0.3;
 
 /// In-flight bookkeeping for one load delivery the async task is tracking.
 struct InFlight {
@@ -265,12 +260,9 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
     let mut fatal: Option<String> = None;
     let mut shutdown_deadline: Option<Instant> = None;
 
-    // Status-line / guard state.
+    // Status-line state.
     let mut mq_depth: Option<u32> = None;
     let mut mq_was_empty: Option<bool> = None;
-    let mut slope = Ewma::new(SLOPE_EWMA_ALPHA);
-    let mut prev_backlog: Option<i64> = None;
-    let mut floor_guard = FloorGuard::default();
     let mut last_status_at = Instant::now();
     let mut prev_adds: usize = 0;
     let mut prev_redos: usize = 0;
@@ -330,7 +322,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
                 }
             }
 
-            // Stats answer arrived: engine stats + status line + guards.
+            // Stats answer arrived: engine stats + status line.
             Some(payload) = stats_resp_rx.recv() => {
                 if let Some(engine_stats) = &payload.engine_stats {
                     // The prefix is MANDATORY: the harness scrapes on
@@ -342,11 +334,6 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
                 let dt = now.duration_since(last_status_at).as_secs_f64().max(0.001);
                 let adds = ADDS_PROCESSED.load(Ordering::Relaxed);
                 let redos = stats::REDOS_PROCESSED.load(Ordering::Relaxed);
-                let backlog = payload.redo_backlog;
-                let slope_val = match (backlog, prev_backlog) {
-                    (Some(b), Some(p)) => Some(slope.update((b - p) as f64)),
-                    _ => slope.value(),
-                };
                 stats::emit_status_line(&stats::StatusLine {
                     redo_percent: config.redo_percent,
                     load_pref,
@@ -356,27 +343,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
                     redos,
                     redos_rate: (redos - prev_redos) as f64 / dt,
                     mq_depth,
-                    redo_backlog: backlog,
-                    redo_backlog_slope: slope_val,
                 });
-                if config.redo_percent > 0 {
-                    match floor_guard.observe(redos, backlog, mq_depth) {
-                        GuardTransition::Tripped => {
-                            tracing::warn!(
-                                "redo-floor suspected (possible __REPAIR__ loop): redo \
-                                 progressing while backlog stays flat at a small value and \
-                                 the MQ is empty; sampling raw redo records to the log"
-                            );
-                            SAMPLE_REDO_RECORDS.store(true, Ordering::Relaxed);
-                        }
-                        GuardTransition::Cleared => {
-                            tracing::info!("redo-floor condition cleared; stopping redo-record sampling");
-                            SAMPLE_REDO_RECORDS.store(false, Ordering::Relaxed);
-                        }
-                        GuardTransition::Unchanged => {}
-                    }
-                }
-                prev_backlog = backlog;
                 prev_adds = adds;
                 prev_redos = redos;
                 last_status_at = now;

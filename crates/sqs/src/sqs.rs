@@ -437,8 +437,6 @@ pub async fn run(
                     redos,
                     redos_rate: (redos - prev_redos) as f64 / dt,
                     mq_depth: queue_depth,
-                    redo_backlog: payload.redo_backlog,
-                    redo_backlog_slope: None,
                 });
                 prev_adds = adds;
                 prev_redos = redos;
