@@ -19,7 +19,9 @@
 //!   long call cannot outlive the 10 s deadline and its message is left for
 //!   redelivery, SIGHUP is graceful, persistent `ReceiveMessage` failure is
 //!   fatal (exit 255), and the `--mq-recheck-secs` depth probe logs its
-//!   drained/active transitions.
+//!   drained/active transitions;
+//! * `--prefetch` is the TOTAL in-flight cap (data in
+//!   `tests/fixtures/prefetch.yaml`).
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -803,10 +805,10 @@ async fn e2e_sqs_mq_recheck_logs_depth_transitions() {
 
     let out = out_path("depth");
     let recheck = case.mq_recheck_secs.to_string();
-    // --prefetch 0: in-flight cap = threads, so the rest stays visible.
+    // --prefetch 2: in-flight cap = threads, so the rest stays visible.
     let mut child = spawn_driver_env(
         &src,
-        &["--mq-recheck-secs", &recheck, "--prefetch", "0"],
+        &["--mq-recheck-secs", &recheck, "--prefetch", "2"],
         &sleep_plugin_env(case.sleep_ms),
         &out,
     );
@@ -825,7 +827,7 @@ async fn e2e_sqs_mq_recheck_logs_depth_transitions() {
     while approx_depth(&client, &src).await > 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    // Let the last deletes flush (1 s batcher) before signalling.
+    // Let the last deletes land before signalling.
     tokio::time::sleep(Duration::from_secs(2)).await;
     sigterm(&child);
     let status = wait_bounded(&mut child, Duration::from_secs(30));
@@ -852,4 +854,81 @@ async fn e2e_sqs_mq_recheck_logs_depth_transitions() {
         "{stdout}"
     );
     eprintln!("e2e_sqs_mq_recheck_logs_depth_transitions: drained -> active -> drained");
+}
+
+/// `tests/fixtures/prefetch.yaml`.
+#[derive(serde::Deserialize)]
+struct PrefetchCase {
+    queue: String,
+    threads: usize,
+    prefetch: u32,
+    sleep_ms: u64,
+    count: usize,
+    sample_every_ms: u64,
+    loaded_within_secs: u64,
+    record_template: String,
+    final_total: String,
+}
+
+/// `--prefetch N` is the TOTAL in-flight cap (was threads + N): with slow
+/// workers and a backlog, at most N messages are ever in flight (received and
+/// not yet deleted) and the cap is actually used; every record still loads.
+#[tokio::test]
+async fn e2e_sqs_prefetch_is_the_total_in_flight_cap() {
+    let Some(()) = gate() else { return };
+    let case: PrefetchCase = load_fixture("prefetch.yaml");
+    let client = client().await;
+    let name = format!("{}-{}", case.queue, std::process::id());
+    let (src, dlq) = make_queue_pair(&client, &name, true).await;
+    let records: Vec<String> = (0..case.count)
+        .map(|i| case.record_template.replace("{i}", &i.to_string()))
+        .collect();
+    send_all(&client, &src, &records).await;
+
+    let out = out_path("prefetch");
+    let (threads, prefetch) = (case.threads.to_string(), case.prefetch.to_string());
+    let mut child = spawn_driver_env(
+        &src,
+        &["--prefetch", &prefetch],
+        &[
+            &sleep_plugin_env(case.sleep_ms)[..],
+            &[("SENZING_THREADS_PER_PROCESS", threads)],
+        ]
+        .concat(),
+        &out,
+    );
+    let mut max_in_flight = 0;
+    let deadline = Instant::now() + Duration::from_secs(case.loaded_within_secs);
+    while Instant::now() < deadline {
+        let (visible, in_flight) = visible_and_in_flight(&client, &src).await;
+        max_in_flight = max_in_flight.max(in_flight);
+        if visible + in_flight == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(case.sample_every_ms)).await;
+    }
+    sigterm(&child);
+    let status = wait_bounded(&mut child, Duration::from_secs(30));
+    let (stdout, stderr) = take_output(&out);
+    delete_queues(&client, &[&src, &dlq]).await;
+
+    assert!(
+        status.expect("exit").success(),
+        "driver failed\n{stdout}\n{stderr}"
+    );
+    assert_eq!(
+        final_total(&stdout, &case.final_total),
+        case.count,
+        "every record must load\n{stdout}"
+    );
+    assert!(
+        max_in_flight <= case.prefetch,
+        "{max_in_flight} in flight exceeds the total cap {}\n{stdout}",
+        case.prefetch
+    );
+    assert!(
+        max_in_flight > case.threads as u32,
+        "the cap beyond threads was never used ({max_in_flight} in flight)\n{stdout}"
+    );
+    eprintln!("e2e_sqs_prefetch_is_the_total_in_flight_cap: max in flight {max_in_flight}");
 }

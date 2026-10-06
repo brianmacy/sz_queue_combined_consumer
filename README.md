@@ -58,7 +58,7 @@ the redo tail. Here the same capacity flows to whichever work exists:
   threads**; scale by processes, never threads (unixODBC driver-manager convoy
   above that — see the dbperf-faq).
 * **AMQP layer** (redo% < 100): tokio + lapin, one connection/channel, single
-  async consumer, `basic_qos(prefetch = threads + 2)`, acks/rejects only on the
+  async consumer, `basic_qos(prefetch)` (default threads + 2), acks/rejects only on the
   async task. The +2 prefetch overshoot keeps a standing buffer so the workers'
   non-blocking dispatch never stalls per-record waiting on an ack round-trip.
 * **Redo fetcher** (redo% > 0): ONE thread serially calling `get_redo_record()`
@@ -93,7 +93,7 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_REJECT_FILE` (`--reject-file`) | `<input>.rejected.jsonl` | file mode only: JSONL file that receives every rejected input line **verbatim** (unparseable, engine bad input, retry timeout, SENZ0082). Created lazily on the first reject, opened in append mode. Reprocess with `--file <reject file>`. |
 | `SENZING_RECORD_TRANSFORM_PLUGIN` (`--record-transform-plugin`) | none | shared library that rewrites every load record before `add_record` (all backends). See [Record transform plugins](#record-transform-plugins). |
 | `SENZING_RECORD_TRANSFORM_CONFIG` (`--record-transform-config`) | empty | opaque string passed to the plugin's init (e.g. JSON) |
-| `SENZING_PREFETCH` (`--prefetch`) | RabbitMQ: threads + 2; SQS: threads | RabbitMQ: `basic_qos` prefetch. SQS: extra messages held beyond the worker count (in-flight cap = threads + prefetch) |
+| `SENZING_PREFETCH` (`--prefetch`) | RabbitMQ: threads + 2; SQS: 2 × threads | queue mode, both binaries: the **total** in-flight cap — messages received but not yet settled (RabbitMQ: the `basic_qos` prefetch; SQS: received and not yet deleted). A value below threads is raised to threads (with a warning). |
 | `SENZING_SQS_QUEUE_URL` (`-q`/`--queue-url`) | required iff redo% < 100 | SQS binary only: source queue URL |
 | `SENZING_SQS_DEAD_LETTER_QUEUE_URL` (`--dead-letter-queue-url`) | discovered | SQS binary only: where rejected records are sent. Default: the source queue's `RedrivePolicy` → `deadLetterTargetArn` → `GetQueueUrl`. Printed at startup as `DeadLetter: <url>`. |
 | `SENZING_SQS_ALLOW_NO_DLQ` (`--allow-no-dlq`) | off | SQS binary only: start even when no DLQ can be resolved. Rejects are then **deleted** (lost); the log names them with their body. Without it, no DLQ = refuse to start. |
@@ -147,13 +147,16 @@ driver uses this one convention for both binaries.)
 * **Receive errors.** A failed `ReceiveMessage` is retried every second; 30
   consecutive failures (≈ 30 s of an unreachable or denying endpoint) are
   fatal — orderly shutdown, exit 255. Any successful receive resets the count.
-* **Settle.** Deletes are batched (`DeleteMessageBatch`, 10 per call, flushed
-  every second and at shutdown). A fatal engine error leaves the message
+* **In-flight cap.** At most `--prefetch` messages (default 2 × threads, v4
+  parity) are received and not yet deleted; a slot frees when its
+  `DeleteMessageBatch` returns, and the poller refills it immediately.
+* **Settle.** Deletes are batched (`DeleteMessageBatch`, up to 10 per call:
+  every delete settled while the previous call was in flight; a lone delete
+  is sent at once, and the rest flushed at shutdown). A fatal engine error leaves the message
   un-deleted so SQS redelivers it. At shutdown (SIGINT / SIGTERM / SIGHUP,
   bounded by the same 10 s grace as RabbitMQ) messages still in — or queued
-  for — a worker are printed as `Still processing (… min): DS : ID` and left
-  un-deleted for redelivery after their visibility timeout (never
-  dead-lettered).
+  for — a worker are left un-deleted for redelivery after their visibility
+  timeout (never dead-lettered; see *Failure handling*).
 * **Stats.** Same `Processed N adds, R records per second`, `Engine stats:` and
   `Combined stats:` lines as the RabbitMQ binary; `mq_depth` is the source
   queue's `ApproximateNumberOfMessages`, probed every `--mq-recheck-secs`.
@@ -227,11 +230,17 @@ sz_rabbit_combined_consumer --file records.jsonl \
 * **Fatal errors** (Database, NotInitialized, License, …; SQS also 30
   consecutive `ReceiveMessage` failures) → orderly teardown, non-zero exit.
   Graceful shutdown (SIGINT, SIGTERM, or — queue mode — SIGHUP) drains
-  in-flight work within a 10 s grace; queued-but-unstarted deliveries are left
-  for broker redelivery. Deliveries still inside a worker: **RabbitMQ**
-  dead-letters them (the engine call may still complete — requeue would
-  double-process); **SQS** leaves them un-deleted for redelivery after the
-  visibility timeout (`add_record` is idempotent). If a worker is still inside an
+  in-flight work within a 10 s grace; whatever is still unsettled then is
+  **released for redelivery on every transport, never dead-lettered or counted
+  as rejected** — queued-but-unstarted deliveries and those still inside a
+  worker alike (RabbitMQ: left unacked, requeued when the connection closes;
+  SQS: left un-deleted, redelivered after the visibility timeout). Each one
+  still inside a worker is printed as `Still processing (… min): DS : ID`.
+  Redelivery is safe: `add_record` with an existing key replaces the record
+  (idempotent) and the engine handles same-key contention itself; the
+  in-worker call may still complete before the process exits (and a container
+  SIGKILL after its grace aborts it anyway), so dead-lettering would put a
+  valid record in the DLQ on every rolling restart. If a worker is still inside an
   uninterruptible engine call after the grace (the same deadline also bounds
   the stats-thread join), the native environment destroy is skipped
   (leak-on-exit over use-after-free).

@@ -2,6 +2,54 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
+## Unreleased — release in-worker records at shutdown; `SENZING_PREFETCH` is the total in-flight cap (2026-10-06)
+
+### BREAKING
+
+* **RabbitMQ: a record still inside a worker at SIGTERM/SIGINT/SIGHUP is now
+  requeued, not dead-lettered.** Every unsettled delivery is released for
+  redelivery at shutdown on every transport (RabbitMQ: left unacked, requeued
+  on connection close; SQS: left un-deleted, unchanged), named on stdout as
+  `Still processing (… min): DS : ID`, and NOT counted as rejected. The
+  `REJECTING: DS : ID -> in-flight-in-worker on shutdown (…)` marker is gone.
+  Why: `add_record` with an existing key replaces the record (idempotent; file
+  mode's resume already relies on it) and the engine handles same-key
+  contention itself, while dead-lettering put a valid record in the DLQ on
+  every rolling restart. *Migration:* drop alerts/DLQ triage keyed on the
+  shutdown reject; expect a redelivery (re-add) instead.
+* **SQS: `SENZING_PREFETCH` / `--prefetch` is now the TOTAL in-flight cap**
+  (messages received and not yet deleted), as on RabbitMQ — one meaning on
+  every transport. It was the extra beyond the worker count (cap = threads +
+  prefetch). The default is unchanged in effect: 2 × threads (Senzing v4 SQS
+  consumer parity). *Migration:* if you set `SENZING_PREFETCH` on SQS, set it
+  to your old `threads + prefetch`.
+* **`--prefetch` below the worker count is raised to the worker count** (with
+  a warning) on every transport. RabbitMQ `--prefetch 0` previously meant an
+  unlimited `basic_qos`.
+
+### Changed (SQS)
+
+* An in-flight slot is now held until the message's `DeleteMessageBatch`
+  returns (was: freed at ack while the delete waited up to 1 s in the
+  batcher), so `ApproximateNumberOfMessagesNotVisible` never exceeds the cap.
+  Deletes are sent at once and batch naturally under load (every delete
+  settled while the previous call was in flight, up to 10) instead of on a
+  1 s timer; the poller is woken the moment a slot frees.
+
+### Internal
+
+* `Policy::dead_letter_in_worker_at_shutdown` and
+  `DeadLetterReason::Shutdown` removed; `config::resolve_prefetch` is the one
+  prefetch resolver; `Config::prefetch` is `usize` and set by both binaries.
+* New real e2e: `e2e_rabbit_in_worker_record_is_requeued_at_shutdown` (DLQ
+  empty, source ready count back to 1; fails on the previous commit with
+  `(dlq, source) = (1, 0)`), `e2e_rabbit_prefetch_is_the_total_in_flight_cap`
+  (consumer `prefetch_count` = 4, unacked ≤ 4 via the management API),
+  `e2e_rabbit_sigkill_one_of_two_drivers_loses_nothing` (two drivers, one
+  SIGKILLed mid-load: every record in the repository exactly once, DLQ
+  empty), `e2e_sqs_prefetch_is_the_total_in_flight_cap` (NotVisible ≤ 4 with
+  `--prefetch 4 --threads 2`; the previous commit reached 10).
+
 ## Unreleased — unified totals, poison handling, reject marker; SQS `SzReason` (2026-10-06)
 
 ### BREAKING (log / stdout format — update scrapers and alerts)
