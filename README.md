@@ -97,7 +97,7 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_SQS_QUEUE_URL` (`-q`/`--queue-url`) | required iff redo% < 100 | SQS binary only: source queue URL |
 | `SENZING_SQS_DEAD_LETTER_QUEUE_URL` (`--dead-letter-queue-url`) | discovered | SQS binary only: where rejected records are sent. Default: the source queue's `RedrivePolicy` → `deadLetterTargetArn` → `GetQueueUrl`. Printed at startup as `DeadLetter: <url>`. |
 | `SENZING_SQS_ALLOW_NO_DLQ` (`--allow-no-dlq`) | off | SQS binary only: start even when no DLQ can be resolved. Rejects are then **deleted** (lost); the log names them with their body. Without it, no DLQ = refuse to start. |
-| `SENZING_SQS_VISIBILITY_TIMEOUT` (`--visibility-timeout`) | 2 × LONG_RECORD | SQS binary only: initial visibility on receive. Long records are extended automatically (below). |
+| `SENZING_SQS_VISIBILITY_TIMEOUT` (`--visibility-timeout`) | 2 × LONG_RECORD | SQS binary only: initial visibility on receive, 0..=43200 (the SQS 12 h max; outside = startup error, ≤ LONG_RECORD = warning). Long records are extended automatically (below). |
 | `SENZING_SQS_WAIT_TIME` (`--wait-time`) | 20 | SQS binary only: long-poll seconds (0..=20) |
 | `SENZING_SQS_MAX_MESSAGES` (`--max-messages`) | 10 | SQS binary only: receive batch size (1..=10); further capped by free in-flight room |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_ENDPOINT_URL`, … | provider chain | SQS binary only: standard AWS SDK resolution (env, `~/.aws`, IMDS/ECS role, web identity). SSO / `credential_process` are not compiled in (see Cargo.toml). |
@@ -108,9 +108,11 @@ verbatim-compatible with the sibling drivers.
 | `-i`/`--info` | off | print WithInfo payloads (engine-level no-op; print gating only) |
 | `-t`/`--debugTrace` | off | engine debug trace |
 
-Validation is loud (exit 1): redo% ∉ [0,100]; redo% < 100 without URL/queue
-(queue mode); 0 < redo% < 100 with fewer than 2 threads (queue and file mode);
-`LONG_RECORD` < 1. Exit codes:
+Validation is loud (exit 1) and completes before the Senzing engine is
+initialized, in both binaries: redo% ∉ [0,100]; redo% < 100 without URL/queue
+(queue mode; SQS: `--queue-url`); 0 < redo% < 100 with fewer than 2 threads
+(queue and file mode); `LONG_RECORD` < 1; SQS `--wait-time` ∉ 0..=20,
+`--max-messages` ∉ 1..=10, `--visibility-timeout` ∉ 0..=43200. Exit codes:
 **1** = configuration/validation failure at startup, **255** = fatal runtime
 error (engine/DB/broker) after an orderly teardown, **0** = clean shutdown or
 file EOF. (The standalone drivers disagreed with each other here; the combined

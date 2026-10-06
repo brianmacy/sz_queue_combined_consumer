@@ -20,14 +20,13 @@ use clap::Parser;
 use sz_rust_sdk::prelude::*;
 
 use sz_combined_consumer_core::config::{
-    Config, DEFAULT_LONG_RECORD_SECS, DEFAULT_REDO_PERCENT, engine_config_from_env,
-    resolve_reject_file, validate_split_threads,
+    CommonArgs, Config, DEFAULT_LONG_RECORD_SECS, engine_config_from_env,
 };
 use sz_combined_consumer_core::runtime;
-use sz_combined_consumer_core::transform::TransformHandle;
 
 mod sqs;
 
+/// Instance/module name passed to the Senzing environment.
 const INSTANCE_NAME: &str = "sz_sqs_combined_consumer";
 
 /// Default SQS receive long-poll wait (seconds); 20 is the SQS maximum.
@@ -38,6 +37,8 @@ const DEFAULT_MAX_MESSAGES: i32 = 10;
 /// processing time or SQS redelivers a record still being processed (duplicate
 /// add). Defaults to 2x the long-record threshold.
 const DEFAULT_VISIBILITY_TIMEOUT_SECS: i32 = (DEFAULT_LONG_RECORD_SECS as i32) * 2;
+/// SQS's hard visibility-timeout ceiling (12 h), seconds.
+const MAX_VISIBILITY_TIMEOUT_SECS: i32 = 43_200;
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -92,74 +93,8 @@ struct Args {
     #[arg(long = "prefetch", env = "SENZING_PREFETCH")]
     prefetch: Option<usize>,
 
-    /// Load records from a single JSONL file instead of SQS (redo% applies; at
-    /// redo% > 0 exits once the file is loaded and redo is drained).
-    #[arg(short = 'f', long = "file", env = "SENZING_INPUT_FILE")]
-    input_file: Option<String>,
-
-    /// File mode: skip the first N physical lines (resume an interrupted load).
-    #[arg(long = "skip-lines", env = "SENZING_SKIP_LINES", default_value_t = 0)]
-    skip_lines: u64,
-
-    /// File mode: JSONL file receiving every rejected input line verbatim for
-    /// later reprocessing (default `<input file>.rejected.jsonl`).
-    #[arg(long = "reject-file", env = "SENZING_REJECT_FILE")]
-    reject_file: Option<String>,
-
-    /// Share (%) of worker capacity preferring redo, in [0, 100].
-    #[arg(long = "redo-percent", env = "SENZING_REDO_PERCENT", default_value_t = DEFAULT_REDO_PERCENT)]
-    redo_percent: u8,
-
-    /// Worker thread count. 0 auto-detects via available CPUs.
-    #[arg(
-        long = "threads-per-process",
-        env = "SENZING_THREADS_PER_PROCESS",
-        default_value_t = 12
-    )]
-    threads_per_process: usize,
-
-    /// Seconds the redo fetcher pauses when no redo records are available.
-    #[arg(
-        long = "redo-sleep-secs",
-        env = "SENZING_REDO_SLEEP_TIME_IN_SECONDS",
-        default_value_t = 60
-    )]
-    redo_sleep_secs: u64,
-
-    /// Seconds before a record is considered long-running.
-    /// Must be >= 1: at 0 every in-flight record is instantly "stuck" and the
-    /// monitor would dead-letter the whole queue (sibling drivers fell back to
-    /// the default on 0/garbage; clap rejects it at startup here).
-    #[arg(
-        long = "long-record",
-        env = "LONG_RECORD",
-        default_value_t = DEFAULT_LONG_RECORD_SECS,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    long_record: u64,
-
-    /// Shared library implementing the record-transform ABI (sz-record-transform);
-    /// applied to every load record before add_record.
-    #[arg(
-        long = "record-transform-plugin",
-        env = "SENZING_RECORD_TRANSFORM_PLUGIN"
-    )]
-    record_transform_plugin: Option<String>,
-
-    /// Opaque config string passed to the record-transform plugin at init.
-    #[arg(
-        long = "record-transform-config",
-        env = "SENZING_RECORD_TRANSFORM_CONFIG"
-    )]
-    record_transform_config: Option<String>,
-
-    /// Print the WithInfo response for each processed record.
-    #[arg(short = 'i', long = "info", default_value_t = false)]
-    info: bool,
-
-    /// Output Senzing engine debug trace information.
-    #[arg(short = 't', long = "debugTrace", default_value_t = false)]
-    debug_trace: bool,
+    #[command(flatten)]
+    common: CommonArgs,
 }
 
 /// SQS-specific ingestion parameters (validated), handed to the SQS run loop.
@@ -179,9 +114,10 @@ pub struct SqsParams {
 fn main() -> ExitCode {
     runtime::init_logging();
 
+    // Every check (engine JSON, shared + SQS params) runs before Sz_init.
     let args = Args::parse();
-    let config = match build_config(&args) {
-        Ok(c) => c,
+    let (config, params) = match engine_config_from_env().and_then(|ec| build(&args, ec)) {
+        Ok(built) => built,
         Err(msg) => {
             eprintln!("{msg}");
             return ExitCode::from(1);
@@ -194,66 +130,30 @@ fn main() -> ExitCode {
     };
 
     // Shared modes reuse the core runtime; the SQS load loop is local.
-    if config.input_file.is_some() {
-        runtime::run_file_loader(&config, env)
-    } else if config.redo_percent == 100 {
-        runtime::run_pure_redoer(&config, env)
-    } else {
-        let params = match sqs_params(&args) {
-            Ok(p) => p,
-            Err(msg) => {
-                eprintln!("{msg}");
-                return ExitCode::from(1);
-            }
-        };
-        run_sqs(config, params, env)
+    match params {
+        Some(params) => run_sqs(config, params, env),
+        None if config.input_file.is_some() => runtime::run_file_loader(&config, env),
+        None => runtime::run_pure_redoer(&config, env),
     }
 }
 
-/// Builds a core `Config` from the SQS binary's own args. url/queue stay `None`
-/// (SQS has no AMQP topology); prefetch/mq-recheck are AMQP-only and left at inert
-/// defaults. Shared validation (engine JSON, redo% range) is applied here.
-fn build_config(args: &Args) -> Result<Config, String> {
-    let engine_config = engine_config_from_env()?;
-    if args.redo_percent > 100 {
-        return Err(format!(
-            "SENZING_REDO_PERCENT must be within [0, 100], got {}",
-            args.redo_percent
-        ));
-    }
-    let threads = if args.threads_per_process == 0 {
-        num_cpus_get()
+/// Resolves and validates everything before engine init: the shared config via
+/// [`Config::from_common`] (url/queue stay `None` and prefetch/mq-recheck stay
+/// inert — SQS has no AMQP topology), plus the SQS params when the SQS load
+/// path will run (redo% < 100, not file mode). Pure (no engine).
+fn build(args: &Args, engine_config: String) -> Result<(Config, Option<SqsParams>), String> {
+    let config = Config::from_common(&args.common, engine_config)?;
+    let params = if config.input_file.is_none() && config.redo_percent < 100 {
+        Some(sqs_params(args, config.threads)?)
     } else {
-        args.threads_per_process
+        None
     };
-    validate_split_threads(threads, args.redo_percent)?;
-    Ok(Config {
-        engine_config,
-        url: None,
-        queue: None,
-        reject_file: resolve_reject_file(
-            args.input_file.as_deref().filter(|s| !s.is_empty()),
-            args.reject_file.clone(),
-        ),
-        input_file: args.input_file.clone().filter(|s| !s.is_empty()),
-        skip_lines: args.skip_lines,
-        redo_percent: args.redo_percent,
-        threads,
-        prefetch: 0,
-        mq_recheck_secs: 0,
-        redo_sleep_secs: args.redo_sleep_secs,
-        long_record_secs: args.long_record,
-        info: args.info,
-        debug_trace: args.debug_trace,
-        transform: TransformHandle::load(
-            args.record_transform_plugin.as_deref(),
-            args.record_transform_config.as_deref(),
-        )?,
-    })
+    Ok((config, params))
 }
 
 /// Validates and extracts the SQS ingestion parameters (SQS load path only).
-fn sqs_params(args: &Args) -> Result<SqsParams, String> {
+/// `threads` is the resolved worker count (default prefetch).
+fn sqs_params(args: &Args, threads: usize) -> Result<SqsParams, String> {
     let queue_url = args.queue_url.clone().filter(|s| !s.is_empty()).ok_or(
         "No SQS queue URL provided (use --queue-url or SENZING_SQS_QUEUE_URL); \
              required when redo% < 100",
@@ -270,18 +170,19 @@ fn sqs_params(args: &Args) -> Result<SqsParams, String> {
             args.max_messages
         ));
     }
-    if args.visibility_timeout <= args.long_record as i32 {
+    if !(0..=MAX_VISIBILITY_TIMEOUT_SECS).contains(&args.visibility_timeout) {
+        return Err(format!(
+            "--visibility-timeout must be 0..={MAX_VISIBILITY_TIMEOUT_SECS} (SQS 12 h max), got {}",
+            args.visibility_timeout
+        ));
+    }
+    if i64::from(args.visibility_timeout) <= args.common.long_record as i64 {
         eprintln!(
             "warning: --visibility-timeout ({}) <= --long-record ({}); SQS may redeliver a \
              record still being processed. Set it above the worst-case processing time.",
-            args.visibility_timeout, args.long_record
+            args.visibility_timeout, args.common.long_record
         );
     }
-    let threads = if args.threads_per_process == 0 {
-        num_cpus_get()
-    } else {
-        args.threads_per_process
-    };
     Ok(SqsParams {
         queue_url,
         visibility_timeout: args.visibility_timeout,
@@ -291,14 +192,6 @@ fn sqs_params(args: &Args) -> Result<SqsParams, String> {
         allow_no_dlq: args.allow_no_dlq,
         prefetch: args.prefetch.unwrap_or(threads),
     })
-}
-
-fn num_cpus_get() -> usize {
-    // Small local shim so the bin need not depend on num_cpus directly; the core
-    // already uses it, but Config construction here just needs a sane default.
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
 }
 
 /// redo% < 100: build a tokio runtime for the SQS I/O layer only (engine calls
@@ -355,6 +248,12 @@ mod tests {
         let mut argv = vec!["sz_sqs_combined_consumer"];
         argv.extend_from_slice(extra);
         Args::parse_from(argv)
+    }
+
+    /// Runs the full pre-init [`build`] (shared + SQS validation) and returns
+    /// the SQS params, which exist on the SQS load path (redo% < 100, no file).
+    fn sqs_params(a: &Args) -> Result<SqsParams, String> {
+        build(a, "{}".into()).map(|(_, p)| p.expect("SQS load path builds params"))
     }
 
     #[test]
@@ -423,5 +322,60 @@ mod tests {
         assert!(sqs_params(&args(&["--queue-url", "u", "--max-messages", "0"])).is_err());
         assert!(sqs_params(&args(&["--queue-url", "u", "--max-messages", "11"])).is_err());
         assert!(sqs_params(&args(&["--queue-url", "u", "--max-messages", "10"])).is_ok());
+    }
+
+    #[test]
+    fn sqs_params_rejects_out_of_range_visibility_timeout() {
+        let err = sqs_params(&args(&[
+            "--queue-url",
+            "u",
+            "--visibility-timeout",
+            "43201",
+        ]))
+        .err()
+        .expect("above the SQS 12 h max must fail");
+        assert!(err.contains("--visibility-timeout"), "{err}");
+        assert!(sqs_params(&args(&["--queue-url", "u", "--visibility-timeout=-1"])).is_err());
+        assert!(
+            sqs_params(&args(&[
+                "--queue-url",
+                "u",
+                "--visibility-timeout",
+                "43200"
+            ]))
+            .is_ok()
+        );
+        // 0 is legal for SQS (only warned about: <= --long-record).
+        assert!(sqs_params(&args(&["--queue-url", "u", "--visibility-timeout", "0"])).is_ok());
+    }
+
+    #[test]
+    fn build_validates_sqs_params_before_engine_init() {
+        // build() is the whole pre-Sz_init gate and needs no engine: a bad SQS
+        // value fails here, not after init_environment.
+        let mut a = args(&["--max-messages", "0"]);
+        a.queue_url = Some("u".into());
+        let err = build(&a, "{}".into())
+            .err()
+            .expect("bad SQS value must fail in build");
+        assert!(err.contains("--max-messages"), "{err}");
+    }
+
+    #[test]
+    fn build_skips_sqs_params_off_the_sqs_load_path() {
+        // File mode and the pure redoer need no queue URL and build no params.
+        for extra in [&["--file", "in.jsonl"][..], &["--redo-percent", "100"][..]] {
+            let mut a = args(extra);
+            a.queue_url = None;
+            let (_, p) = build(&a, "{}".into()).expect("valid without a queue URL");
+            assert!(p.is_none());
+        }
+    }
+
+    #[test]
+    fn build_leaves_amqp_fields_inert() {
+        let (c, _) = build(&args(&["--queue-url", "u"]), "{}".into()).unwrap();
+        assert_eq!((c.url, c.queue), (None, None));
+        assert_eq!((c.prefetch, c.mq_recheck_secs), (0, 0));
     }
 }

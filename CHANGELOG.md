@@ -2,6 +2,22 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
+## Unreleased — shared args, validate before engine init (2026-10-06)
+
+### Changed
+
+* Shared flags/env vars (file mode, redo%, threads, redo sleep, long-record,
+  transform, `--info`, `--debugTrace`) are one `config::CommonArgs` flattened
+  into both binaries and resolved by one `Config::from_common`. Names, env
+  vars and defaults are unchanged; `--help` wording for them is now identical
+  across binaries. `--threads-per-process 0` uses one CPU-count fallback.
+* SQS: `--queue-url`, `--wait-time` and `--max-messages` are now validated
+  before `Sz_init` (previously after engine init), matching RabbitMQ.
+* SQS: `--visibility-timeout` outside 0..=43200 (the SQS maximum) is a startup
+  error (exit 1); the `<= --long-record` warning is kept.
+* Core no longer exports the RabbitMQ-named `INSTANCE_NAME`; each binary owns
+  its engine instance name (RabbitMQ: also the AMQP consumer tag, unchanged).
+
 ## Unreleased — remove redo backlog/slope/floor guard (2026-10-05)
 
 ### Removed
