@@ -103,6 +103,10 @@ const RECEIVE_ERROR_MAX: u32 = 30;
 /// Bound on one diagnostic depth probe, so a hung endpoint cannot stall the
 /// loop that also handles signals.
 const DEPTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on the close-time delete flush: an SQS endpoint that stops answering
+/// must not hold the process past shutdown (an unflushed delete only means
+/// that message redelivers after its visibility timeout).
+const CLOSE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolved dead-letter destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,8 +493,8 @@ impl Transport for SqsTransport {
     }
 
     /// Stops the poller, flushes every pending delete (settled adds must not
-    /// be redelivered) and names messages received but never dispatched (left
-    /// for redelivery).
+    /// be redelivered; bounded by [`CLOSE_FLUSH_TIMEOUT`]) and names messages
+    /// received but never dispatched (left for redelivery).
     async fn close(mut self) {
         self.stop_intake();
         let _ = self.poller.await;
@@ -502,7 +506,17 @@ impl Transport for SqsTransport {
             info!("leaving {undispatched} received-but-undispatched SQS message(s) for redelivery");
         }
         drop(self.delete_tx);
-        let _ = self.deleter.await;
+        let abort = self.deleter.abort_handle();
+        if tokio::time::timeout(CLOSE_FLUSH_TIMEOUT, self.deleter)
+            .await
+            .is_err()
+        {
+            abort.abort();
+            warn!(
+                "SQS delete flush timed out after {CLOSE_FLUSH_TIMEOUT:?}; unflushed message(s) \
+                 redeliver after their visibility timeout"
+            );
+        }
     }
 }
 
@@ -817,6 +831,60 @@ fn sqs_message(m: Message, slot: OwnedSemaphorePermit) -> Option<SqsMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_sqs::config::{BehaviorVersion, Credentials, Region};
+
+    /// An SQS endpoint that accepts connections and never answers (a hung
+    /// API): `close` must still return, bounded by `CLOSE_FLUSH_TIMEOUT`,
+    /// with a delete pending.
+    #[tokio::test]
+    async fn close_bounds_a_hung_delete_flush() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let conf = aws_sdk_sqs::Config::builder()
+            .behavior_version(BehaviorVersion::latest())
+            .region(Region::new("us-east-1"))
+            .credentials_provider(Credentials::new("id", "secret", None, None, "test"))
+            .endpoint_url(&endpoint)
+            .build();
+        let poll = PollParams {
+            queue_url: format!("{endpoint}/000000000000/hung"),
+            visibility_timeout: 30,
+            wait_time: 1,
+            max_messages: 1,
+            cap: 1,
+        };
+        let transport = SqsTransport::start(Client::from_conf(conf), poll, None, 300);
+        let slot = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("permit");
+        transport
+            .delete_tx
+            .send(PendingDelete {
+                tag: 1,
+                receipt_handle: "receipt".to_string(),
+                _slot: slot,
+            })
+            .expect("queue a delete");
+        let started = Instant::now();
+        let bound = CLOSE_FLUSH_TIMEOUT + Duration::from_secs(5);
+        assert!(
+            tokio::time::timeout(bound, transport.close()).await.is_ok(),
+            "close hung on the delete flush"
+        );
+        assert!(
+            started.elapsed() >= CLOSE_FLUSH_TIMEOUT,
+            "the flush was attempted"
+        );
+    }
 
     #[test]
     fn sz_reason_value_sanitizes_and_fits_sqs_limits() {

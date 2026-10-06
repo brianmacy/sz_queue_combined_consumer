@@ -39,6 +39,9 @@ serde = { version = "1", features = ["derive"] }
 serde_norway = "0.9"
 # Jolokia (Artemis management) responses: queue message / delivering counts.
 serde_json.workspace = true
+# Raw AMQP values (fe2o3-amqp's own encoder): sends a message the driver
+# cannot decode, and reads any dead-lettered body without decoding it.
+serde_amqp = "0.18"
 # Example record-transform cdylib (SLEEP_MS holds a worker), dlopened by the
 # shutdown-deadline and in-flight-cap e2e tests.
 sz-record-transform-example = { path = "../transform-example" }

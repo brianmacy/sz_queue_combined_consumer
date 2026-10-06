@@ -3046,6 +3046,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "serde",
+ "serde_amqp",
  "serde_json",
  "serde_norway",
  "sz-combined-consumer-core",

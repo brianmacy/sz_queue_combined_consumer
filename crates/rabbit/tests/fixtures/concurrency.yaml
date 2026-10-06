@@ -25,11 +25,13 @@ sigkill:
   queue: sz-combined-sigkill-queue
   dead_letter_queue: sz-combined-sigkill-dlq
   threads: 4
-  # Kept small: the whole e2e suite must stay under the 500-record EVAL
-  # license limit on a fresh repository.
-  count: 150
-  # SIGKILL one driver once fewer than this many records are still ready.
-  kill_below_ready: 100
+  # Kept small: the whole e2e suite (RabbitMQ + SQS + ActiveMQ, one fresh
+  # repository) must stay well under the 500-record EVAL license limit.
+  count: 100
+  # SIGKILL one driver once fewer than this many records are still ready
+  # (early: each ready-count probe opens a connection, so the load runs on
+  # while it polls; the test asserts the kill lands mid-load).
+  kill_below_ready: 75
   # Bound on every record being loaded after the kill.
   loaded_within_secs: 300
   record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","NAME_FULL":"Sigkill Tester {i}","EMAIL_ADDRESS":"s1_{i}@example.com","ADDR_FULL":"{i} Crash Ave"}'

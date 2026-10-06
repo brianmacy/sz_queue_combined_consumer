@@ -2,273 +2,171 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
-## Unreleased — Apache ActiveMQ Artemis backend (2026-10-06)
+## Unreleased
+
+One section for everything since `v0.3.0`, describing the behavior as it
+ships. All three binaries now run queue mode on one shared core loop
+(`queue_loop::run` behind a `Transport` trait), so the totals line, reject
+marker, poison handling, signals and shutdown are identical on every
+transport.
 
 ### Added
 
-* **`sz_activemq_combined_consumer`**: a new binary (`crates/activemq`) that
-  consumes an **Apache ActiveMQ Artemis** ANYCAST queue over **AMQP 1.0**
-  (`fe2o3-amqp`, rustls only) on the shared core queue loop — same worker
-  pool, redo share, stats, totals line, `REJECTING:` marker, shutdown
-  sequence, file mode and pure redoer as the RabbitMQ and SQS binaries.
-  `SENZING_ACTIVEMQ_URL` (`amqp://` / `amqps://`, credentials may be in the
-  URL), `SENZING_ACTIVEMQ_USER` / `SENZING_ACTIVEMQ_PASSWORD` (override),
-  `SENZING_ACTIVEMQ_QUEUE` (name or FQQN `address::queue`),
-  `SENZING_PREFETCH` (total in-flight cap via manual link credit; default
-  threads + 2). The receiver uses the `queue` source capability (anycast);
-  rejects are the AMQP `rejected` outcome, which Artemis routes to the
-  address's dead-letter address (dropped if none is configured); shutdown
-  `released` the unsettled deliveries (no delivery-count increment); long
-  records are never dead-lettered; a lost broker link is fatal (exit 255).
-  No queue-depth probe in v1 (Artemis has no AMQP depth verb). Docker:
-  `--build-arg BIN=sz_activemq_combined_consumer`. See README
-  *ActiveMQ Artemis specifics*.
-* `crates/activemq/tests/activemq_e2e.rs`: real-Artemis + real-engine e2e
-  suite (redo% 0/20/100, Data and JMS-text bodies, dead-letter address,
-  stuck-worker shutdown deadline, SIGHUP, link loss, bad credentials/URL,
-  in-flight cap); requires `SENZING_ACTIVEMQ_URL` and
-  `IT_ARTEMIS_JOLOKIA_URL` (management, for queue counts).
+* **`sz_activemq_combined_consumer`** (`crates/activemq`): consumes an
+  **Apache ActiveMQ Artemis** ANYCAST queue over **AMQP 1.0** (`fe2o3-amqp`,
+  rustls only; compiles neither `lapin` nor the AWS SDK). Flags / env:
+  `-u/--url` `SENZING_ACTIVEMQ_URL` (`amqp://` / `amqps://`, credentials may
+  be in the URL), `--user` / `--password` (`SENZING_ACTIVEMQ_USER` /
+  `SENZING_ACTIVEMQ_PASSWORD`, each overrides the URL's; none = anonymous),
+  `-q/--queue` `SENZING_ACTIVEMQ_QUEUE` (name or FQQN `address::queue`),
+  `--prefetch` (default threads + 2), `--mq-recheck-secs`, plus every shared
+  flag (file mode, pure redoer, transform plugin). The receiver attaches with
+  the `queue` source capability (anycast); success = `accepted`; a reject =
+  `rejected` with the reason in its error description, which Artemis routes
+  to the address's dead-letter address (dropped if none is configured);
+  shutdown `released` the unsettled deliveries (no delivery-count
+  increment); long records are only logged, never dead-lettered; a message
+  the receiver cannot decode is dead-lettered as malformed and the driver
+  keeps running; a lost broker link is fatal (exit 255). No queue-depth probe
+  (Artemis has no AMQP depth verb). Docker:
+  `--build-arg BIN=sz_activemq_combined_consumer`. See README *ActiveMQ
+  Artemis specifics*.
+* **SQS: every DLQ copy carries a String message attribute `SzReason`** with
+  the reject reason (engine error text, or `malformed record: <parse
+  error>`), sanitized to SQS's allowed characters and capped at 1 KiB (less
+  when the body leaves less room under 256 KiB). Receive it with
+  `MessageAttributeNames=All`.
+* **SQS: `--mq-recheck-secs` / `SENZING_MQ_RECHECK_SECONDS`** (default 30, as
+  on RabbitMQ): cadence of the `ApproximateNumberOfMessages` depth probe and
+  of the `MQ drained (depth 0)` / `MQ active (depth N)` transition log.
 
-### CI / tests
+### Changed
 
-* `ci.yml` `integration` job: new `apache/artemis:2.57.0` service (credentials
-  enforced via `ANONYMOUS_LOGIN=false`, Jolokia exposed; bash `/dev/tcp`
-  health check — the image ships no curl/wget), `SENZING_ACTIVEMQ_URL` /
-  `IT_ARTEMIS_JOLOKIA_URL`, and a step running the ActiveMQ e2e suite after
-  the RabbitMQ and SQS ones. Docker matrix: one `sz_activemq_combined_consumer`
-  row (`both` DB closure only).
-* `IT_REQUIRE_INFRA=1` (set in the CI `integration` job) turns every e2e
-  `SKIP` (missing broker, engine or truth set) into a failure, on all three
-  suites. The RabbitMQ truth-set tests looked for `crates/rabbit/truth-sets`
-  (absent) and so silently skipped in CI; they now resolve the workspace-root
-  `truth-sets` submodule.
-* README: *Tests and CI* table and *Running the e2e tests locally* (docker
-  commands for Postgres, RabbitMQ, ElasticMQ and Artemis, env vars, repo init).
-
-## Unreleased — release in-worker records at shutdown; `SENZING_PREFETCH` is the total in-flight cap (2026-10-06)
-
-### BREAKING
-
-* **RabbitMQ: a record still inside a worker at SIGTERM/SIGINT/SIGHUP is now
-  requeued, not dead-lettered.** Every unsettled delivery is released for
-  redelivery at shutdown on every transport (RabbitMQ: left unacked, requeued
-  on connection close; SQS: left un-deleted, unchanged), named on stdout as
-  `Still processing (… min): DS : ID`, and NOT counted as rejected. The
-  `REJECTING: DS : ID -> in-flight-in-worker on shutdown (…)` marker is gone.
-  Why: `add_record` with an existing key replaces the record (idempotent; file
-  mode's resume already relies on it) and the engine handles same-key
-  contention itself, while dead-lettering put a valid record in the DLQ on
-  every rolling restart. *Migration:* drop alerts/DLQ triage keyed on the
-  shutdown reject; expect a redelivery (re-add) instead.
-* **SQS: `SENZING_PREFETCH` / `--prefetch` is now the TOTAL in-flight cap**
-  (messages received and not yet deleted), as on RabbitMQ — one meaning on
-  every transport. It was the extra beyond the worker count (cap = threads +
-  prefetch). The default is unchanged in effect: 2 × threads (Senzing v4 SQS
-  consumer parity). *Migration:* if you set `SENZING_PREFETCH` on SQS, set it
-  to your old `threads + prefetch`.
-* **`--prefetch` below the worker count is raised to the worker count** (with
-  a warning) on every transport. RabbitMQ `--prefetch 0` previously meant an
-  unlimited `basic_qos`.
-
-### Changed (SQS)
-
-* An in-flight slot is now held until the message's `DeleteMessageBatch`
-  returns (was: freed at ack while the delete waited up to 1 s in the
-  batcher), so `ApproximateNumberOfMessagesNotVisible` never exceeds the cap.
-  Deletes are sent at once and batch naturally under load (every delete
-  settled while the previous call was in flight, up to 10) instead of on a
-  1 s timer; the poller is woken the moment a slot frees.
-
-### Internal
-
-* `Policy::dead_letter_in_worker_at_shutdown` and
-  `DeadLetterReason::Shutdown` removed; `config::resolve_prefetch` is the one
-  prefetch resolver; `Config::prefetch` is `usize` and set by both binaries.
-* New real e2e: `e2e_rabbit_in_worker_record_is_requeued_at_shutdown` (DLQ
-  empty, source ready count back to 1; fails on the previous commit with
-  `(dlq, source) = (1, 0)`), `e2e_rabbit_prefetch_is_the_total_in_flight_cap`
-  (consumer `prefetch_count` = 4, unacked ≤ 4 via the management API),
-  `e2e_rabbit_sigkill_one_of_two_drivers_loses_nothing` (two drivers, one
-  SIGKILLed mid-load: every record in the repository exactly once, DLQ
-  empty), `e2e_sqs_prefetch_is_the_total_in_flight_cap` (NotVisible ≤ 4 with
-  `--prefetch 4 --threads 2`; the previous commit reached 10).
-
-## Unreleased — unified totals, poison handling, reject marker; SQS `SzReason` (2026-10-06)
-
-### BREAKING (log / stdout format — update scrapers and alerts)
-
-* **Final total line gains a `rejected` count and `N` is adds only on every
-  transport.** Now `Processed total of N adds, M redo records (R rejected, D
-  redo dropped, E errors)` in queue, file and pure-redoer modes (was `(D redo
-  dropped, E errors)`). **RabbitMQ: `N` no longer includes dead-lettered
-  records** (it did; SQS and file mode already counted adds only), and the
-  `Processed N adds, … records per second` throughput line follows the same
-  `N`. *Migration:* the prefix and first number are unchanged, so
+* **BREAKING (stdout format): final total line.** Every mode prints
+  `Processed total of N adds, M redo records (R rejected, D redo dropped, E
+  errors)`. `N` is successful adds only on every transport and file mode
+  (RabbitMQ used to include dead-lettered records; the `Processed N adds, …
+  records per second` throughput line follows the same `N`), and `R` counts
+  every dead-letter / reject-file record (RabbitMQ poison messages were
+  uncounted). *Migration:* the prefix and first number are unchanged, so
   `starts_with("Processed total of ")` + first-token parsers keep working; a
-  RabbitMQ "processed" figure that relied on rejects being included must add
-  `R`. Regexes anchored on `(D redo dropped` must allow the new leading
-  `R rejected, ` field.
-* **`R` counts every dead-letter.** RabbitMQ unparseable (poison) messages
-  and in-worker-at-shutdown dead-letters are now counted (previously
-  uncounted); a long-record give-up is counted once, when it is dead-lettered.
-* **One reject marker on stdout, both transports:**
-  `REJECTING: DATA_SOURCE : RECORD_ID -> <reason>`. *Replaces* RabbitMQ's
-  `REJECTING due to bad data or timeout: DS : ID`, `REJECTING: DS : ID`
-  (long-record give-up) and the `REJECTING in-flight-in-worker on shutdown
-  (…): DS : ID` warn (now the marker with reason `in-flight-in-worker on
-  shutdown (…)`), and SQS's `Sending to deadletter: DS : ID`. An unparseable
-  body has no DS/ID: `REJECTING:  :  -> malformed record: <parse error>`.
-  *Migration:* grep/alert on `^REJECTING: ` (and parse ` -> ` for the
-  reason). The worker warn `REJECTING due to bad data or timeout [worker N]:
-  DS : ID -> <engine error>` is unchanged. Transform-plugin rejects now warn
-  `REJECTING [worker N]: DS : ID -> record transform failed: …` / `…
-  transformed record is invalid: …` (was `REJECTING: record transform failed
-  [worker N]: …`, which collided with the new marker).
-* **Poison handling is one core path:** one warn `DEAD-LETTERING malformed
-  record: <error> [<first 2048 chars>…truncated]` (truncation suffix was
-  ` (truncated)`), counted as rejected, then dead-lettered (SQS: forwarded
-  verbatim to the DLQ; RabbitMQ: `basic_reject`, no requeue).
-
-### Added (SQS)
-
-* Every DLQ copy carries a String message attribute **`SzReason`** with the
-  reject reason (engine error text, e.g. `Unknown data source: SENZ2207|…`,
-  or `malformed record: <parse error>`), sanitized to SQS's allowed
-  characters and capped at 1 KiB (less when the body leaves less room under
-  256 KiB). Receive it with `MessageAttributeNames=All`. RabbitMQ's
-  `basic_reject` cannot carry a reason (unchanged; the reason is on the stdout
-  marker).
-
-### Internal
-
-* `Policy::count_rejects_in_total` removed. `DeadLetterReason::{Malformed,
-  Rejected}` carry the reason text and `DeadLetterReason` implements
-  `Display` (the marker / `SzReason` text); `Action::RejectNoRequeue` carries
-  the reason. The final line is printed by `stats::print_final_totals` in
-  every mode.
-* New real e2e: `e2e_rabbit_rejects_are_counted_and_dead_lettered` (1 valid +
-  1 unparseable + 1 engine reject → `Processed total of 1 adds, … (2
-  rejected, …`, markers, both bad bodies in the DLQ); the SQS DLQ e2e now
-  asserts the marker, `(2 rejected, ` and `SzReason` on each DLQ copy. Data in
-  `tests/fixtures/rejects.yaml`.
-
-## Unreleased — SQS ported onto the core queue loop (2026-10-06)
-
-### Fixed (SQS)
-
-* **Shutdown is bounded by the same 10 s `SHUTDOWN_GRACE` deadline as
-  RabbitMQ.** Previously the loop only exited once every worker had returned,
-  so a worker stuck in an engine call kept the process alive until SIGKILL.
-  Messages still in a worker are left un-deleted (redelivered after the
-  visibility timeout), as before.
-* **SIGHUP is a graceful shutdown** (drain, exit 0, final total), like
-  SIGINT/SIGTERM. Previously it killed the process.
-* **Persistent `ReceiveMessage` failure is fatal**: 30 consecutive failures
-  (1 s apart, SDK-internal retries off for this call) → orderly shutdown, exit
-  255. Previously it retried every second forever. A success resets the count.
-* The poller's hand-off to the loop is cancelable by shutdown (it could block
-  on a full channel).
-* `All N threads are stuck on long running records` now counts every record
+  RabbitMQ figure that relied on rejects being included must add `R`; a
+  regex anchored on `(D redo dropped` must allow the leading `R rejected, `.
+* **BREAKING (stdout format): one reject marker on every transport:**
+  `REJECTING: DATA_SOURCE : RECORD_ID -> <reason>` (an unparseable body has
+  no DS/ID: `REJECTING:  :  -> malformed record: <parse error>`). It replaces
+  RabbitMQ's `REJECTING due to bad data or timeout: DS : ID` and
+  `REJECTING: DS : ID` (long-record give-up), and SQS's `Sending to
+  deadletter: DS : ID` and `REJECTING unparseable SQS message`. A poison body
+  also logs one warn `DEAD-LETTERING malformed record: <error> [<first 2048
+  chars>…truncated]`. The engine-reject worker warn `REJECTING due to bad data
+  or timeout [worker N]: DS : ID -> <engine error>` is unchanged; a
+  transform-plugin reject now warns `REJECTING [worker N]: DS : ID -> record
+  transform failed: …` / `… transformed record is invalid: …`. *Migration:*
+  alert on `^REJECTING: ` and split on ` -> ` for the reason.
+* **BREAKING: records still in flight at shutdown are released for
+  redelivery on every transport, never dead-lettered or counted.** At
+  SIGINT/SIGTERM/SIGHUP the loop drains within the 10 s grace; whatever is
+  still unsettled then — queued-but-unstarted or still inside a worker — is
+  left for redelivery (RabbitMQ: unacked, requeued on connection close; SQS:
+  un-deleted, redelivered after the visibility timeout; ActiveMQ:
+  `released`). A record still inside a worker prints `Still processing (…
+  min): DS : ID`. RabbitMQ used to dead-letter those with `REJECTING
+  in-flight-in-worker on shutdown (…)`; `add_record` with an existing key
+  replaces the record, so that put valid records in the DLQ on every rolling
+  restart. *Migration:* drop DLQ triage / alerts keyed on the shutdown reject;
+  expect a redelivery (re-add) instead.
+* **BREAKING: `SENZING_PREFETCH` / `--prefetch` is the TOTAL in-flight cap on
+  every transport** (messages received and not yet settled). Defaults:
+  RabbitMQ and ActiveMQ threads + 2, SQS 2 × threads (Senzing v4 SQS
+  consumer parity; the effective SQS default is unchanged). On SQS it used to
+  be the extra beyond the worker count (cap = threads + prefetch).
+  *Migration:* if you set it on SQS, set your old `threads + prefetch`.
+* **BREAKING: `--prefetch` below the worker count is raised to the worker
+  count** (with a warning) on every transport; RabbitMQ `--prefetch 0` used to
+  mean an unlimited `basic_qos`.
+* **BREAKING: file mode shares redo.** `--file` follows `--redo-percent` like
+  queue mode (one redo fetcher; at EOF the whole pool falls through to redo)
+  and, at redo% > 0, exits 0 only once every record has an outcome and
+  `get_redo_record()` is empty on 2 consecutive probes `--redo-sleep-secs`
+  apart with no redo outstanding. At the default redo% (20) a file run now
+  waits for that drain (≈ one `--redo-sleep-secs` tail). File mode enforces
+  ≥ 2 threads for 0 < redo% < 100. *Migration:* `--redo-percent 0` for the
+  old pure-loader behavior.
+* **SIGHUP is a graceful shutdown in queue mode** on every transport (drain,
+  exit 0, final total), like SIGINT/SIGTERM; it used to kill the process.
+* **SQS shutdown is bounded by the same 10 s grace as RabbitMQ** (a worker
+  stuck in an engine call used to keep the process alive until SIGKILL), and
+  the stats thread is joined within that deadline on every transport.
+* **SQS: 30 consecutive `ReceiveMessage` failures are fatal** (1 s apart,
+  SDK-internal retries off for that call; exit 255); any success resets the
+  count. It used to retry forever.
+* **SQS settle:** an in-flight slot is held until the message's
+  `DeleteMessageBatch` returns, so `ApproximateNumberOfMessagesNotVisible`
+  never exceeds the cap. Deletes are sent at once and batch naturally under
+  load (every delete settled while the previous call was in flight, up to 10
+  per call; no timer); pending deletes are flushed at close, bounded at 5 s
+  (an unflushed delete only redelivers that message after its visibility
+  timeout).
+* SQS: `All N threads are stuck on long running records` counts every record
   past `LONG_RECORD`, not only those extended on that tick.
-* The stats thread is joined within the shutdown deadline.
-
-### Changed (SQS)
-
-* New `--mq-recheck-secs` / `SENZING_MQ_RECHECK_SECONDS` (default 30, same as
-  RabbitMQ): the `ApproximateNumberOfMessages` depth probe runs at this cadence
-  (was every `LONG_RECORD / 2`) and logs `MQ drained (depth 0)` /
-  `MQ active (depth N)` transitions.
-* Deletes are batched by a background task (still 10 per call, 1 s flush,
-  flushed at shutdown). A poison message logs `DEAD-LETTERING malformed
-  record` (was `REJECTING unparseable SQS message`). Reject markers: see the
-  unified `REJECTING:` marker above (supersedes `Sending to deadletter`).
-* Unchanged: long records extend visibility and are never dead-lettered; the
-  final total counts adds only; `Extended visibility` and `Still processing`
-  lines.
-* Internal: `SqsTransport` on core `queue_loop::run`; `Policy` gained
-  `stuck_records_label`, `Transport` gained
-  `stop_intake`; `queue_run::install_signals` removed (unused).
-
-## Unreleased — core queue loop; RabbitMQ ported onto it (2026-10-06)
-
-### Changed
-
-* **SIGHUP is now a graceful shutdown in queue mode (RabbitMQ)**, exactly like
-  SIGINT/SIGTERM (`SIGHUP received, shutting down gracefully`, drain, exit 0).
-  Previously SIGHUP killed the process with the default disposition.
-* RabbitMQ: the stats thread is now joined within the same shutdown deadline
-  as the engine workers instead of being detached (it holds an engine handle).
-* Internal: the queue-mode event loop (in-flight table, engine pool, stats,
-  long-record monitor, depth probe, shutdown) moved to core
-  `queue_loop::run` behind a `Transport` trait; RabbitMQ is now a
-  `RabbitTransport`. No other behavior change.
-
-## Unreleased — shared args, validate before engine init (2026-10-06)
-
-### Changed
-
-* Shared flags/env vars (file mode, redo%, threads, redo sleep, long-record,
-  transform, `--info`, `--debugTrace`) are one `config::CommonArgs` flattened
-  into both binaries and resolved by one `Config::from_common`. Names, env
-  vars and defaults are unchanged; `--help` wording for them is now identical
-  across binaries. `--threads-per-process 0` uses one CPU-count fallback.
-* SQS: `--queue-url`, `--wait-time` and `--max-messages` are now validated
-  before `Sz_init` (previously after engine init), matching RabbitMQ.
-* SQS: `--visibility-timeout` outside 0..=43200 (the SQS maximum) is a startup
-  error (exit 1); the `<= --long-record` warning is kept.
-* Core no longer exports the RabbitMQ-named `INSTANCE_NAME`; each binary owns
-  its engine instance name (RabbitMQ: also the AMQP consumer tag, unchanged).
-
-## Unreleased — remove redo backlog/slope/floor guard (2026-10-05)
+* SQS: `--queue-url`, `--wait-time` and `--max-messages` are validated before
+  engine init; `--visibility-timeout` outside 0..=43200 is a startup error
+  (exit 1; the `<= --long-record` warning stays).
+* Shared flags (file mode, redo%, threads, redo sleep, long record,
+  transform, `--info`, `--debugTrace`) are one `config::CommonArgs` in every
+  binary: same names, env vars, defaults and `--help` text.
+* Dependencies: sz-rust-sdk v4.3.2 (`rev = 2787281…`; its FFI moved to the
+  `sz-rust-sdk-ffi` git crate, allowed in `deny.toml`), aws-config 1.10.1,
+  aws-sdk-sqs 1.105.0, clap 4.6.6, libc 0.2.189; GitHub Actions
+  actions/checkout 7.0.1, actions/cache 6.1.0, docker/setup-buildx-action
+  4.3.0 (hash-pinned); `fe2o3-amqp` 0.18 (ActiveMQ binary only).
 
 ### Removed
 
 * The `redo_backlog` / `redo_backlog_slope` fields of the `Combined stats:`
   line and the redo-floor (`__REPAIR__` loop) guard warning + raw-record
-  sampling were never functional (the backlog source was always `None` once
-  the `count_redo_records()` scan was dropped) and are removed.
+  sampling: never functional once the `count_redo_records()` scan was dropped.
+* Internal: `queue_run::install_signals`, `Policy::count_rejects_in_total`,
+  `Policy::dead_letter_in_worker_at_shutdown`, `DeadLetterReason::Shutdown`;
+  core no longer exports the RabbitMQ-named `INSTANCE_NAME` (each binary owns
+  its engine instance name).
 
-## Unreleased — file mode shares redo (2026-09-29)
+### Fixed
 
-* **File mode no longer ignores redo% (owner ruling: a file run that does not
-  process redo is a defect).** Measured before: 12 × `--file <shard>
-  --threads-per-process 16 --redo-percent 20` each printed `0 redo records` and
-  exited at EOF leaving 146,008 redo on the store.
-* Same machinery as queue mode, not a fork: `redo_preferring_count` split
-  (shared `worker::worker_class`), `redo::fetcher_loop`, `mixed_loop` cross-over,
-  `monitor_redo_in_flight`, and the status line. At EOF the load channel closes
-  and every worker ramps to redo.
-* New file-mode-only exit rule (`redo::DrainExit` / `DrainGate`): after the
-  file is exhausted and every record has an outcome, stop after 2 consecutive
-  empty `get_redo_record()` probes `--redo-sleep-secs` apart with no redo
-  outstanding in the process. Queue mode still never exits on idle.
-* ⚠ Behaviour change: `--file` at the DEFAULT redo% (20) now processes redo and
-  waits for the drain (≈ one `--redo-sleep-secs` tail) before exiting. Pass
-  `--redo-percent 0` for the old pure-loader behaviour.
-* The final `Processed total of X adds, Y redo records (...)` line now reports
-  real redo/dropped counts. File mode now enforces ≥ 2 threads for
-  0 < redo% < 100 (shared `config::validate_split_threads`).
-* Tests: `file_mode_worker_plan_matches_queue_split`,
-  `input_done_waits_for_every_dispatched_outcome`, two `DrainGate` tests,
-  `worker_class_splits_first_b_ids_to_redo`, and the engine e2e
-  `e2e_file_mode_shares_redo_and_exits_when_drained` (truth set, self-cleaning).
+* SQS: the poller's hand-off to the loop is cancelable by shutdown (it could
+  block on a full channel).
+* SQS: a hung endpoint at shutdown can no longer hold the process in the
+  close-time delete flush (bounded at 5 s; see *Changed*).
 
-## Unreleased — dependency roll-up (2026-09-23)
+### Known limitations
 
-One change instead of eight Dependabot PRs (each PR fires the full CI matrix).
-Versions are exactly the ones Dependabot proposed, so the 21-day cooldown holds.
+* Shutdown can outlast the 10 s grace by the transport close: SQS delete
+  flush ≤ 5 s, ActiveMQ link/session/connection close ≤ 5 s, RabbitMQ
+  connection close unbounded (then the 5 s native-teardown bound).
+* With `--prefetch` > 2 × threads, a signal can wait for a worker to finish
+  while the loop hands a delivery to a full worker channel; it cannot happen
+  at the defaults.
 
-* **sz-rust-sdk v4.3.1 → v4.3.2** (`rev = 2787281…`). The SDK moved its
-  FFI/marshaling + error-taxonomy codegen into a sibling crate,
-  `sz-rust-sdk-ffi` (pinned by rev inside the SDK); `deny.toml` `allow-git`
-  now lists that repo. All 62 tests pass unchanged, including the
-  `classify_error` suite (SENZ0010 retry-timeout, DB errors fatal, SENZ0082)
-  and the real-engine / ElasticMQ e2e.
-* Cargo: aws-config 1.9.0 → 1.10.1, aws-sdk-sqs 1.103.0 → 1.105.0,
-  clap 4.6.3 → 4.6.6, libc 0.2.188 → 0.2.189 (plus their semver-compatible
-  transitive bumps).
-* GitHub Actions: actions/checkout 7.0.0 → 7.0.1, actions/cache 5.0.5 → 6.1.0,
-  docker/setup-buildx-action 4.1.0 → 4.3.0 (hash-pinned with tag comments).
+### CI / tests
+
+* `ci.yml` `integration` job: `apache/artemis:2.57.0` service (credentials
+  enforced, Jolokia exposed, bash `/dev/tcp` health check), and the ActiveMQ
+  e2e suite after the RabbitMQ and SQS ones; Docker matrix row for
+  `sz_activemq_combined_consumer` (`both` DB closure).
+* `IT_REQUIRE_INFRA=1` (set in CI) turns every e2e `SKIP` into a failure on
+  all three suites; the truth-set tests now find the workspace-root
+  `truth-sets` submodule (they silently skipped in CI before).
+* New real-infra e2e: ActiveMQ suite (redo% 0/20/100, Data and JMS-text
+  bodies, dead-letter address incl. an undecodable message, stuck-worker
+  deadline, SIGHUP, link loss, bad credentials/URL, in-flight cap); RabbitMQ
+  rejects counted + dead-lettered, in-worker record requeued at shutdown,
+  in-flight cap, SIGKILL of one of two drivers mid-load loses nothing; SQS
+  `SzReason` + in-flight cap. The pure-redoer e2e tests (RabbitMQ, ActiveMQ)
+  seed a redo backlog and assert it is non-zero before the run. The whole
+  e2e run stays well under the 500-record EVAL license cap on a fresh
+  repository.
+* README: *Tests and CI* and *Running the e2e tests locally*.
 
 ## 0.3.0 — SQS dead-letter queue restored + sibling parity (2026-09-23)
 

@@ -29,8 +29,15 @@
 //! the reason is on the `REJECTING:` stdout marker and in the `rejected`
 //! error description.
 //!
-//! ## Link loss
-//! A receive error (connection/session/link gone) is FATAL: orderly shutdown,
+//! ## Receive errors
+//! Per-message errors leave the link usable and are NOT fatal: a message
+//! whose sections the receiver cannot decode (e.g. invalid UTF-8 in an
+//! AmqpValue string) arrives unsettled with its delivery info, and one over
+//! the link's max-message-size has already been `rejected` by `fe2o3-amqp`.
+//! Both reach the core loop as an empty body, so they get the poison-message
+//! path (`REJECTING:` marker, counted as rejected) and the undecodable one is
+//! `rejected` (dead-lettered) here. Every other receive error (connection,
+//! session or link gone; protocol violation) is FATAL: orderly shutdown,
 //! exit 255. Unsettled deliveries are redelivered by the broker after the
 //! connection drops (verified: delivery-count unchanged).
 
@@ -40,7 +47,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use fe2o3_amqp::connection::ConnectionHandle;
-use fe2o3_amqp::link::delivery::DeliveryInfo;
+use fe2o3_amqp::link::RecvError;
+use fe2o3_amqp::link::delivery::{Delivery as AmqpDelivery, DeliveryInfo};
 use fe2o3_amqp::link::receiver::CreditMode;
 use fe2o3_amqp::sasl_profile::SaslProfile;
 use fe2o3_amqp::session::SessionHandle;
@@ -107,8 +115,9 @@ pub struct ActiveMqTransport {
     connection: ConnectionHandle<()>,
     session: SessionHandle<()>,
     receiver: Receiver,
-    /// Received-but-unsettled deliveries by synthetic tag.
-    unsettled: HashMap<u64, DeliveryInfo>,
+    /// Received deliveries the core loop has yet to settle, by synthetic
+    /// tag; `None` when the link already settled it (oversized message).
+    unsettled: HashMap<u64, Option<DeliveryInfo>>,
     next_tag: u64,
     /// Total in-flight cap (`--prefetch`).
     cap: u32,
@@ -189,13 +198,14 @@ impl ActiveMqTransport {
         }
     }
 
-    /// Removes `tag` from the unsettled map, logging an unknown tag.
+    /// Removes `tag` from the unsettled map, logging an unknown tag. `None`
+    /// also when the link already settled the delivery (nothing to send).
     fn take(&mut self, tag: u64, verb: &str) -> Option<DeliveryInfo> {
-        let info = self.unsettled.remove(&tag);
-        if info.is_none() {
+        let entry = self.unsettled.remove(&tag);
+        if entry.is_none() {
             warn!("no unsettled AMQP delivery {tag}; cannot {verb}");
         }
-        info
+        entry.flatten()
     }
 }
 
@@ -214,6 +224,30 @@ fn body_bytes(body: Body<Value>) -> Vec<u8> {
     }
 }
 
+/// Maps one receive result to what the core loop gets: the delivery info to
+/// settle (`None`: the link already settled it) and the record bytes.
+/// Per-message errors leave the link usable, so they become an empty body
+/// (dead-lettered as malformed); any other error is fatal.
+fn received(
+    result: Result<AmqpDelivery<Body<Value>>, RecvError>,
+) -> Result<(Option<DeliveryInfo>, Vec<u8>)> {
+    match result {
+        Ok(delivery) => {
+            let (info, message) = delivery.into_parts();
+            Ok((Some(info), body_bytes(message.body)))
+        }
+        Err(RecvError::MessageDecode(e)) => {
+            warn!("undecodable AMQP message (dead-lettering it): {}", e.source);
+            Ok((Some(e.info), Vec::new()))
+        }
+        Err(RecvError::MessageSizeExceeded(e)) => {
+            warn!("oversized AMQP message (already rejected by the link): {e}");
+            Ok((None, Vec::new()))
+        }
+        Err(e) => Err(anyhow!("ActiveMQ receive failed (link lost): {e}")),
+    }
+}
+
 /// `reason` cut on a char boundary to [`REJECT_DESCRIPTION_MAX_BYTES`].
 fn reject_description(reason: &str) -> String {
     let mut end = reason.len().min(REJECT_DESCRIPTION_MAX_BYTES);
@@ -226,18 +260,14 @@ fn reject_description(reason: &str) -> String {
 impl Transport for ActiveMqTransport {
     /// `Receiver::recv` is cancel-safe; everything after it is synchronous.
     async fn recv(&mut self) -> Option<Result<Delivery>> {
-        let delivery = match self.receiver.recv::<Body<Value>>().await {
-            Ok(d) => d,
-            Err(e) => return Some(Err(anyhow!("ActiveMQ receive failed (link lost): {e}"))),
+        let (info, body) = match received(self.receiver.recv().await) {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
         };
-        let (info, message) = delivery.into_parts();
         let tag = self.next_tag;
         self.next_tag += 1;
         self.unsettled.insert(tag, info);
-        Some(Ok(Delivery {
-            tag,
-            body: body_bytes(message.body),
-        }))
+        Some(Ok(Delivery { tag, body }))
     }
 
     async fn ack(&mut self, tag: u64) {
@@ -320,6 +350,7 @@ impl Transport for ActiveMqTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fe2o3_amqp::link::{LinkStateError, MessageSizeExceeded};
     use fe2o3_amqp::types::messaging::Data;
     use fe2o3_amqp::types::primitives::Binary;
 
@@ -347,6 +378,30 @@ mod tests {
     fn other_bodies_become_empty_poison() {
         assert!(body_bytes(Body::Value(AmqpValue(Value::Long(7)))).is_empty());
         assert!(body_bytes(Body::Empty).is_empty());
+    }
+
+    #[test]
+    fn oversized_message_is_a_poison_delivery_already_settled() {
+        let oversized = RecvError::MessageSizeExceeded(MessageSizeExceeded {
+            size: 2048,
+            max_size: 1024,
+        });
+        let (info, body) = received(Err(oversized)).expect("not fatal");
+        assert!(info.is_none(), "the link already rejected it");
+        assert!(body.is_empty(), "empty body: dead-lettered as malformed");
+    }
+
+    #[test]
+    fn link_level_receive_errors_are_fatal() {
+        for e in [
+            RecvError::LinkStateError(LinkStateError::RemoteClosed),
+            RecvError::LinkStateError(LinkStateError::RemoteDetached),
+            RecvError::TransferLimitExceeded,
+            RecvError::DeliveryIdIsNone,
+        ] {
+            let err = received(Err(e)).expect_err("fatal");
+            assert!(err.to_string().contains("link lost"), "{err}");
+        }
     }
 
     #[test]

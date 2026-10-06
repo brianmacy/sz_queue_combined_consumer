@@ -8,7 +8,7 @@ threads: 2
 prefetch: 4
 # Plugin sleep per record, milliseconds (keeps a backlog queued).
 sleep_ms: 500
-count: 20
+count: 12
 # In-flight sample cadence, milliseconds.
 sample_every_ms: 50
 # Bound on the whole backlog being loaded.
