@@ -2,6 +2,33 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
+## Unreleased — Apache ActiveMQ Artemis backend (2026-10-06)
+
+### Added
+
+* **`sz_activemq_combined_consumer`**: a new binary (`crates/activemq`) that
+  consumes an **Apache ActiveMQ Artemis** ANYCAST queue over **AMQP 1.0**
+  (`fe2o3-amqp`, rustls only) on the shared core queue loop — same worker
+  pool, redo share, stats, totals line, `REJECTING:` marker, shutdown
+  sequence, file mode and pure redoer as the RabbitMQ and SQS binaries.
+  `SENZING_ACTIVEMQ_URL` (`amqp://` / `amqps://`, credentials may be in the
+  URL), `SENZING_ACTIVEMQ_USER` / `SENZING_ACTIVEMQ_PASSWORD` (override),
+  `SENZING_ACTIVEMQ_QUEUE` (name or FQQN `address::queue`),
+  `SENZING_PREFETCH` (total in-flight cap via manual link credit; default
+  threads + 2). The receiver uses the `queue` source capability (anycast);
+  rejects are the AMQP `rejected` outcome, which Artemis routes to the
+  address's dead-letter address (dropped if none is configured); shutdown
+  `released` the unsettled deliveries (no delivery-count increment); long
+  records are never dead-lettered; a lost broker link is fatal (exit 255).
+  No queue-depth probe in v1 (Artemis has no AMQP depth verb). Docker:
+  `--build-arg BIN=sz_activemq_combined_consumer`. See README
+  *ActiveMQ Artemis specifics*.
+* `crates/activemq/tests/activemq_e2e.rs`: real-Artemis + real-engine e2e
+  suite (redo% 0/20/100, Data and JMS-text bodies, dead-letter address,
+  stuck-worker shutdown deadline, SIGHUP, link loss, bad credentials/URL,
+  in-flight cap); requires `SENZING_ACTIVEMQ_URL` and
+  `IT_ARTEMIS_JOLOKIA_URL` (management, for queue counts).
+
 ## Unreleased — release in-worker records at shutdown; `SENZING_PREFETCH` is the total in-flight cap (2026-10-06)
 
 ### BREAKING

@@ -1,0 +1,17 @@
+# Test data for e2e_activemq_prefetch_is_the_total_in_flight_cap in
+# activemq_e2e.rs: --prefetch is the TOTAL in-flight cap (link credit =
+# prefetch - unsettled), so with 2 slow workers and a backlog Artemis never
+# has more than `prefetch` deliveries outstanding to the driver (queue
+# DeliveringCount via Jolokia), the cap beyond threads is used, and every
+# record is loaded. "{i}" = 0..count-1; the queue gets the test pid appended.
+queue: sz-amq-prefetch
+threads: 2
+prefetch: 4
+# Plugin sleep per record, milliseconds (keeps a backlog queued).
+sleep_ms: 500
+count: 12
+# DeliveringCount sample cadence, milliseconds.
+sample_every_ms: 100
+loaded_within_secs: 120
+record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_PREFETCH_{i}","NAME_FULL":"Prefetch Tester {i}","ADDR_FULL":"{i} Credit St"}'
+final_total: "Processed total of "

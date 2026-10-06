@@ -8,6 +8,7 @@ members = [
     "crates/core",
     "crates/rabbit",
     "crates/sqs",
+    "crates/activemq",
     "crates/transform-abi",
     "crates/transform-example",
 ]
@@ -46,6 +47,13 @@ libc = "0.2"
 # unaffected. Re-add those features if SSO / credential_process auth is needed.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
 aws-sdk-sqs = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"] }
+# ActiveMQ Artemis backend (crates/activemq only): AMQP 1.0 client. Only the
+# `rustls` TLS stack (webpki roots) — no native-tls/OpenSSL. `url` parses the
+# broker URL (already in the tree via fe2o3-amqp); percent-encoding decodes
+# credentials embedded in it.
+fe2o3-amqp = { version = "0.18.2", default-features = false, features = ["rustls"] }
+url = "2"
+percent-encoding = "2"
 
 # sz-combined-consumer-core: the broker-agnostic engine-processing library shared
 # by every backend binary (RabbitMQ, SQS, ...).

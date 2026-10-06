@@ -23,6 +23,7 @@ client (compile-time backend selection — no runtime switch, no feature flags):
 | `sz-combined-consumer-core` | lib | — (worker pool, redo, stats, config reload, file loader) | none |
 | `sz_rabbit_combined_consumer` | bin | RabbitMQ | `lapin` |
 | `sz_sqs_combined_consumer` | bin | Amazon SQS (standard queues) | `aws-sdk-sqs` |
+| `sz_activemq_combined_consumer` | bin | Apache ActiveMQ Artemis (AMQP 1.0, anycast queues) | `fe2o3-amqp` (rustls) |
 | `sz-record-transform` | lib | — (record-transform plugin C ABI + Rust export macro) | none |
 | `sz-record-transform-example` | cdylib | — (example plugin; used by tests) | none |
 
@@ -33,6 +34,9 @@ redoer (`--redo-percent 100`). The SQS binary takes `--queue-url` /
 `SENZING_SQS_QUEUE_URL` (plus `--visibility-timeout`, `--wait-time`,
 `--max-messages`, `--prefetch`, `--dead-letter-queue-url`); credentials/region
 come from the standard AWS provider chain. See [SQS specifics](#sqs-specifics).
+The ActiveMQ binary takes `--url` / `SENZING_ACTIVEMQ_URL` and `--queue` /
+`SENZING_ACTIVEMQ_QUEUE` and compiles neither `lapin` nor the AWS SDK; see
+[ActiveMQ Artemis specifics](#activemq-artemis-specifics).
 
 > NOTE: the repository is being renamed to `sz_queue_combined_consumer` to
 > reflect the multi-backend scope (the binaries keep their per-backend names).
@@ -93,7 +97,7 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_REJECT_FILE` (`--reject-file`) | `<input>.rejected.jsonl` | file mode only: JSONL file that receives every rejected input line **verbatim** (unparseable, engine bad input, retry timeout, SENZ0082). Created lazily on the first reject, opened in append mode. Reprocess with `--file <reject file>`. |
 | `SENZING_RECORD_TRANSFORM_PLUGIN` (`--record-transform-plugin`) | none | shared library that rewrites every load record before `add_record` (all backends). See [Record transform plugins](#record-transform-plugins). |
 | `SENZING_RECORD_TRANSFORM_CONFIG` (`--record-transform-config`) | empty | opaque string passed to the plugin's init (e.g. JSON) |
-| `SENZING_PREFETCH` (`--prefetch`) | RabbitMQ: threads + 2; SQS: 2 × threads | queue mode, both binaries: the **total** in-flight cap — messages received but not yet settled (RabbitMQ: the `basic_qos` prefetch; SQS: received and not yet deleted). A value below threads is raised to threads (with a warning). |
+| `SENZING_PREFETCH` (`--prefetch`) | RabbitMQ/ActiveMQ: threads + 2; SQS: 2 × threads | queue mode, every binary: the **total** in-flight cap — messages received but not yet settled (RabbitMQ: the `basic_qos` prefetch; SQS: received and not yet deleted; ActiveMQ: AMQP link credit kept at cap − unsettled). A value below threads is raised to threads (with a warning). |
 | `SENZING_SQS_QUEUE_URL` (`-q`/`--queue-url`) | required iff redo% < 100 | SQS binary only: source queue URL |
 | `SENZING_SQS_DEAD_LETTER_QUEUE_URL` (`--dead-letter-queue-url`) | discovered | SQS binary only: where rejected records are sent. Default: the source queue's `RedrivePolicy` → `deadLetterTargetArn` → `GetQueueUrl`. Printed at startup as `DeadLetter: <url>`. |
 | `SENZING_SQS_ALLOW_NO_DLQ` (`--allow-no-dlq`) | off | SQS binary only: start even when no DLQ can be resolved. Rejects are then **deleted** (lost); the log names them with their body. Without it, no DLQ = refuse to start. |
@@ -101,7 +105,10 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_SQS_WAIT_TIME` (`--wait-time`) | 20 | SQS binary only: long-poll seconds (0..=20) |
 | `SENZING_SQS_MAX_MESSAGES` (`--max-messages`) | 10 | SQS binary only: receive batch size (1..=10); further capped by free in-flight room |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_ENDPOINT_URL`, … | provider chain | SQS binary only: standard AWS SDK resolution (env, `~/.aws`, IMDS/ECS role, web identity). SSO / `credential_process` are not compiled in (see Cargo.toml). |
-| `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | both binaries, queue mode: diagnostic MQ depth probe cadence (RabbitMQ: passive declare; SQS: `ApproximateNumberOfMessages`) and the `MQ drained (depth 0)` / `MQ active (depth N)` transition log. Not a correctness poll. |
+| `SENZING_ACTIVEMQ_URL` (`-u`/`--url`) | required iff redo% < 100 | ActiveMQ binary only: `amqp://` or `amqps://` broker URL; credentials may be embedded (`amqp://user:pass@host:5672`, percent-encoded) |
+| `SENZING_ACTIVEMQ_USER` / `SENZING_ACTIVEMQ_PASSWORD` (`--user` / `--password`) | from URL | ActiveMQ binary only: SASL PLAIN credentials; each overrides the URL's. None at all = anonymous. |
+| `SENZING_ACTIVEMQ_QUEUE` (`-q`/`--queue`) | required iff redo% < 100 | ActiveMQ binary only: ANYCAST queue name, or an FQQN `address::queue` |
+| `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | every binary, queue mode: diagnostic MQ depth probe cadence (RabbitMQ: passive declare; SQS: `ApproximateNumberOfMessages`; ActiveMQ: no AMQP depth verb, depth reported unknown) and the `MQ drained (depth 0)` / `MQ active (depth N)` transition log. Not a correctness poll. |
 | `SENZING_REDO_SLEEP_TIME_IN_SECONDS` (`--redo-sleep-secs`) | 60 | fetcher pause on empty redo queue (auto-shortened to 2 s while redo is still in flight, for cascade drain) |
 | `LONG_RECORD` (`--long-record`) | 300 | long-record threshold, seconds; stats cadence = LONG_RECORD/2 |
 | `SENZING_LOG_LEVEL` | info | log level (`RUST_LOG` overrides) |
@@ -163,6 +170,54 @@ driver uses this one convention for both binaries.)
 * **IAM.** On the source queue: `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
   `sqs:ChangeMessageVisibility`, `sqs:GetQueueAttributes`. On the DLQ:
   `sqs:SendMessage`, `sqs:GetQueueUrl` (discovery only).
+
+## ActiveMQ Artemis specifics
+
+* **Queue semantics.** The receiver link's source carries the AMQP
+  **`queue` capability**, so Artemis binds it to an **ANYCAST** queue
+  (point-to-point, competing consumers). `--queue` is a queue name or an FQQN
+  (`address::queue`). An address that exists only as MULTICAST refuses the
+  attach (startup failure, exit 255). With Artemis' default
+  `auto-create-queues`, a missing queue is **created** on attach — a typo
+  makes a new empty queue, not an error (disable auto-create to get one).
+  Producers should also send with the `queue` target capability (or to a
+  pre-created anycast address): a plain AMQP sender auto-creates a MULTICAST
+  address the driver cannot attach to.
+* **Settle.** Success = `accepted`. Reject (engine bad input, `SENZ0010`
+  retry timeout, `SENZ0082`, unparseable body) = **`rejected`**, with the
+  reason in its error description (`senzing:rejected-record`). Artemis moves a
+  rejected message to the address's **dead-letter address** (the
+  `artemis create` default is `DLQ` for `#`, anycast), annotated
+  `x-opt-ORIG-QUEUE` / `x-opt-ORIG-ADDRESS`. **An address with no
+  dead-letter address drops rejected messages** (like RabbitMQ without a DLX);
+  the `REJECTING:` stdout marker still names them. The driver never sends to
+  the DLQ itself.
+* **Shutdown / release.** At shutdown (SIGINT / SIGTERM / SIGHUP, same 10 s
+  grace) link credit drops to 0 and every unsettled delivery is `released`:
+  immediately redeliverable and, on Artemis, **not** counted as a delivery
+  attempt. Verified against Artemis 2.57: release and an unsettled connection
+  close both redeliver with the delivery count unchanged.
+* **Long records.** Artemis has no ack timeout and the engine call cannot be
+  interrupted, so a long record is only logged (`Still processing …`, and the
+  all-threads-stuck line); it is never dead-lettered (SQS parity).
+* **In-flight cap.** Manual link credit: credit is re-granted on every settle
+  as `--prefetch` − unsettled, so the broker never has more than `--prefetch`
+  deliveries outstanding to the driver (default threads + 2).
+* **Link loss.** Any receive error (connection, session or link gone; a
+  60 s idle timeout catches a silent broker) is **fatal**: orderly shutdown,
+  final totals, exit 255. Unsettled deliveries are redelivered by the broker.
+* **Bodies.** An AMQP `Data` section (bytes; multiple sections are
+  concatenated) or an `AmqpValue` string (what a JMS `TextMessage` sends) is
+  the record JSON; an `AmqpValue` binary is accepted too. Anything else is
+  dead-lettered as malformed.
+* **Credentials / TLS.** SASL PLAIN from the URL userinfo or
+  `SENZING_ACTIVEMQ_USER` / `SENZING_ACTIVEMQ_PASSWORD`; the password is never
+  logged. `amqps://` uses rustls with the webpki root store.
+* **Depth.** Artemis exposes no queue depth over AMQP (only via its
+  management API), so v1 reports none: the status line has no `mq_depth` and
+  the drained/active transition log does not fire.
+* **ActiveMQ Classic.** Classic (5.x) also implements AMQP 1.0, but only
+  Artemis is tested (e2e against `apache/artemis:2.57.0`).
 
 ## Record transform plugins
 
@@ -289,11 +344,13 @@ compare/scoring buffers with `MADV_DONTNEED` on release, tracked in
 cargo build --release --workspace                       # everything
 cargo build --release -p sz_rabbit_combined_consumer    # RabbitMQ bin only (no AWS SDK)
 cargo build --release -p sz_sqs_combined_consumer       # SQS bin only (no lapin)
+cargo build --release -p sz_activemq_combined_consumer  # ActiveMQ Artemis bin only (no lapin, no AWS SDK)
 cargo test  --workspace --lib --bins                    # unit tests (no infra)
 
 # Docker: BIN selects the backend binary; WITH_POSTGRES/WITH_MSSQL the DB closure.
 docker build --build-arg BIN=sz_rabbit_combined_consumer -t brian/sz_rabbit_combined_consumer .        # both DB backends
 docker build --build-arg BIN=sz_sqs_combined_consumer    -t brian/sz_sqs_combined_consumer .
+docker build --build-arg BIN=sz_activemq_combined_consumer -t brian/sz_activemq_combined_consumer .
 docker build --build-arg BIN=sz_rabbit_combined_consumer --build-arg WITH_MSSQL=0 -t brian/sz_rabbit_combined_consumer:pg .
 ```
 

@@ -1,0 +1,38 @@
+# Test data for the load / redo-share / body-type e2e tests in activemq_e2e.rs.
+# Queue names get the test pid appended; record templates: "{tag}" = a per-test
+# prefix, "{i}" = 0..count-1. Totals stay far below the 500-record EVAL
+# license cap the whole e2e run (RabbitMQ + SQS + ActiveMQ) shares.
+
+# The final line every run prints on shutdown.
+final_total: "Processed total of "
+
+# redo% = 0 / 20: publish `count` records, wait for the queue to empty,
+# SIGTERM, assert every record was loaded.
+combined:
+  queue: sz-amq-combined
+  threads: 4
+  count: 10
+  # Short redo pause so the 20% fetcher does not stall the drain tail.
+  redo_sleep_secs: 2
+  drained_within_secs: 120
+  record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","NAME_FULL":"Artemis Tester {i}","EMAIL_ADDRESS":"amq{i}@example.com"}'
+
+# redo% = 100: no broker settings at all; seed redo through the engine, then
+# the pure redoer must drain the redo backlog to 0.
+redoer:
+  seed_count: 12
+  # Logged once the redoer runs (its signal handler is installed by then).
+  started: "Pure redoer (redo% = 100)"
+  started_within_secs: 60
+  threads: 2
+  redo_sleep_secs: 2
+  drained_within_secs: 60
+  record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","NAME_FULL":"Redo Seed {i}","ADDR_FULL":"{i} Redo Ln"}'
+
+# One record as an AMQP Data section (bytes), one as an AmqpValue string (a
+# JMS TextMessage): both must load.
+body_types:
+  queue: sz-amq-bodies
+  loaded_within_secs: 120
+  data_record: '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_BODY_DATA","NAME_FULL":"Data Section","ADDR_FULL":"1 Bytes Rd"}'
+  value_record: '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_BODY_VALUE","NAME_FULL":"Value Section","ADDR_FULL":"2 Text Rd"}'
