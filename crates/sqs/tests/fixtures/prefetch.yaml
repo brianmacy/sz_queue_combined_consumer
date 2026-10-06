@@ -1,0 +1,18 @@
+# Test data for e2e_sqs_prefetch_is_the_total_in_flight_cap in sqs_e2e.rs:
+# --prefetch is the TOTAL in-flight cap, so with 2 slow workers and a backlog
+# the source queue never has more than `prefetch` messages in flight
+# (ApproximateNumberOfMessagesNotVisible), and every record is still loaded.
+# The queue name gets the test pid appended; "{i}" = 0..count-1.
+queue: sz-e2e-prefetch
+threads: 2
+prefetch: 4
+# Plugin sleep per record, milliseconds (keeps a backlog queued).
+sleep_ms: 500
+count: 20
+# In-flight sample cadence, milliseconds.
+sample_every_ms: 50
+# Bound on the whole backlog being loaded.
+loaded_within_secs: 120
+record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_PREFETCH_{i}","NAME_FULL":"Prefetch Tester {i}","ADDR_FULL":"{i} Cap St"}'
+# The final line (all records loaded).
+final_total: "Processed total of "

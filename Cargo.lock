@@ -2843,6 +2843,7 @@ dependencies = [
  "lapin",
  "libc",
  "serde",
+ "serde_json",
  "serde_norway",
  "sz-combined-consumer-core",
  "sz-record-transform-example",

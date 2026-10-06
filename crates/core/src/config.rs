@@ -152,8 +152,10 @@ pub struct Config {
     pub reject_file: Option<String>,
     pub redo_percent: u8,
     pub threads: usize,
-    /// RabbitMQ only (`basic_qos`); inert 0 from [`Config::from_common`].
-    pub prefetch: u16,
+    /// Queue mode: the TOTAL in-flight cap (received but not yet settled) on
+    /// every transport, resolved by each backend via [`resolve_prefetch`];
+    /// inert 0 from [`Config::from_common`].
+    pub prefetch: usize,
     /// Queue mode: depth-probe cadence (`--mq-recheck-secs`, set by each queue
     /// backend); inert 0 from [`Config::from_common`].
     pub mq_recheck_secs: u64,
@@ -265,6 +267,22 @@ pub fn validate_split_threads(threads: usize, redo_percent: u8) -> Result<(), St
     Ok(())
 }
 
+/// Resolves `--prefetch` / `SENZING_PREFETCH`: the TOTAL in-flight cap
+/// (messages received but not yet settled) on every transport. `None` takes
+/// the transport's `default`; a value below `threads` would idle workers, so
+/// it is raised to `threads` with a warning.
+pub fn resolve_prefetch(requested: Option<usize>, threads: usize, default: usize) -> usize {
+    let prefetch = requested.unwrap_or(default);
+    if prefetch >= threads {
+        return prefetch;
+    }
+    eprintln!(
+        "warning: --prefetch ({prefetch}) is below the worker count ({threads}); raising it \
+         to {threads} (the in-flight cap must cover every worker)"
+    );
+    threads
+}
+
 /// |B|: how many of `threads` workers are redo-preferring (design §1.2).
 ///
 /// `|B| = clamp(round(N × redo% / 100), 1, N−1)` for interior redo%; 0 at
@@ -307,6 +325,15 @@ mod tests {
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
         let ok = Cli::try_parse_from(["bin", "--long-record", "1"]).expect("1 is valid");
         assert_eq!(ok.common.long_record, 1);
+    }
+
+    #[test]
+    fn resolve_prefetch_is_the_total_cap_clamped_up_to_threads() {
+        assert_eq!(resolve_prefetch(None, 4, 6), 6, "transport default");
+        assert_eq!(resolve_prefetch(Some(9), 4, 6), 9, "explicit total");
+        assert_eq!(resolve_prefetch(Some(4), 4, 6), 4, "== threads is kept");
+        assert_eq!(resolve_prefetch(Some(1), 4, 6), 4, "below threads: raised");
+        assert_eq!(resolve_prefetch(Some(0), 4, 6), 4, "0 is not unlimited");
     }
 
     #[test]

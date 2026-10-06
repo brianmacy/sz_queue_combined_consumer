@@ -142,10 +142,9 @@ pub struct LoadSide {
     pub work_rx: Arc<Mutex<mpsc::Receiver<LoadItem>>>,
     pub result_tx: mpsc::Sender<Outcome>,
     /// Delivery tags currently being processed by SOME worker (picked up from
-    /// the channel). At shutdown this distinguishes design §6's two paths:
-    /// (a) in-flight-in-worker -> reject(requeue=false) to the DLQ (the engine
-    /// call may still complete — requeue would risk double-processing);
-    /// (b) queued-but-unstarted -> left unacked (broker requeues on close).
+    /// the channel). At shutdown both of design §6's cases are released for
+    /// redelivery; this only decides which ones are named as
+    /// `Still processing` (in-flight-in-worker) vs queued-but-unstarted.
     pub started: Arc<Mutex<HashSet<u64>>>,
     /// Wakeup optimization for the async loop on fatal errors. The DURABLE
     /// fatal signal is always the `Fatal` Outcome on `result_tx` (`Notify`

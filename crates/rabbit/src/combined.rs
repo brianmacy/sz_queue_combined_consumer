@@ -6,9 +6,9 @@
 //! Inherited from `sz_rabbit_consumer_rust` (see its module docs for the full
 //! rationale): one lapin `Connection` + `Channel`, single async consumer,
 //! `basic_qos` prefetch, acks/rejects ONLY on the async task. RabbitMQ policy:
-//! a load record running past `2 * LONG_RECORD` is dead-lettered, and at
-//! shutdown a delivery still inside a worker is dead-lettered while
-//! queued-but-unstarted ones are left unacked for broker requeue (design §6).
+//! a load record running past `2 * LONG_RECORD` is dead-lettered. At shutdown
+//! every unsettled delivery (in-worker or queued-but-unstarted) is left
+//! unacked; the connection close requeues it (design §6).
 
 use std::sync::Arc;
 
@@ -28,7 +28,6 @@ use sz_combined_consumer_core::queue_run::RunOutcome;
 /// RabbitMQ settle policy (consumer parity).
 const RABBIT_POLICY: Policy = Policy {
     dead_letter_long_records: true,
-    dead_letter_in_worker_at_shutdown: true,
     stuck_records_label: "load records",
 };
 
@@ -81,7 +80,7 @@ pub struct RabbitTransport {
 impl RabbitTransport {
     /// Connects, asserts the queue exists, sets `basic_qos` and starts the
     /// consumer.
-    async fn connect(url: String, queue: String, prefetch: u16) -> Result<Self> {
+    async fn connect(url: String, queue: String, prefetch: usize) -> Result<Self> {
         tracing::info!("Connecting to RabbitMQ");
         let connection = Connection::connect(&url, ConnectionProperties::default())
             .await
@@ -96,12 +95,16 @@ impl RabbitTransport {
             .await
             .with_context(|| format!("queue '{queue}' does not exist (passive declare)"))?;
 
-        // prefetch = threads + 2 by default: the +2 overshoot keeps a standing
-        // load_ch buffer that masks the ack round-trip so the non-blocking worker
-        // dispatch never stalls per-record (design §1.2/§2.3). Not materially
-        // larger: prefetched messages are invisible to sibling processes.
+        // prefetch = the total in-flight cap (threads + 2 by default): the +2
+        // overshoot keeps a standing load_ch buffer that masks the ack
+        // round-trip so the non-blocking worker dispatch never stalls
+        // per-record (design §1.2/§2.3). Not materially larger: prefetched
+        // messages are invisible to sibling processes.
         channel
-            .basic_qos(prefetch, BasicQosOptions::default())
+            .basic_qos(
+                u16::try_from(prefetch).unwrap_or(u16::MAX),
+                BasicQosOptions::default(),
+            )
             .await
             .context("failed to set basic_qos")?;
 
@@ -163,15 +166,11 @@ impl Transport for RabbitTransport {
     /// any) receives it. AMQP reject cannot carry the reason; it is on the
     /// `REJECTING:` stdout marker the core loop printed.
     async fn dead_letter(&mut self, tag: u64, reason: DeadLetterReason) {
-        let Err(e) = self
+        if let Err(e) = self
             .channel
             .basic_reject(tag, BasicRejectOptions { requeue: false })
             .await
-        else {
-            return;
-        };
-        // Best effort at shutdown (the connection is about to close).
-        if reason != DeadLetterReason::Shutdown {
+        {
             tracing::error!("basic_reject failed for {tag} ({reason}): {e:#}");
         }
     }
@@ -186,7 +185,10 @@ impl Transport for RabbitTransport {
         }
     }
 
-    /// Unacked deliveries are requeued by the broker on close.
+    /// Unacked deliveries (everything [`Transport::release`]d at shutdown) are
+    /// requeued by the broker on close. Deliberately not `basic_nack(requeue)`
+    /// at release time: the consumer is still subscribed then, so the broker
+    /// would push the requeued message straight back to this channel.
     async fn close(self) {
         if let Err(e) = self.connection.close(0, "shutting down".into()).await {
             tracing::warn!("error closing connection: {e:#}");

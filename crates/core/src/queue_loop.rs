@@ -9,8 +9,11 @@
 //! is closed, results are drained until ONE deadline (`SHUTDOWN_GRACE` after
 //! the trigger), every engine-owning thread (workers, redo fetcher, stats) is
 //! joined against that same deadline, and whatever is still unsettled is
-//! handled per [`Policy`] — design §6: (a) in-flight-in-worker vs (b)
-//! queued-but-unstarted.
+//! released for redelivery on every transport — both (a) in-flight-in-worker
+//! and (b) queued-but-unstarted (design §6). `add_record` with an existing
+//! key replaces the record, so a redelivered in-worker record is re-added
+//! idempotently; dead-lettering it would put a valid record in the DLQ on
+//! every rolling restart.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -56,8 +59,6 @@ pub enum DeadLetterReason {
     Rejected(String),
     /// Still processing past `2 * LONG_RECORD`.
     LongRecord,
-    /// Still inside a worker when the shutdown grace elapsed.
-    Shutdown,
 }
 
 impl std::fmt::Display for DeadLetterReason {
@@ -66,9 +67,6 @@ impl std::fmt::Display for DeadLetterReason {
             Self::Malformed(err) => write!(f, "malformed record: {err}"),
             Self::Rejected(err) => f.write_str(err),
             Self::LongRecord => f.write_str("still processing past 2x LONG_RECORD"),
-            Self::Shutdown => f.write_str(
-                "in-flight-in-worker on shutdown (engine call may still complete in background)",
-            ),
         }
     }
 }
@@ -88,8 +86,9 @@ pub trait Transport {
         tag: u64,
         reason: DeadLetterReason,
     ) -> impl Future<Output = ()> + Send;
-    /// Leaves a delivery for redelivery at shutdown. Default: no-op (the
-    /// broker redelivers whatever is unsettled when the connection closes).
+    /// Leaves a delivery for redelivery at shutdown (never a reject: it is not
+    /// dead-lettered and not counted). Default: no-op (the broker redelivers
+    /// whatever is unsettled when the connection closes).
     fn release(&mut self, _tag: u64) -> impl Future<Output = ()> + Send {
         async {}
     }
@@ -109,16 +108,12 @@ pub trait Transport {
     fn close(self) -> impl Future<Output = ()> + Send;
 }
 
-/// Per-backend settle policy for the two cases a broker answers differently.
+/// Per-backend settle policy for the case brokers answer differently.
 pub struct Policy {
     /// Dead-letter a load delivery still running at `2 * LONG_RECORD` (the
     /// worker keeps going; its late result is ignored). `false`: only
     /// [`Transport::extend_lease`] is called.
     pub dead_letter_long_records: bool,
-    /// At shutdown, dead-letter a delivery still inside a worker (the engine
-    /// call may still complete, so a requeue would double-process). `false`:
-    /// [`Transport::release`] it like an unstarted one.
-    pub dead_letter_in_worker_at_shutdown: bool,
     /// What the all-workers-stuck warning calls the records
     /// (`All N threads are stuck on long running <label>`); kept per backend
     /// so existing log searches keep matching.
@@ -530,16 +525,15 @@ impl<T: Transport> Session<T> {
         }
     }
 
-    /// Settles every delivery still unsettled after the join — design §6:
+    /// Releases every delivery still unsettled after the join, on every
+    /// transport (design §6), and never counts it as rejected:
     /// (a) in-flight-in-worker: the engine call may still complete in the
-    ///     background (the batch-deadline "bookmark" pattern), so per
-    ///     [`Policy::dead_letter_in_worker_at_shutdown`] it is dead-lettered
-    ///     rather than requeued (a requeue risks double-processing);
-    /// (b) queued-but-unstarted (never dispatched): released, nothing lost.
-    ///
-    /// A worker could in principle pick an item up between the `started`
-    /// snapshot and the connection close (post-grace window); the window is a
-    /// few microseconds and the failure mode is a redelivery, not data loss.
+    ///     background; the redelivered copy is re-added idempotently
+    ///     (`add_record` with an existing key replaces the record, and the
+    ///     engine serializes same-key contention itself). Named on stdout as
+    ///     `Still processing (… min): DS : ID` so an operator can correlate
+    ///     the redelivery;
+    /// (b) queued-but-unstarted (never dispatched): nothing lost.
     async fn settle_remainder(&mut self, started: &HashSet<u64>) {
         let remaining: Vec<(u64, InFlight)> = self.in_flight.drain().collect();
         for (tag, record) in remaining {
@@ -550,22 +544,18 @@ impl<T: Transport> Session<T> {
                 data_source,
                 record_id,
             } = &record.info;
-            if !started.contains(&tag) {
-                tracing::info!(
-                    "leaving queued-but-unstarted delivery unacked (broker requeues on \
-                     close): {data_source} : {record_id}"
+            if started.contains(&tag) {
+                println!(
+                    "Still processing ({:.1} min): {data_source} : {record_id}",
+                    record.started.elapsed().as_secs_f64() / 60.0
                 );
-                self.transport.release(tag).await;
-            } else if self.policy.dead_letter_in_worker_at_shutdown {
-                self.reject(tag, &record.info, DeadLetterReason::Shutdown)
-                    .await;
             } else {
-                tracing::warn!(
-                    "releasing in-flight-in-worker delivery on shutdown (engine call may \
-                     still complete in background): {data_source} : {record_id}"
+                tracing::info!(
+                    "releasing queued-but-unstarted delivery for redelivery: \
+                     {data_source} : {record_id}"
                 );
-                self.transport.release(tag).await;
             }
+            self.transport.release(tag).await;
         }
     }
 
@@ -649,11 +639,6 @@ mod tests {
         assert_eq!(
             reject_marker(&RecordInfo::empty(), &poison),
             "REJECTING:  :  -> malformed record: missing DATA_SOURCE"
-        );
-        assert!(
-            DeadLetterReason::Shutdown
-                .to_string()
-                .starts_with("in-flight-in-worker")
         );
         assert!(
             DeadLetterReason::LongRecord

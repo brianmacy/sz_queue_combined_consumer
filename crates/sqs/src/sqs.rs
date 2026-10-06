@@ -6,11 +6,11 @@
 //! | Concern      | RabbitMQ (combined.rs)        | SQS (here)                                   |
 //! |--------------|-------------------------------|----------------------------------------------|
 //! | ingest       | lapin push consumer stream    | ReceiveMessage long-poll task -> channel     |
-//! | backpressure | basic_qos prefetch            | bounded in-flight count (threads + prefetch) |
+//! | backpressure | basic_qos prefetch            | bounded in-flight count (prefetch)           |
 //! | ack success  | basic_ack(delivery_tag)       | DeleteMessageBatch(receipt_handle)           |
 //! | dead-letter  | basic_reject(requeue=false)   | SendMessage to the DLQ, then delete          |
 //! | long record  | reject at 2x LONG_RECORD      | ChangeMessageVisibility heartbeat            |
-//! | fatal/leave  | leave unacked -> redeliver    | don't delete -> visibility expiry            |
+//! | fatal/release| leave unacked -> redeliver    | don't delete -> visibility expiry            |
 //! | identity     | u64 delivery tag              | synthetic u64 -> receipt-handle map          |
 //!
 //! ## Receiving
@@ -18,8 +18,12 @@
 //! [`Transport::recv`] reads (cancel-safe): cancelling a raw `ReceiveMessage`
 //! inside the loop's `select!` could orphan messages SQS already handed out.
 //! The poller holds one semaphore permit per received-but-unsettled message
-//! (cap `threads + prefetch`, v4 parity) so queued messages never sit with
-//! their visibility timer running down. [`RECEIVE_ERROR_MAX`] consecutive
+//! (cap = `prefetch`, the total in-flight cap; default 2 x threads, v4
+//! parity) so queued messages never sit with their visibility timer running
+//! down. A permit is released only once the message has left the queue
+//! (`DeleteMessageBatch` returned) or been released at shutdown, so the cap
+//! bounds the messages this consumer holds invisible; the waiting poller is
+//! woken the moment one is released. [`RECEIVE_ERROR_MAX`] consecutive
 //! `ReceiveMessage` failures are fatal (orderly shutdown, exit 255).
 //!
 //! ## Dead-letter queue
@@ -40,8 +44,9 @@
 //! visibility extended to `(n + 2) * LONG_RECORD` so SQS does not redeliver it
 //! mid-`add_record` (duplicate add); it is never dead-lettered for running
 //! long (Senzing v4 SQS consumer parity). SQS caps visibility at 12 h;
-//! extensions are clamped. At shutdown a record still inside a worker is left
-//! un-deleted for redelivery after its visibility timeout.
+//! extensions are clamped. At shutdown every unsettled message (in a worker or
+//! queued for one) is left un-deleted for redelivery after its visibility
+//! timeout.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,10 +73,9 @@ use sz_combined_consumer_core::record::{RecordInfo, parse_record};
 use crate::SqsParams;
 
 /// SQS settle policy: extend visibility on long records (never dead-letter
-/// them) and leave in-worker messages for redelivery at shutdown.
+/// them).
 const SQS_POLICY: Policy = Policy {
     dead_letter_long_records: false,
-    dead_letter_in_worker_at_shutdown: false,
     stuck_records_label: "records",
 };
 
@@ -89,8 +93,6 @@ const SQS_MAX_MESSAGE_BYTES: usize = 262_144;
 pub const MAX_VISIBILITY_SECS: u64 = 43_200;
 /// SQS hard maximum entries per `DeleteMessageBatch`.
 const DELETE_BATCH_MAX: usize = 10;
-/// How often pending deletes are flushed even when the batch is not full.
-const DELETE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// Backoff after a `ReceiveMessage` API error.
 const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 /// Consecutive `ReceiveMessage` failures that make the run fatal (exit 255
@@ -241,7 +243,7 @@ pub async fn run(
         threads - redo_pref,
         config.redo_percent,
         params.queue_url,
-        params.prefetch
+        config.prefetch
     );
 
     // Client + DLQ resolution fail fast, before any engine thread is spawned.
@@ -254,8 +256,7 @@ pub async fn run(
         visibility_timeout: params.visibility_timeout,
         wait_time: params.wait_time,
         max_messages: params.max_messages,
-        // Overshoot so workers never idle waiting on a receive (v4 parity).
-        cap: threads + params.prefetch,
+        cap: config.prefetch,
     };
     // The core loop spawns the engine pool BEFORE awaiting this, so the
     // poller only starts once the workers exist.
@@ -283,8 +284,9 @@ struct SqsMessage {
     received: Instant,
     /// Number of visibility extensions granted so far.
     extended: u32,
-    /// In-flight cap slot, released when the message is settled.
-    _slot: OwnedSemaphorePermit,
+    /// In-flight cap slot, released once the message has left the queue
+    /// (deleted) or been released at shutdown.
+    slot: OwnedSemaphorePermit,
 }
 
 impl SqsMessage {
@@ -297,6 +299,14 @@ impl SqsMessage {
 /// What the poller hands to [`Transport::recv`].
 type Received = Result<(u64, SqsMessage)>;
 
+/// A settled message awaiting `DeleteMessageBatch`. Its in-flight slot is
+/// held until the batch call returns (the message is invisible until then).
+struct PendingDelete {
+    tag: u64,
+    receipt_handle: String,
+    _slot: OwnedSemaphorePermit,
+}
+
 /// The SQS transport: a poller task feeding a bounded channel, the receipt
 /// handles of everything unsettled, and a background delete batcher.
 pub struct SqsTransport {
@@ -306,7 +316,7 @@ pub struct SqsTransport {
     long_record_secs: u64,
     rx: mpsc::Receiver<Received>,
     unsettled: HashMap<u64, SqsMessage>,
-    delete_tx: mpsc::UnboundedSender<(u64, String)>,
+    delete_tx: mpsc::UnboundedSender<PendingDelete>,
     stop_tx: watch::Sender<bool>,
     poller: JoinHandle<()>,
     deleter: JoinHandle<()>,
@@ -347,9 +357,13 @@ impl SqsTransport {
         }
     }
 
-    fn delete(&self, tag: u64, receipt_handle: String) {
+    fn delete(&self, tag: u64, m: SqsMessage) {
         // The batcher only exits after `close` drops the sender.
-        let _ = self.delete_tx.send((tag, receipt_handle));
+        let _ = self.delete_tx.send(PendingDelete {
+            tag,
+            receipt_handle: m.receipt_handle,
+            _slot: m.slot,
+        });
     }
 
     /// Forwards `m` to the DLQ (tagged with `reason`) and, only if that
@@ -365,11 +379,11 @@ impl SqsTransport {
                 info.record_id,
                 String::from_utf8_lossy(&m.body)
             );
-            self.delete(tag, m.receipt_handle);
+            self.delete(tag, m);
             return;
         };
         match send_to_dead_letter(&self.client, dl, &m, &info, reason).await {
-            Ok(()) => self.delete(tag, m.receipt_handle),
+            Ok(()) => self.delete(tag, m),
             Err(e) => error!(
                 "SendMessage to DLQ {} failed for {} : {}: {e:#}; leaving the source \
                  message for redelivery",
@@ -392,7 +406,7 @@ impl Transport for SqsTransport {
 
     async fn ack(&mut self, tag: u64) {
         if let Some(m) = self.unsettled.remove(&tag) {
-            self.delete(tag, m.receipt_handle);
+            self.delete(tag, m);
         }
     }
 
@@ -405,18 +419,9 @@ impl Transport for SqsTransport {
     }
 
     /// Leaves the message un-deleted: SQS redelivers it after its visibility
-    /// timeout (at-least-once). Named (v4 parity) so an operator can correlate
-    /// a later duplicate.
+    /// timeout (at-least-once; the core loop names in-worker ones).
     async fn release(&mut self, tag: u64) {
-        if let Some(m) = self.unsettled.remove(&tag) {
-            let info = m.info();
-            println!(
-                "Still processing ({:.1} min): {} : {}",
-                m.received.elapsed().as_secs_f64() / 60.0,
-                info.data_source,
-                info.record_id
-            );
-        }
+        self.unsettled.remove(&tag);
     }
 
     /// Visibility heartbeat, measured from the receive time (the visibility
@@ -557,72 +562,61 @@ fn sqs_attribute_char(c: char) -> bool {
     matches!(c, '\t' | '\n' | '\r') || (c >= ' ' && c != '\u{fffe}' && c != '\u{ffff}')
 }
 
-/// Background delete batcher: `DeleteMessageBatch` when 10 are pending or
-/// every [`DELETE_FLUSH_INTERVAL`]; flushes the rest when the sender drops.
+/// Background delete batcher: waits for at least one settled message, then
+/// deletes everything pending (up to [`DELETE_BATCH_MAX`] per call) at once.
+/// Batches form naturally under load (acks pile up during each call) and a
+/// lone delete is never held back, so freed in-flight slots return promptly.
+/// Exits once `close` drops the sender and the rest is flushed.
 async fn delete_loop(
     client: Client,
     queue_url: String,
-    mut rx: mpsc::UnboundedReceiver<(u64, String)>,
+    mut rx: mpsc::UnboundedReceiver<PendingDelete>,
 ) {
-    let mut pending: Vec<(u64, String)> = Vec::new();
-    let mut tick = tokio::time::interval(DELETE_FLUSH_INTERVAL);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            item = rx.recv() => {
-                let Some(item) = item else { break };
-                pending.push(item);
-                if pending.len() >= DELETE_BATCH_MAX {
-                    flush_deletes(&client, &queue_url, &mut pending).await;
-                }
-            }
-            _ = tick.tick() => flush_deletes(&client, &queue_url, &mut pending).await,
-        }
+    let mut batch = Vec::with_capacity(DELETE_BATCH_MAX);
+    while rx.recv_many(&mut batch, DELETE_BATCH_MAX).await > 0 {
+        flush_deletes(&client, &queue_url, &batch).await;
+        // Dropping the entries releases their in-flight slots.
+        batch.clear();
     }
-    flush_deletes(&client, &queue_url, &mut pending).await;
 }
 
-/// Issues `DeleteMessageBatch` for everything pending. A failed entry is
-/// logged (the message redelivers after its visibility timeout, and
-/// `add_record` is idempotent), never retried here.
-async fn flush_deletes(client: &Client, queue_url: &str, pending: &mut Vec<(u64, String)>) {
-    while !pending.is_empty() {
-        let take = pending.len().min(DELETE_BATCH_MAX);
-        let chunk: Vec<(u64, String)> = pending.drain(..take).collect();
-        let entries: Vec<DeleteMessageBatchRequestEntry> = chunk
-            .iter()
-            .filter_map(|(id, handle)| {
-                DeleteMessageBatchRequestEntry::builder()
-                    .id(id.to_string())
-                    .receipt_handle(handle)
-                    .build()
-                    .ok()
-            })
-            .collect();
-        match client
-            .delete_message_batch()
-            .queue_url(queue_url)
-            .set_entries(Some(entries))
-            .send()
-            .await
-        {
-            Ok(resp) => {
-                for failed in resp.failed() {
-                    warn!(
-                        "SQS DeleteMessageBatch entry {} failed: {} ({}); message will \
-                         redeliver after its visibility timeout",
-                        failed.id(),
-                        failed.code(),
-                        failed.message().unwrap_or("")
-                    );
-                }
+/// Issues one `DeleteMessageBatch` (at most [`DELETE_BATCH_MAX`] entries). A
+/// failed entry is logged (the message redelivers after its visibility
+/// timeout, and `add_record` is idempotent), never retried here.
+async fn flush_deletes(client: &Client, queue_url: &str, chunk: &[PendingDelete]) {
+    let entries: Vec<DeleteMessageBatchRequestEntry> = chunk
+        .iter()
+        .filter_map(|d| {
+            DeleteMessageBatchRequestEntry::builder()
+                .id(d.tag.to_string())
+                .receipt_handle(&d.receipt_handle)
+                .build()
+                .ok()
+        })
+        .collect();
+    match client
+        .delete_message_batch()
+        .queue_url(queue_url)
+        .set_entries(Some(entries))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            for failed in resp.failed() {
+                warn!(
+                    "SQS DeleteMessageBatch entry {} failed: {} ({}); message will \
+                     redeliver after its visibility timeout",
+                    failed.id(),
+                    failed.code(),
+                    failed.message().unwrap_or("")
+                );
             }
-            Err(e) => warn!(
-                "SQS DeleteMessageBatch of {} message(s) failed: {e}; they will redeliver \
-                 after their visibility timeout",
-                chunk.len()
-            ),
         }
+        Err(e) => warn!(
+            "SQS DeleteMessageBatch of {} message(s) failed: {e}; they will redeliver \
+             after their visibility timeout",
+            chunk.len()
+        ),
     }
 }
 
@@ -702,22 +696,20 @@ impl Poller {
         }
     }
 
-    /// Waits for at least one free in-flight slot, then takes up to one batch
-    /// worth. `None` on stop.
+    /// Waits for at least one free in-flight slot (woken the moment a settled
+    /// message releases one), then takes the rest of the room up to one batch.
+    /// `None` on stop.
     async fn reserve(&mut self) -> Option<Vec<OwnedSemaphorePermit>> {
         let first = tokio::select! {
             biased;
             () = stopped(&mut self.stop) => return None,
             permit = self.slots.clone().acquire_owned() => permit.ok()?,
         };
-        let mut slots = vec![first];
-        while slots.len() < self.p.max_messages.max(1) as usize {
-            match self.slots.clone().try_acquire_owned() {
-                Ok(permit) => slots.push(permit),
-                Err(_) => break,
-            }
-        }
-        Some(slots)
+        Some(take_room(
+            &self.slots,
+            first,
+            self.p.max_messages.max(1) as usize,
+        ))
     }
 
     /// Hands each received message (with its slot) to the loop; unused slots
@@ -763,6 +755,23 @@ impl Poller {
     }
 }
 
+/// `first` plus every other free slot, up to `batch` in total: the receive
+/// size is `min(batch, prefetch - outstanding)`.
+fn take_room(
+    slots: &Arc<Semaphore>,
+    first: OwnedSemaphorePermit,
+    batch: usize,
+) -> Vec<OwnedSemaphorePermit> {
+    let mut taken = vec![first];
+    while taken.len() < batch {
+        match slots.clone().try_acquire_owned() {
+            Ok(permit) => taken.push(permit),
+            Err(_) => break,
+        }
+    }
+    taken
+}
+
 /// One `ReceiveMessage` for at most `room` messages. SDK-internal retries are
 /// disabled: the poller is the retry policy, so the fatal window stays
 /// [`RECEIVE_ERROR_MAX`] x [`RECEIVE_ERROR_BACKOFF`] (with SDK retries each
@@ -801,7 +810,7 @@ fn sqs_message(m: Message, slot: OwnedSemaphorePermit) -> Option<SqsMessage> {
         message_id: m.message_id,
         received: Instant::now(),
         extended: 0,
-        _slot: slot,
+        slot,
     })
 }
 
@@ -927,5 +936,26 @@ mod tests {
         );
         drop(m);
         assert_eq!(slots.available_permits(), 2, "settling frees the slot");
+    }
+
+    #[test]
+    fn receive_room_is_prefetch_minus_outstanding_capped_by_batch() {
+        let prefetch = 6;
+        let slots = Arc::new(Semaphore::new(prefetch));
+        let take = |batch| {
+            let first = slots.clone().try_acquire_owned().expect("a free slot");
+            take_room(&slots, first, batch)
+        };
+        let outstanding = take(2);
+        assert_eq!(outstanding.len(), 2, "capped by the batch size");
+        let rest = take(10);
+        assert_eq!(
+            rest.len(),
+            prefetch - outstanding.len(),
+            "prefetch - outstanding"
+        );
+        assert_eq!(slots.available_permits(), 0, "never beyond the total cap");
+        drop(outstanding);
+        assert_eq!(take(10).len(), 2, "settled slots are room again");
     }
 }

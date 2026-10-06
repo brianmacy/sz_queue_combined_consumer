@@ -18,7 +18,8 @@ use clap::Parser;
 use sz_rust_sdk::prelude::*;
 
 use sz_combined_consumer_core::config::{
-    CommonArgs, Config, DEFAULT_MQ_RECHECK_SECS, engine_config_from_env, validate_split_threads,
+    CommonArgs, Config, DEFAULT_MQ_RECHECK_SECS, engine_config_from_env, resolve_prefetch,
+    validate_split_threads,
 };
 use sz_combined_consumer_core::{queue_run, runtime};
 
@@ -48,11 +49,13 @@ struct Args {
     #[arg(short = 'q', long = "queue", env = "SENZING_RABBITMQ_QUEUE")]
     queue: Option<String>,
 
-    /// AMQP basic_qos prefetch. Defaults to threads + 2: the +2 overshoot keeps
-    /// a standing load_ch buffer that masks the ack round-trip, so the workers'
+    /// Total in-flight cap: deliveries received but not yet settled (AMQP
+    /// basic_qos prefetch). Defaults to threads + 2: the +2 overshoot keeps a
+    /// standing load_ch buffer that masks the ack round-trip, so the workers'
     /// non-blocking dispatch never stalls per-record (design §1.2/§2.3).
+    /// Below threads is raised to threads (with a warning).
     #[arg(long = "prefetch", env = "SENZING_PREFETCH")]
-    prefetch: Option<u16>,
+    prefetch: Option<usize>,
 
     /// Cadence of the diagnostic MQ depth probe (passive queue_declare) and
     /// mode-transition log hysteresis. NOT a correctness poll — the consumer
@@ -118,9 +121,11 @@ fn resolve(args: Args, engine_config: String) -> Result<Config, String> {
         config.queue = queue;
     }
 
-    config.prefetch = args
-        .prefetch
-        .unwrap_or_else(|| u16::try_from(config.threads.saturating_add(2)).unwrap_or(u16::MAX));
+    config.prefetch = resolve_prefetch(
+        args.prefetch,
+        config.threads,
+        config.threads.saturating_add(2),
+    );
     config.mq_recheck_secs = args.mq_recheck_secs;
     Ok(config)
 }
@@ -226,10 +231,23 @@ mod tests {
         let c = resolve(args(&["-f", "in.jsonl", "-u", "amqp://x"]), "{}".into()).unwrap();
         assert_eq!((c.url, c.queue), (None, None));
         let c = resolve(
-            args(&["--redo-percent", "100", "--prefetch", "3"]),
+            args(&["--redo-percent", "100", "--prefetch", "13"]),
             "{}".into(),
         )
         .unwrap();
-        assert_eq!(c.prefetch, 3);
+        assert_eq!(c.prefetch, 13);
+    }
+
+    #[test]
+    fn resolve_prefetch_is_total_and_clamped_up_to_threads() {
+        let base = ["-u", "amqp://x", "-q", "q", "--threads-per-process", "4"];
+        let with = |p: &str| {
+            let mut a = base.to_vec();
+            a.extend(["--prefetch", p]);
+            resolve(args(&a), "{}".into()).expect("valid").prefetch
+        };
+        assert_eq!(with("5"), 5, "the total cap, not extra beyond threads");
+        assert_eq!(with("2"), 4, "below threads is raised to threads");
+        assert_eq!(with("0"), 4, "0 would mean unlimited to basic_qos");
     }
 }

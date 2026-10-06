@@ -21,6 +21,7 @@ use sz_rust_sdk::prelude::*;
 
 use sz_combined_consumer_core::config::{
     CommonArgs, Config, DEFAULT_LONG_RECORD_SECS, DEFAULT_MQ_RECHECK_SECS, engine_config_from_env,
+    resolve_prefetch,
 };
 use sz_combined_consumer_core::{queue_run, runtime};
 
@@ -87,9 +88,10 @@ struct Args {
     )]
     allow_no_dlq: bool,
 
-    /// Extra messages to hold beyond the worker count so workers never idle on
-    /// a receive round-trip (in-flight cap = threads + prefetch). Default:
-    /// threads (sz_sqs_consumer-v4 parity).
+    /// Total in-flight cap: messages received but not yet deleted (or
+    /// dead-lettered). Default: 2 x threads, so workers never idle on a
+    /// receive round-trip (Senzing v4 SQS consumer parity). Below threads is
+    /// raised to threads (with a warning).
     #[arg(long = "prefetch", env = "SENZING_PREFETCH")]
     prefetch: Option<usize>,
 
@@ -117,8 +119,6 @@ pub struct SqsParams {
     pub dead_letter_queue_url: Option<String>,
     /// Run without any DLQ (rejects are deleted). Loud opt-in.
     pub allow_no_dlq: bool,
-    /// In-flight overshoot beyond the worker count.
-    pub prefetch: usize,
 }
 
 fn main() -> ExitCode {
@@ -148,14 +148,19 @@ fn main() -> ExitCode {
 }
 
 /// Resolves and validates everything before engine init: the shared config via
-/// [`Config::from_common`] plus the depth-probe cadence (url/queue/prefetch
-/// stay inert — SQS has no AMQP topology), and the SQS params when the SQS
-/// load path will run (redo% < 100, not file mode). Pure (no engine).
+/// [`Config::from_common`] plus the depth-probe cadence and the in-flight cap
+/// (url/queue stay inert — SQS has no AMQP topology), and the SQS params when
+/// the SQS load path will run (redo% < 100, not file mode). Pure (no engine).
 fn build(args: &Args, engine_config: String) -> Result<(Config, Option<SqsParams>), String> {
     let mut config = Config::from_common(&args.common, engine_config)?;
     config.mq_recheck_secs = args.mq_recheck_secs;
+    config.prefetch = resolve_prefetch(
+        args.prefetch,
+        config.threads,
+        config.threads.saturating_mul(2),
+    );
     let params = if config.input_file.is_none() && config.redo_percent < 100 {
-        Some(sqs_params(args, config.threads)?)
+        Some(sqs_params(args)?)
     } else {
         None
     };
@@ -163,8 +168,7 @@ fn build(args: &Args, engine_config: String) -> Result<(Config, Option<SqsParams
 }
 
 /// Validates and extracts the SQS ingestion parameters (SQS load path only).
-/// `threads` is the resolved worker count (default prefetch).
-fn sqs_params(args: &Args, threads: usize) -> Result<SqsParams, String> {
+fn sqs_params(args: &Args) -> Result<SqsParams, String> {
     let queue_url = args.queue_url.clone().filter(|s| !s.is_empty()).ok_or(
         "No SQS queue URL provided (use --queue-url or SENZING_SQS_QUEUE_URL); \
              required when redo% < 100",
@@ -201,7 +205,6 @@ fn sqs_params(args: &Args, threads: usize) -> Result<SqsParams, String> {
         max_messages: args.max_messages,
         dead_letter_queue_url: args.dead_letter_queue_url.clone().filter(|s| !s.is_empty()),
         allow_no_dlq: args.allow_no_dlq,
-        prefetch: args.prefetch.unwrap_or(threads),
     })
 }
 
@@ -275,14 +278,16 @@ mod tests {
     }
 
     #[test]
-    fn sqs_params_prefetch_defaults_to_thread_count() {
-        let p = sqs_params(&args(&["--queue-url", "u", "--threads-per-process", "7"])).unwrap();
-        assert_eq!(
-            p.prefetch, 7,
-            "v4 parity: in-flight cap = 2 x threads by default"
-        );
-        let p = sqs_params(&args(&["--queue-url", "u", "--prefetch", "0"])).unwrap();
-        assert_eq!(p.prefetch, 0);
+    fn prefetch_is_the_total_cap_defaulting_to_twice_threads() {
+        let prefetch = |extra: &[&str]| {
+            let mut a = vec!["--queue-url", "u", "--threads-per-process", "7"];
+            a.extend_from_slice(extra);
+            build(&args(&a), "{}".into()).expect("valid").0.prefetch
+        };
+        assert_eq!(prefetch(&[]), 14, "v4 parity: 2 x threads by default");
+        assert_eq!(prefetch(&["--prefetch", "9"]), 9, "the total, not extra");
+        assert_eq!(prefetch(&["--prefetch", "3"]), 7, "raised to threads");
+        assert_eq!(prefetch(&["--prefetch", "0"]), 7, "raised to threads");
     }
 
     #[test]
@@ -358,7 +363,6 @@ mod tests {
     fn build_leaves_amqp_fields_inert() {
         let (c, _) = build(&args(&["--queue-url", "u"]), "{}".into()).unwrap();
         assert_eq!((c.url, c.queue), (None, None));
-        assert_eq!(c.prefetch, 0);
     }
 
     #[test]
