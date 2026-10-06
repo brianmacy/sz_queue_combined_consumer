@@ -101,6 +101,98 @@ pub fn stats_loop(
     }
 }
 
+/// Handles for the dedicated stats thread of an async backend.
+pub struct StatsThread {
+    /// One `()` per monitor tick requests a `get_stats()`; dropping it stops
+    /// the thread.
+    pub req_tx: std::sync::mpsc::Sender<()>,
+    pub resp_rx: tokio::sync::mpsc::Receiver<StatsPayload>,
+    pub handle: std::thread::JoinHandle<()>,
+}
+
+/// Spawns `sz-stats` running [`stats_loop`] (blocking `get_stats` only).
+pub fn spawn_stats_thread(env: &Arc<SzEnvironmentCore>) -> anyhow::Result<StatsThread> {
+    use anyhow::Context;
+    let stats_env = env.clone();
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<()>();
+    let (resp_tx, resp_rx) = tokio::sync::mpsc::channel::<StatsPayload>(1);
+    let handle = std::thread::Builder::new()
+        .name("sz-stats".to_string())
+        .spawn(move || stats_loop(stats_env, req_rx, resp_tx))
+        .context("failed to spawn stats thread")?;
+    Ok(StatsThread {
+        req_tx,
+        resp_rx,
+        handle,
+    })
+}
+
+/// Rate state for the async backends' `Combined stats:` line: one line per
+/// stats-thread answer, rates computed over the time since the previous one.
+pub struct StatusTicker {
+    redo_percent: u8,
+    load_pref: usize,
+    redo_pref: usize,
+    last_status_at: Instant,
+    prev_adds: usize,
+    prev_redos: usize,
+}
+
+impl StatusTicker {
+    /// Starts the rate window now.
+    pub fn new(redo_percent: u8, load_pref: usize, redo_pref: usize) -> Self {
+        Self {
+            redo_percent,
+            load_pref,
+            redo_pref,
+            last_status_at: Instant::now(),
+            prev_adds: 0,
+            prev_redos: 0,
+        }
+    }
+
+    /// Prints the `Engine stats:` line (when present) then the status line.
+    pub fn on_payload(&mut self, payload: &StatsPayload, mq_depth: Option<u32>) {
+        if let Some(engine_stats) = &payload.engine_stats {
+            // The prefix is MANDATORY: the harness scrapes on
+            // "Engine stats:" (the bare {"workload":...} line broke
+            // scrape_engine_stats — FAQ-documented bug).
+            println!("Engine stats: {engine_stats}");
+        }
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.last_status_at)
+            .as_secs_f64()
+            .max(0.001);
+        let adds = ADDS_PROCESSED.load(Ordering::Relaxed);
+        let redos = REDOS_PROCESSED.load(Ordering::Relaxed);
+        emit_status_line(&StatusLine {
+            redo_percent: self.redo_percent,
+            load_pref: self.load_pref,
+            redo_pref: self.redo_pref,
+            adds,
+            adds_rate: (adds - self.prev_adds) as f64 / dt,
+            redos,
+            redos_rate: (redos - self.prev_redos) as f64 / dt,
+            mq_depth,
+        });
+        self.prev_adds = adds;
+        self.prev_redos = redos;
+        self.last_status_at = now;
+    }
+}
+
+/// Prints the final `Processed total of ...` line the e2e tests scrape. `adds`
+/// is the backend's own add total (the backends count it differently).
+pub fn print_final_totals(adds: u64) {
+    println!(
+        "Processed total of {adds} adds, {} redo records ({} redo dropped, {} errors)",
+        REDOS_PROCESSED.load(Ordering::Relaxed),
+        REDOS_DROPPED.load(Ordering::Relaxed),
+        ERRORS.load(Ordering::Relaxed),
+    );
+}
+
 /// Global run flag: flipped to `false` on shutdown (signal or fatal error).
 pub static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -225,6 +317,19 @@ mod tests {
         assert!(t.observe(9_999, 10_000).is_some());
         assert_eq!(t.observe(10_000, 10_001), None);
         assert!(t.observe(19_999, 20_000).is_some());
+    }
+
+    #[test]
+    fn status_ticker_advances_its_rate_window_per_payload() {
+        let mut t = StatusTicker::new(20, 10, 2);
+        let first = t.last_status_at;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        t.on_payload(&StatsPayload { engine_stats: None }, Some(3));
+        assert!(t.last_status_at > first);
+        // Counters only grow, so the snapshot never exceeds the live value.
+        assert!(t.prev_adds <= ADDS_PROCESSED.load(Ordering::Relaxed));
+        assert!(t.prev_redos <= REDOS_PROCESSED.load(Ordering::Relaxed));
+        assert_eq!((t.redo_percent, t.load_pref, t.redo_pref), (20, 10, 2));
     }
 
     #[test]

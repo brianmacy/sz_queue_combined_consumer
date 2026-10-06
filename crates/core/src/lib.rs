@@ -28,7 +28,9 @@
 pub mod config;
 pub mod config_reload;
 pub mod file_loader;
+pub mod pool;
 pub mod pure_redoer;
+pub mod queue_run;
 pub mod record;
 pub mod redo;
 pub mod runtime;

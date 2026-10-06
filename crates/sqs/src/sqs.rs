@@ -34,7 +34,7 @@
 //! message is assigned a monotonic `u64` id mapped to its [`SqsInFlight`] entry
 //! (receipt handle, body, ids, start time, extension count).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -49,14 +49,14 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{error, info, warn};
 
 use sz_combined_consumer_core::config::Config;
+use sz_combined_consumer_core::pool::{EnginePool, spawn_engine_pool};
+use sz_combined_consumer_core::queue_run::{RunOutcome, install_signals, monitor_interval};
 use sz_combined_consumer_core::record::{RecordInfo, parse_record};
-use sz_combined_consumer_core::redo::fetcher_loop;
 use sz_combined_consumer_core::stats::{
-    self, ADDS_PROCESSED, ADDS_REJECTED, RUNNING, StatsPayload, ThroughputTicker, stats_loop,
+    self, ADDS_PROCESSED, ADDS_REJECTED, RUNNING, StatsThread, StatusTicker, ThroughputTicker,
 };
 use sz_combined_consumer_core::worker::{
-    Action, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
-    WorkerCtx, add_record_flags, monitor_redo_in_flight, redo_flags, worker_class, worker_loop,
+    Action, LoadItem, Outcome, SHUTDOWN_GRACE, monitor_redo_in_flight,
 };
 
 use crate::SqsParams;
@@ -100,13 +100,6 @@ impl DeadLetter {
         let fifo = url.ends_with(".fifo");
         Self { url, fifo }
     }
-}
-
-/// Outcome of a run, mirroring the RabbitMQ loop, so `main` can apply the shared
-/// use-after-free exit discipline (destroy on clean join, else leak-on-exit).
-pub struct RunOutcome {
-    pub all_workers_joined: bool,
-    pub fatal: Option<String>,
 }
 
 /// Splits an SQS queue ARN (`arn:<partition>:sqs:<region>:<account>:<name>`)
@@ -235,86 +228,22 @@ pub async fn run(
         }
     };
 
-    // --- Bridge channels (identical to the AMQP path) ------------------------
-    let (work_tx, work_rx) = mpsc::channel::<LoadItem>(threads);
-    let (result_tx, mut result_rx) = mpsc::channel::<Outcome>(threads * 2);
-    let work_rx = Arc::new(Mutex::new(work_rx));
-    let started: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
-    let shutdown_notify = Arc::new(Notify::new());
-    let add_flags = add_record_flags(config.info);
-    let rflags = redo_flags(config.info);
-    let want_info = config.info;
-
-    // --- Redo side (only when redo% > 0) — reuses the core fetcher -----------
-    let redo_in_flight: Arc<Mutex<RedoInFlight>> = Arc::new(Mutex::new(HashMap::new()));
-    let (redo_side, fetcher_handle) = if config.redo_percent > 0 {
-        let (redo_tx, redo_rx) = std::sync::mpsc::sync_channel::<RedoJob>(redo_pref + 2);
-        let redo_rx = Arc::new(Mutex::new(redo_rx));
-        let fetcher_env = env.clone();
-        let sleep_secs = config.redo_sleep_secs;
-        let fetcher_result_tx = result_tx.clone();
-        let fetcher_notify = shutdown_notify.clone();
-        let handle = std::thread::Builder::new()
-            .name("sz-redo-fetcher".to_string())
-            .spawn(move || {
-                fetcher_loop(
-                    fetcher_env,
-                    redo_tx,
-                    sleep_secs,
-                    Some(fetcher_result_tx),
-                    Some(fetcher_notify),
-                    None, // queue mode never self-terminates on an empty redo queue
-                )
-            })
-            .context("failed to spawn redo fetcher thread")?;
-        (
-            Some(RedoSide {
-                redo_rx,
-                in_flight: redo_in_flight.clone(),
-            }),
-            Some(handle),
-        )
-    } else {
-        (None, None)
-    };
-
-    // --- Spawn engine worker threads -----------------------------------------
-    let mut workers = Vec::with_capacity(threads + 1);
-    for worker_id in 0..threads {
-        let class = worker_class(worker_id, redo_pref);
-        let ctx = WorkerCtx {
-            worker_id,
-            class,
-            env: env.clone(),
-            load: Some(LoadSide {
-                work_rx: work_rx.clone(),
-                result_tx: result_tx.clone(),
-                started: started.clone(),
-                shutdown_notify: shutdown_notify.clone(),
-            }),
-            redo: redo_side.clone(),
-            add_flags,
-            redo_flags: rflags,
-            want_info,
-            transform: config.transform.clone(),
-        };
-        let handle = std::thread::Builder::new()
-            .name(format!("sz-worker-{worker_id}"))
-            .spawn(move || worker_loop(ctx))
-            .context("failed to spawn worker thread")?;
-        workers.push(handle);
-    }
-    drop(result_tx);
-    drop(redo_side);
+    // --- Engine pool: bridge channels, redo fetcher (redo% > 0), workers ----
+    let EnginePool {
+        work_tx,
+        mut result_rx,
+        started: _,
+        shutdown_notify,
+        redo_in_flight,
+        threads: engine_threads,
+    } = spawn_engine_pool(config, &env)?;
 
     // --- Stats thread (blocking get_stats only; shared core impl) ------------
-    let (stats_req_tx, stats_req_rx) = std::sync::mpsc::channel::<()>();
-    let (stats_resp_tx, mut stats_resp_rx) = mpsc::channel::<StatsPayload>(1);
-    let stats_env = env.clone();
-    let stats_handle = std::thread::Builder::new()
-        .name("sz-stats".to_string())
-        .spawn(move || stats_loop(stats_env, stats_req_rx, stats_resp_tx))
-        .context("failed to spawn stats thread")?;
+    let StatsThread {
+        req_tx: stats_req_tx,
+        resp_rx: mut stats_resp_rx,
+        handle: stats_handle,
+    } = stats::spawn_stats_thread(&env)?;
 
     // Synthetic id -> in-flight entry for received-but-not-settled messages.
     let in_flight: InFlightMap = Arc::new(Mutex::new(HashMap::new()));
@@ -339,14 +268,9 @@ pub async fn run(
     };
 
     // --- Main loop: signals + outcomes + monitor + stats + delete flush ------
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("failed to install SIGINT handler")?;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("failed to install SIGTERM handler")?;
+    let (mut sigint, mut sigterm) = install_signals()?;
 
-    let monitor_interval = Duration::from_secs(config.long_record_secs.max(2) / 2);
-    let mut monitor = tokio::time::interval(monitor_interval);
-    monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut monitor = monitor_interval(config.long_record_secs);
     let mut flush_tick = tokio::time::interval(DELETE_FLUSH_INTERVAL);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -356,9 +280,7 @@ pub async fn run(
     let mut fatal: Option<String> = None;
     let mut shutting_down = false;
     let mut queue_depth: Option<u32> = None;
-    let mut last_status_at = Instant::now();
-    let mut prev_adds: usize = 0;
-    let mut prev_redos: usize = 0;
+    let mut status = StatusTicker::new(config.redo_percent, load_pref, redo_pref);
 
     loop {
         tokio::select! {
@@ -420,27 +342,7 @@ pub async fn run(
                 queue_depth = approximate_depth(&client, &params.queue_url).await;
             }
             Some(payload) = stats_resp_rx.recv() => {
-                if let Some(engine_stats) = &payload.engine_stats {
-                    // The prefix is MANDATORY: the harness scrapes on "Engine stats:".
-                    println!("Engine stats: {engine_stats}");
-                }
-                let now = Instant::now();
-                let dt = now.duration_since(last_status_at).as_secs_f64().max(0.001);
-                let adds = ADDS_PROCESSED.load(Ordering::Relaxed);
-                let redos = stats::REDOS_PROCESSED.load(Ordering::Relaxed);
-                stats::emit_status_line(&stats::StatusLine {
-                    redo_percent: config.redo_percent,
-                    load_pref,
-                    redo_pref,
-                    adds,
-                    adds_rate: (adds - prev_adds) as f64 / dt,
-                    redos,
-                    redos_rate: (redos - prev_redos) as f64 / dt,
-                    mq_depth: queue_depth,
-                });
-                prev_adds = adds;
-                prev_redos = redos;
-                last_status_at = now;
+                status.on_payload(&payload, queue_depth);
             }
         }
     }
@@ -448,26 +350,11 @@ pub async fn run(
     // --- Shutdown: poller already stopping; bounded worker join --------------
     let _ = poller.await;
     drop(stats_req_tx);
-    workers.push(stats_handle);
-    if let Some(handle) = fetcher_handle {
-        workers.push(handle);
-    }
+    // Unlike RabbitMQ (which detaches it), the stats thread is joined too.
     let join_deadline = Instant::now() + SHUTDOWN_GRACE;
-    while Instant::now() < join_deadline && workers.iter().any(|h| !h.is_finished()) {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let all_workers_joined = workers.iter().all(|h| h.is_finished());
-    if all_workers_joined {
-        for handle in workers {
-            let _ = handle.join();
-        }
-        info!("all engine workers finished; safe to destroy environment");
-    } else {
-        warn!(
-            "shutdown grace elapsed with workers still in engine calls; \
-             skipping environment destroy to avoid use-after-free (leak-on-exit)"
-        );
-    }
+    let all_workers_joined = engine_threads
+        .join_bounded(join_deadline, Some(stats_handle))
+        .await;
 
     // Settled adds whose delete is still pending must not be redelivered.
     deletes.flush(&client, &params.queue_url).await;
@@ -488,13 +375,8 @@ pub async fn run(
         }
     }
 
-    println!(
-        "Processed total of {} adds, {} redo records ({} redo dropped, {} errors)",
-        ADDS_PROCESSED.load(Ordering::Relaxed),
-        stats::REDOS_PROCESSED.load(Ordering::Relaxed),
-        stats::REDOS_DROPPED.load(Ordering::Relaxed),
-        stats::ERRORS.load(Ordering::Relaxed),
-    );
+    // Ack-only total (rejects are not counted, unlike RabbitMQ's `processed`).
+    stats::print_final_totals(ADDS_PROCESSED.load(Ordering::Relaxed) as u64);
 
     Ok(RunOutcome {
         all_workers_joined,
