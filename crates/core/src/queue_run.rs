@@ -61,9 +61,9 @@ where
     // Use-after-free guard (consumer FIX-2): only tear down the Senzing
     // environment when EVERY engine thread actually finished. A startup `Err`
     // from `run` is also treated conservatively as "do not destroy". In every
-    // case we terminate via `process::exit` rather than returning: returning would
-    // drop the tokio runtime and `Arc<env>`, either of which can wedge on a stuck
-    // native thread and overrun the SIGTERM grace (issue #4).
+    // case we terminate via the `runtime` exit helpers rather than returning:
+    // returning would drop the tokio runtime and `Arc<env>`, either of which can
+    // wedge on a stuck native thread and overrun the SIGTERM grace (issue #4).
     match rt.block_on(run) {
         Ok(outcome) => {
             let code = exit_code(&outcome);
