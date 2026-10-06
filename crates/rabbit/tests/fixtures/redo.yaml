@@ -1,0 +1,8 @@
+# Test data for e2e_pure_redoer_100pct in integration_test.rs. The seed is
+# loaded straight through the engine and reliably leaves a redo backlog
+# (asserted > 0 before the redoer runs): all records share one email ("{tag}"
+# makes it run-unique), the first two resolve on name + email, and when the
+# email goes generic for scoring (6th record) Senzing queues REPAIR_ENTITY
+# redo instead of re-resolving inline. "{i}" = 0..n-1, "{name}" = seed_names[i].
+seed_names: ["Andrew Quill", "Andy Quill", "Bruno Marchetti", "Carmen Okafor", "Dmitri Halvorsen", "Esther Nakamura"]
+record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","NAME_FULL":"{name}","EMAIL_ADDRESS":"{tag}@redo.example.com"}'

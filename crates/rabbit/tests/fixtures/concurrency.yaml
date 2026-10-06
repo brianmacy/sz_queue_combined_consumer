@@ -1,0 +1,41 @@
+# Test data for the in-flight-cap and multi-driver e2e tests in
+# integration_test.rs. Record templates: "{tag}" = a per-run prefix, "{i}" =
+# 0..count-1.
+
+# --prefetch is the TOTAL in-flight cap: with 2 slow workers and a backlog, the
+# broker never has more than `prefetch` deliveries unacked to the driver, and
+# every record is still loaded.
+prefetch:
+  queue: sz-combined-prefetch-queue
+  threads: 2
+  prefetch: 4
+  # Plugin sleep per record, milliseconds (keeps a backlog queued).
+  sleep_ms: 1500
+  count: 20
+  # Management API sample cadence (its queue stats refresh every 5 s).
+  sample_every_ms: 500
+  # Bound on the whole backlog being delivered and loaded.
+  loaded_within_secs: 120
+  record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","NAME_FULL":"Prefetch Tester {i}","ADDR_FULL":"{i} Cap St"}'
+
+# Two drivers share one queue; one is SIGKILLed mid-load. Its unacked
+# deliveries are requeued by the broker and the survivor loads them: every
+# record ends up in the repository exactly once and nothing is dead-lettered.
+sigkill:
+  queue: sz-combined-sigkill-queue
+  dead_letter_queue: sz-combined-sigkill-dlq
+  threads: 4
+  # Kept small: the whole e2e suite (RabbitMQ + SQS + ActiveMQ, one fresh
+  # repository) must stay well under the 500-record EVAL license limit.
+  count: 100
+  # SIGKILL one driver once fewer than this many records are still ready
+  # (early: each ready-count probe opens a connection, so the load runs on
+  # while it polls; the test asserts the kill lands mid-load).
+  kill_below_ready: 75
+  # Bound on every record being loaded after the kill.
+  loaded_within_secs: 300
+  record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","NAME_FULL":"Sigkill Tester {i}","EMAIL_ADDRESS":"s1_{i}@example.com","ADDR_FULL":"{i} Crash Ave"}'
+  # Survivor stdout must not contain this (nothing dead-lettered).
+  reject_marker: "REJECTING:"
+  # Survivor stdout lines with this are reported (engine errors).
+  engine_error_marker: "SENZ"

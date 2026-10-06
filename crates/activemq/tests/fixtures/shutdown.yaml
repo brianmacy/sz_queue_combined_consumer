@@ -1,0 +1,56 @@
+# Test data for the ActiveMQ shutdown / failure e2e tests in activemq_e2e.rs
+# (SIGHUP, shutdown deadline, link loss, startup failures). Queue names get
+# the test pid appended so reruns against a long-lived broker never collide.
+
+markers:
+  final_total: "Processed total of "
+  sighup: "SIGHUP received, shutting down gracefully"
+  # An in-worker delivery is released at shutdown and named.
+  left_for_redelivery: "Still processing ("
+  link_lost: "Shutting down due to error: ActiveMQ receive failed (link lost)"
+  connect_failed: "failed to connect to ActiveMQ"
+
+# SIGHUP must shut down exactly like SIGTERM: drain, exit 0, print the total.
+sighup:
+  queue: sz-amq-sighup
+  exit_within_secs: 30
+  records:
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_SIGHUP_0","NAME_FULL":"Sighup Tester 0","ADDR_FULL":"0 Hangup St"}'
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_SIGHUP_1","NAME_FULL":"Sighup Tester 1","ADDR_FULL":"1 Hangup St"}'
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_SIGHUP_2","NAME_FULL":"Sighup Tester 2","ADDR_FULL":"2 Hangup St"}'
+
+# One record blocks a worker (example transform plugin SLEEP_MS) far longer
+# than the 10 s shutdown grace; SIGTERM must still end the process promptly,
+# the delivery must be released (not dead-lettered) and be redeliverable.
+deadline:
+  queue: sz-amq-deadline
+  sleep_ms: 60000
+  # Seconds to let the received record reach a worker before SIGTERM.
+  settle_secs: 2
+  # Hard bound on SIGTERM -> process exit (grace is 10 s).
+  exit_within_secs: 15
+  # Bound on the message being receivable again after the exit.
+  redelivered_within_secs: 30
+  record: '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_DEADLINE_0","NAME_FULL":"Deadline Stuck","ADDR_FULL":"0 Grace St"}'
+
+# The driver reaches the broker through an in-test TCP proxy; cutting every
+# proxied connection mid-run (a held record in a worker) must be fatal: an
+# orderly shutdown with the total line and exit 255; the broker then
+# redelivers the unsettled record.
+link_loss:
+  queue: sz-amq-linkloss
+  sleep_ms: 5000
+  settle_secs: 2
+  exit_code: 255
+  exit_within_secs: 30
+  redelivered_within_secs: 30
+  record: '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_LINKLOSS_0","NAME_FULL":"Link Lost","ADDR_FULL":"0 Proxy Rd"}'
+
+# Startup failures exit non-zero: a wrong password (SASL auth) after engine
+# init (255), a non-AMQP URL scheme before it (1).
+startup:
+  queue: sz-amq-startup
+  wrong_password: not-the-password
+  bad_url: http://localhost:8161
+  bad_url_marker: "amqp:// or amqps://"
+  exit_within_secs: 60

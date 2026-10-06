@@ -48,10 +48,11 @@ ENV LD_LIBRARY_PATH=/opt/senzing/er/lib
 
 WORKDIR /app
 
-# Which workspace binary to build: sz_rabbit_combined_consumer (RabbitMQ, default)
-# or sz_sqs_combined_consumer (Amazon SQS). `cargo build -p ${BIN}` compiles only
-# that bin + its deps, so the RabbitMQ image never pulls the AWS SDK and the SQS
-# image never pulls lapin.
+# Which workspace binary to build: sz_rabbit_combined_consumer (RabbitMQ, default),
+# sz_sqs_combined_consumer (Amazon SQS) or sz_activemq_combined_consumer (Apache
+# ActiveMQ Artemis, AMQP 1.0). `cargo build -p ${BIN}` compiles only that bin +
+# its deps, so each image pulls only its own broker client (lapin / AWS SDK /
+# fe2o3-amqp).
 ARG BIN=sz_rabbit_combined_consumer
 
 # Build the selected binary from the workspace. (The single-crate dummy-src

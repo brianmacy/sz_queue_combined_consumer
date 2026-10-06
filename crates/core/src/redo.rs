@@ -42,10 +42,7 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::record::RecordInfo;
-use crate::stats::{
-    ERRORS, REDO_IN_FLIGHT, REDOS_DROPPED, REDOS_PROCESSED, RUNNING, SAMPLE_REDO_RECORDS,
-    WORKER_FATAL,
-};
+use crate::stats::{ERRORS, REDO_IN_FLIGHT, REDOS_DROPPED, REDOS_PROCESSED, RUNNING, WORKER_FATAL};
 use crate::worker::{Action, Outcome, RedoJob};
 
 /// Monotonic id source for redo jobs (keys the in-flight map).
@@ -190,13 +187,6 @@ pub fn fetcher_loop(
         }
 
         gate.observe(false, false, false); // non-empty probe resets the streak
-
-        if SAMPLE_REDO_RECORDS.load(Ordering::Relaxed) {
-            // Redo-floor guard tripped: sample raw records so the trigger
-            // reason is visible in the log (a constant reason across
-            // iterations is the documented escalate-to-Senzing signal).
-            warn!("redo-floor sample: {record}");
-        }
 
         let id = NEXT_REDO_ID.fetch_add(1, Ordering::Relaxed);
         if send_interruptible(&tx, (id, record)).is_err() {

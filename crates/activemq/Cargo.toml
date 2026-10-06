@@ -1,0 +1,47 @@
+[package]
+name = "sz_activemq_combined_consumer"
+description = "Senzing combined load + redo driver, Apache ActiveMQ Artemis backend (AMQP 1.0 anycast queues; one redo% knob). Shares the engine-processing core with the RabbitMQ and SQS drivers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sz_activemq_combined_consumer"
+path = "src/main.rs"
+
+[dependencies]
+sz-combined-consumer-core.workspace = true
+sz-rust-sdk.workspace = true
+tokio.workspace = true
+# AMQP 1.0 client. NO lapin / AWS SDK here — this bin compiles only its own
+# transport.
+fe2o3-amqp.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# tests/activemq_e2e.rs spawns the binary against a real Artemis broker and
+# drives queues with the same AMQP client. libc: signals via kill(2) (the
+# senzingsdk-runtime CI container has no `kill` executable on PATH).
+libc.workspace = true
+sz-rust-sdk.workspace = true
+fe2o3-amqp.workspace = true
+url.workspace = true
+# net + io-util: the in-test TCP proxy that simulates a broker link loss.
+tokio = { workspace = true, features = ["net", "io-util"] }
+# YAML test fixtures (tests/fixtures/): data in YAML, not hardcoded.
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
+# Jolokia (Artemis management) responses: queue message / delivering counts.
+serde_json.workspace = true
+# Raw AMQP values (fe2o3-amqp's own encoder): sends a message the driver
+# cannot decode, and reads any dead-lettered body without decoding it.
+serde_amqp = "0.18"
+# Example record-transform cdylib (SLEEP_MS holds a worker), dlopened by the
+# shutdown-deadline and in-flight-cap e2e tests.
+sz-record-transform-example = { path = "../transform-example" }

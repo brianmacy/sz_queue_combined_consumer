@@ -16,17 +16,11 @@ use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::redo::{fetcher_loop, interruptible_sleep};
-use crate::stats::{
-    self, ERRORS, Ewma, FloorGuard, GuardTransition, REDOS_DROPPED, REDOS_PROCESSED, RUNNING,
-    SAMPLE_REDO_RECORDS, WORKER_FATAL,
-};
+use crate::stats::{self, ERRORS, REDOS_DROPPED, REDOS_PROCESSED, RUNNING, WORKER_FATAL};
 use crate::worker::{
     Class, RedoInFlight, RedoJob, RedoSide, WorkerCtx, join_workers_bounded,
     monitor_redo_in_flight, redo_flags, worker_loop,
 };
-
-/// EWMA smoothing for the redo-backlog slope (same as the mixed path).
-const SLOPE_EWMA_ALPHA: f64 = 0.3;
 
 /// Runs the pure-redoer topology until SIGINT/SIGTERM (installed by `main`
 /// via `ctrlc`, which flips [`RUNNING`]) or a fatal error.
@@ -117,9 +111,6 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
     };
 
     let interval = Duration::from_secs((config.long_record_secs / 2).max(1));
-    let mut slope = Ewma::new(SLOPE_EWMA_ALPHA);
-    let mut prev_backlog: Option<i64> = None;
-    let mut floor_guard = FloorGuard::default();
     let mut last_status_at = Instant::now();
     let mut prev_redos: usize = 0;
 
@@ -141,15 +132,10 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
         // already detected by the fetcher's get_redo_record() coming back empty.
         // Restore backlog via a cheap source (engine redo counters or DB-side
         // metadata rowcount) — do NOT reintroduce the COUNT(*) scan.
-        let backlog: Option<i64> = None;
 
         let now = Instant::now();
         let dt = now.duration_since(last_status_at).as_secs_f64().max(0.001);
         let redos = REDOS_PROCESSED.load(Ordering::Relaxed);
-        let slope_val = match (backlog, prev_backlog) {
-            (Some(b), Some(p)) => Some(slope.update((b - p) as f64)),
-            _ => slope.value(),
-        };
         stats::emit_status_line(&stats::StatusLine {
             redo_percent: 100,
             load_pref: 0,
@@ -159,32 +145,10 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
             redos,
             redos_rate: (redos - prev_redos) as f64 / dt,
             mq_depth: None, // no AMQP exists; field omitted (design §7)
-            redo_backlog: backlog,
-            redo_backlog_slope: slope_val,
         });
-
-        // The redo-floor guard's "MQ is empty" conjunct is vacuously TRUE here
-        // (no AMQP exists) — the 4.2.4 __REPAIR__ floor was hit precisely by
-        // pure redoers at the drain tail (design §6).
-        match floor_guard.observe(redos, backlog, None) {
-            GuardTransition::Tripped => {
-                warn!(
-                    "redo-floor suspected (possible __REPAIR__ loop): redo progressing \
-                     while backlog stays flat at a small value; sampling raw redo \
-                     records to the log"
-                );
-                SAMPLE_REDO_RECORDS.store(true, Ordering::Relaxed);
-            }
-            GuardTransition::Cleared => {
-                info!("redo-floor condition cleared; stopping redo-record sampling");
-                SAMPLE_REDO_RECORDS.store(false, Ordering::Relaxed);
-            }
-            GuardTransition::Unchanged => {}
-        }
 
         monitor_redo_in_flight(&in_flight, config.long_record_secs, n_workers);
 
-        prev_backlog = backlog;
         prev_redos = redos;
         last_status_at = now;
     }
@@ -206,9 +170,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
         0.0
     };
     println!("Stats: {redos} redo records processed, {rate:.1}/sec, runtime: {elapsed:.0}s");
-    println!(
-        "Processed total of 0 adds, {redos} redo records ({dropped} redo dropped, {errors} errors)"
-    );
+    crate::stats::print_final_totals(0);
     if let Ok(engine_stats) = monitor_engine.get_stats() {
         println!("Engine stats: {engine_stats}");
     }

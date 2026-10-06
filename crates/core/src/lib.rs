@@ -28,7 +28,10 @@
 pub mod config;
 pub mod config_reload;
 pub mod file_loader;
+pub mod pool;
 pub mod pure_redoer;
+pub mod queue_loop;
+pub mod queue_run;
 pub mod record;
 pub mod redo;
 pub mod runtime;
@@ -36,7 +39,4 @@ pub mod stats;
 pub mod transform;
 pub mod worker;
 
-pub use config::{Args, Config};
-
-/// Instance/module name passed to the Senzing environment.
-pub const INSTANCE_NAME: &str = "sz_rabbit_combined_consumer";
+pub use config::{CommonArgs, Config};
