@@ -8,7 +8,8 @@
 //!   skips all redo machinery at redo% = 0).
 //!
 //! Shared bring-up / shutdown / redoer / file-loader logic lives in
-//! `sz_combined_consumer_core::runtime`; only the AMQP load loop is local.
+//! `sz_combined_consumer_core::runtime`, the queue-mode loop in
+//! `sz_combined_consumer_core::queue_loop`; only the AMQP transport is local.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use sz_combined_consumer_core::config::{
 };
 use sz_combined_consumer_core::{queue_run, runtime};
 
-/// RabbitMQ ingestion loop (AMQP-specific; lives in this bin so `lapin` never
+/// RabbitMQ transport (AMQP-specific; lives in this bin so `lapin` never
 /// compiles into the SQS binary).
 mod combined;
 

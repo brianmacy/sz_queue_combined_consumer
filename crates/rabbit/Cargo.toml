@@ -29,5 +29,8 @@ tracing.workspace = true
 # `kill` executable on PATH — Command::new("kill") would fail ENOENT).
 libc.workspace = true
 sz-rust-sdk.workspace = true
+# YAML test fixtures (tests/fixtures/): data in YAML, not hardcoded.
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
 # Example record-transform cdylib, dlopened by the transform e2e test.
 sz-record-transform-example = { path = "../transform-example" }
