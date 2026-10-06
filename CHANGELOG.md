@@ -29,6 +29,22 @@ All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); 
   in-flight cap); requires `SENZING_ACTIVEMQ_URL` and
   `IT_ARTEMIS_JOLOKIA_URL` (management, for queue counts).
 
+### CI / tests
+
+* `ci.yml` `integration` job: new `apache/artemis:2.57.0` service (credentials
+  enforced via `ANONYMOUS_LOGIN=false`, Jolokia exposed; bash `/dev/tcp`
+  health check — the image ships no curl/wget), `SENZING_ACTIVEMQ_URL` /
+  `IT_ARTEMIS_JOLOKIA_URL`, and a step running the ActiveMQ e2e suite after
+  the RabbitMQ and SQS ones. Docker matrix: one `sz_activemq_combined_consumer`
+  row (`both` DB closure only).
+* `IT_REQUIRE_INFRA=1` (set in the CI `integration` job) turns every e2e
+  `SKIP` (missing broker, engine or truth set) into a failure, on all three
+  suites. The RabbitMQ truth-set tests looked for `crates/rabbit/truth-sets`
+  (absent) and so silently skipped in CI; they now resolve the workspace-root
+  `truth-sets` submodule.
+* README: *Tests and CI* table and *Running the e2e tests locally* (docker
+  commands for Postgres, RabbitMQ, ElasticMQ and Artemis, env vars, repo init).
+
 ## Unreleased — release in-worker records at shutdown; `SENZING_PREFETCH` is the total in-flight cap (2026-10-06)
 
 ### BREAKING

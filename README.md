@@ -28,7 +28,7 @@ client (compile-time backend selection — no runtime switch, no feature flags):
 | `sz-record-transform-example` | cdylib | — (example plugin; used by tests) | none |
 
 `cargo build -p sz_rabbit_combined_consumer` never compiles the AWS SDK, and
-`cargo build -p sz_sqs_combined_consumer` never compiles `lapin`. Both binaries
+`cargo build -p sz_sqs_combined_consumer` never compiles `lapin`. All three binaries
 also support the shared **file-input** mode (`--file`, below) and the pure
 redoer (`--redo-percent 100`). The SQS binary takes `--queue-url` /
 `SENZING_SQS_QUEUE_URL` (plus `--visibility-timeout`, `--wait-time`,
@@ -411,6 +411,60 @@ second pass does not append to its own input):
 sz_rabbit_combined_consumer --file /data/records.jsonl.rejected.jsonl \
     --reject-file /data/records.still-rejected.jsonl
 ```
+
+## Tests and CI
+
+| Suite | Command | Needs |
+|---|---|---|
+| unit (all crates) | `cargo test --workspace --lib --bins` | libSz only |
+| RabbitMQ e2e | `cargo test -p sz_rabbit_combined_consumer --test integration_test -- --nocapture --test-threads=1` | RabbitMQ + engine + `truth-sets` submodule |
+| SQS e2e | `cargo test -p sz_sqs_combined_consumer --test sqs_e2e -- --nocapture --test-threads=1` | ElasticMQ + engine |
+| ActiveMQ e2e | `cargo test -p sz_activemq_combined_consumer --test activemq_e2e -- --nocapture --test-threads=1` | Artemis (AMQP + Jolokia) + engine |
+
+`.github/workflows/ci.yml` runs fmt + clippy, the release build + unit tests,
+the three e2e suites in one `integration` job (Postgres, RabbitMQ, ElasticMQ
+and Artemis service containers) and the Docker matrix (every `BIN`; the
+postgres / mssql DB-closure variants on the RabbitMQ and SQS images).
+`--test-threads=1` is required: the engine is a process-global singleton.
+An e2e test whose infrastructure is missing prints `SKIP` and passes, unless
+`IT_REQUIRE_INFRA=1` (set in CI), which turns every skip into a failure.
+
+### Running the e2e tests locally
+
+```console
+# Brokers + Postgres (image tags match ci.yml). Artemis AMQP is mapped to
+# host 5673 because RabbitMQ owns 5672.
+docker run -d --name sz-e2e-postgres -p 55432:5432 \
+  -e POSTGRES_USER=senzing -e POSTGRES_PASSWORD=senzing -e POSTGRES_DB=G2 postgres:16
+docker run -d --name sz-e2e-rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+docker run -d --name sz-e2e-elasticmq -p 9324:9324 softwaremill/elasticmq-native:1.6.11
+docker run -d --name sz-e2e-artemis -p 5673:5672 -p 8161:8161 \
+  -e ARTEMIS_USER=artemis -e ARTEMIS_PASSWORD=artemis -e ANONYMOUS_LOGIN=false \
+  -e EXTRA_ARGS="--http-host 0.0.0.0 --relax-jolokia --no-autotune" \
+  apache/artemis:2.57.0
+
+# macOS (Homebrew Senzing); on Linux use /opt/senzing/er and LD_LIBRARY_PATH.
+export SENZING_ROOT="$(brew --prefix)/opt/senzing/er"
+export DYLD_LIBRARY_PATH="$SENZING_ROOT/lib"
+export SENZING_LIB_PATH="$SENZING_ROOT/lib"
+export SENZING_ENGINE_CONFIGURATION_JSON='{"PIPELINE":{"CONFIGPATH":"'"$SENZING_ROOT"'/etc","RESOURCEPATH":"'"$SENZING_ROOT"'/resources","SUPPORTPATH":"'"$(brew --prefix)"'/opt/senzing/data"},"SQL":{"CONNECTION":"postgresql://senzing:senzing@localhost:55432:G2"}}'
+export IT_PG_DSN=postgresql://senzing:senzing@localhost:55432/G2
+export SENZING_AMQP_URL='amqp://guest:guest@localhost:5672/%2F' SENZING_RABBITMQ_QUEUE=senzing-rabbitmq-queue
+export AWS_ENDPOINT_URL=http://localhost:9324 AWS_ACCESS_KEY_ID=elasticmq AWS_SECRET_ACCESS_KEY=elasticmq AWS_REGION=elasticmq
+export SENZING_ACTIVEMQ_URL=amqp://artemis:artemis@localhost:5673
+export IT_ARTEMIS_JOLOKIA_URL=http://artemis:artemis@localhost:8161/console/jolokia
+export IT_REQUIRE_INFRA=1
+```
+
+Initialize a **fresh** Senzing repository before each full run (the truth-set
+and file-mode redo tests need an empty one): apply
+`$SENZING_ROOT/resources/schema/szcore-schema-postgresql-create.sql` with
+`psql "$IT_PG_DSN"`, install the default config (`sz_setup_config --auto`)
+and register the data sources `CUSTOMERS REFERENCE WATCHLIST TEST SEARCH`
+(`sz_configtool -f -C "addDataSource TEST" … -C save`) — the same steps as
+the `integration` job's init step. Then run the three e2e commands above.
+Queues are created by the tests (unique names per test); Artemis's default
+`DLQ` address receives the ActiveMQ dead-lettered records.
 
 ## License
 
