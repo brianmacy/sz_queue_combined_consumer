@@ -43,18 +43,34 @@ pub struct Delivery {
     pub body: Vec<u8>,
 }
 
-/// Why a delivery is being dead-lettered (lets a backend keep its own log
-/// wording per call site).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why a delivery is being dead-lettered. Its [`Display`](std::fmt::Display)
+/// text is the reason on the `REJECTING:` stdout marker and the dead-letter
+/// metadata a backend can attach (SQS: the `SzReason` message attribute).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeadLetterReason {
-    /// Unparseable body (poison message), never handed to a worker.
-    Malformed,
-    /// A worker reported bad data / timeout.
-    Rejected,
+    /// Unparseable body (poison message), never handed to a worker; carries
+    /// the parse error.
+    Malformed(String),
+    /// A worker reported bad data / timeout; carries the engine (or
+    /// transform) error text.
+    Rejected(String),
     /// Still processing past `2 * LONG_RECORD`.
     LongRecord,
     /// Still inside a worker when the shutdown grace elapsed.
     Shutdown,
+}
+
+impl std::fmt::Display for DeadLetterReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(err) => write!(f, "malformed record: {err}"),
+            Self::Rejected(err) => f.write_str(err),
+            Self::LongRecord => f.write_str("still processing past 2x LONG_RECORD"),
+            Self::Shutdown => f.write_str(
+                "in-flight-in-worker on shutdown (engine call may still complete in background)",
+            ),
+        }
+    }
 }
 
 /// A message broker as seen by [`run`]. Settle methods log their own failures
@@ -103,9 +119,6 @@ pub struct Policy {
     /// call may still complete, so a requeue would double-process). `false`:
     /// [`Transport::release`] it like an unstarted one.
     pub dead_letter_in_worker_at_shutdown: bool,
-    /// Count dead-lettered deliveries in the final `Processed total of` line
-    /// and the throughput line (RabbitMQ). `false`: acks only (SQS).
-    pub count_rejects_in_total: bool,
     /// What the all-workers-stuck warning calls the records
     /// (`All N threads are stuck on long running <label>`); kept per backend
     /// so existing log searches keep matching.
@@ -362,8 +375,8 @@ struct Session<T> {
     transport: T,
     policy: Policy,
     in_flight: HashMap<u64, InFlight>,
-    /// Settled deliveries for the final total: acks, plus rejects when
-    /// [`Policy::count_rejects_in_total`].
+    /// Successful adds (acks) for the final total and the throughput line;
+    /// dead-lettered deliveries are counted in `ADDS_REJECTED` instead.
     processed: u64,
     fatal: Option<String>,
 }
@@ -397,7 +410,7 @@ impl<T: Transport> Session<T> {
         let info = match parse_record(&delivery.body) {
             Ok(info) => info,
             Err(e) => {
-                dead_letter_poison(&mut self.transport, &delivery, &e).await;
+                self.dead_letter_poison(&delivery, &e).await;
                 return false;
             }
         };
@@ -457,20 +470,10 @@ impl<T: Transport> Session<T> {
                 ADDS_PROCESSED.fetch_add(1, Ordering::Relaxed);
                 false
             }
-            Action::RejectNoRequeue => {
-                if !already_rejected {
-                    println!(
-                        "REJECTING due to bad data or timeout: {} : {}",
-                        info.data_source, info.record_id
-                    );
-                    self.transport
-                        .dead_letter(delivery_tag, DeadLetterReason::Rejected)
-                        .await;
-                }
-                if self.policy.count_rejects_in_total {
-                    self.processed += 1;
-                }
-                ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+            Action::RejectNoRequeue(_) if already_rejected => false,
+            Action::RejectNoRequeue(reason) => {
+                self.reject(delivery_tag, &info, DeadLetterReason::Rejected(reason))
+                    .await;
                 false
             }
             Action::Fatal(msg) => {
@@ -521,10 +524,8 @@ impl<T: Transport> Session<T> {
             }
             if let Some(f) = self.in_flight.get_mut(&tag).filter(|f| !f.rejected) {
                 f.rejected = true;
-                println!("REJECTING: {} : {}", f.info.data_source, f.info.record_id);
-                self.transport
-                    .dead_letter(tag, DeadLetterReason::LongRecord)
-                    .await;
+                let info = f.info.clone();
+                self.reject(tag, &info, DeadLetterReason::LongRecord).await;
             }
         }
     }
@@ -542,13 +543,13 @@ impl<T: Transport> Session<T> {
     async fn settle_remainder(&mut self, started: &HashSet<u64>) {
         let remaining: Vec<(u64, InFlight)> = self.in_flight.drain().collect();
         for (tag, record) in remaining {
+            if record.rejected {
+                continue;
+            }
             let RecordInfo {
                 data_source,
                 record_id,
             } = &record.info;
-            if record.rejected {
-                continue;
-            }
             if !started.contains(&tag) {
                 tracing::info!(
                     "leaving queued-but-unstarted delivery unacked (broker requeues on \
@@ -556,12 +557,7 @@ impl<T: Transport> Session<T> {
                 );
                 self.transport.release(tag).await;
             } else if self.policy.dead_letter_in_worker_at_shutdown {
-                tracing::warn!(
-                    "REJECTING in-flight-in-worker on shutdown (engine call may still \
-                     complete in background): {data_source} : {record_id}"
-                );
-                self.transport
-                    .dead_letter(tag, DeadLetterReason::Shutdown)
+                self.reject(tag, &record.info, DeadLetterReason::Shutdown)
                     .await;
             } else {
                 tracing::warn!(
@@ -572,32 +568,49 @@ impl<T: Transport> Session<T> {
             }
         }
     }
+
+    /// The single dead-letter path for every transport and cause: prints the
+    /// one `REJECTING: DS : ID -> reason` stdout marker, counts the record
+    /// as rejected and hands it to [`Transport::dead_letter`].
+    async fn reject(&mut self, tag: u64, info: &RecordInfo, reason: DeadLetterReason) {
+        println!("{}", reject_marker(info, &reason));
+        ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+        self.transport.dead_letter(tag, reason).await;
+    }
+
+    /// The single poison-message path: an unparseable body is never handed to
+    /// a worker; it is logged once (body truncated to [`POISON_EXCERPT_CHARS`])
+    /// and dead-lettered like any reject, and the loop keeps going (consumer
+    /// parity; see record.rs for the rationale).
+    async fn dead_letter_poison(&mut self, delivery: &Delivery, err: &ParseError) {
+        tracing::warn!(
+            "DEAD-LETTERING malformed record: {err} [{}]",
+            poison_excerpt(&delivery.body)
+        );
+        let reason = DeadLetterReason::Malformed(err.to_string());
+        self.reject(delivery.tag, &RecordInfo::empty(), reason)
+            .await;
+    }
 }
 
-/// The single poison-message path: an unparseable body is never handed to a
-/// worker; it is logged (body truncated to 2048 chars) and dead-lettered, and
-/// the loop keeps going (consumer parity; see record.rs for the rationale).
-async fn dead_letter_poison<T: Transport>(
-    transport: &mut T,
-    delivery: &Delivery,
-    err: &ParseError,
-) {
-    tracing::warn!(
-        "DEAD-LETTERING malformed record: {err} [{}]",
-        poison_excerpt(&delivery.body)
-    );
-    transport
-        .dead_letter(delivery.tag, DeadLetterReason::Malformed)
-        .await;
+/// The unified reject marker (identical on every transport).
+fn reject_marker(info: &RecordInfo, reason: &DeadLetterReason) -> String {
+    format!(
+        "REJECTING: {} : {} -> {reason}",
+        info.data_source, info.record_id
+    )
 }
 
-/// First 2048 chars of a (lossily decoded) body, suffixed ` (truncated)` when
-/// cut.
+/// Characters of a poison body quoted in its warning.
+const POISON_EXCERPT_CHARS: usize = 2048;
+
+/// First [`POISON_EXCERPT_CHARS`] chars of a (lossily decoded) body, suffixed
+/// `…truncated` when cut.
 fn poison_excerpt(body: &[u8]) -> String {
     let raw = String::from_utf8_lossy(body);
-    let excerpt: String = raw.chars().take(2048).collect();
+    let excerpt: String = raw.chars().take(POISON_EXCERPT_CHARS).collect();
     if raw.len() > excerpt.len() {
-        format!("{excerpt} (truncated)")
+        format!("{excerpt}…truncated")
     } else {
         excerpt
     }
@@ -622,12 +635,40 @@ mod tests {
     }
 
     #[test]
+    fn reject_marker_names_record_and_reason() {
+        let info = RecordInfo {
+            data_source: "DS".to_string(),
+            record_id: "ID".to_string(),
+        };
+        let engine = DeadLetterReason::Rejected("SENZ2207|bad data source".to_string());
+        assert_eq!(
+            reject_marker(&info, &engine),
+            "REJECTING: DS : ID -> SENZ2207|bad data source"
+        );
+        let poison = DeadLetterReason::Malformed("missing DATA_SOURCE".to_string());
+        assert_eq!(
+            reject_marker(&RecordInfo::empty(), &poison),
+            "REJECTING:  :  -> malformed record: missing DATA_SOURCE"
+        );
+        assert!(
+            DeadLetterReason::Shutdown
+                .to_string()
+                .starts_with("in-flight-in-worker")
+        );
+        assert!(
+            DeadLetterReason::LongRecord
+                .to_string()
+                .contains("LONG_RECORD")
+        );
+    }
+
+    #[test]
     fn poison_excerpt_truncates_at_2048_chars() {
         assert_eq!(poison_excerpt(b"{bad"), "{bad");
         let long = "x".repeat(3000);
         let e = poison_excerpt(long.as_bytes());
-        assert!(e.ends_with(" (truncated)"));
-        assert_eq!(e.len(), 2048 + " (truncated)".len());
+        assert!(e.ends_with("…truncated"));
+        assert_eq!(e.len(), POISON_EXCERPT_CHARS + "…truncated".len());
         // Non-UTF-8 is decoded lossily, never panics.
         assert_eq!(poison_excerpt(&[0xff]), "\u{fffd}");
     }

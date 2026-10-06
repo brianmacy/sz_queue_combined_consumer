@@ -29,7 +29,6 @@ use sz_combined_consumer_core::queue_run::RunOutcome;
 const RABBIT_POLICY: Policy = Policy {
     dead_letter_long_records: true,
     dead_letter_in_worker_at_shutdown: true,
-    count_rejects_in_total: true,
     stuck_records_label: "load records",
 };
 
@@ -161,7 +160,8 @@ impl Transport for RabbitTransport {
     }
 
     /// `basic_reject(requeue=false)`: the queue's dead-letter exchange (if
-    /// any) receives it.
+    /// any) receives it. AMQP reject cannot carry the reason; it is on the
+    /// `REJECTING:` stdout marker the core loop printed.
     async fn dead_letter(&mut self, tag: u64, reason: DeadLetterReason) {
         let Err(e) = self
             .channel
@@ -170,16 +170,9 @@ impl Transport for RabbitTransport {
         else {
             return;
         };
-        match reason {
-            DeadLetterReason::Malformed => {
-                tracing::error!("basic_reject failed for malformed record {tag}: {e:#}");
-            }
-            DeadLetterReason::Rejected => tracing::error!("basic_reject failed for {tag}: {e:#}"),
-            DeadLetterReason::LongRecord => {
-                tracing::error!("basic_reject (long record) failed for {tag}: {e:#}");
-            }
-            // Best effort at shutdown (the connection is about to close).
-            DeadLetterReason::Shutdown => {}
+        // Best effort at shutdown (the connection is about to close).
+        if reason != DeadLetterReason::Shutdown {
+            tracing::error!("basic_reject failed for {tag} ({reason}): {e:#}");
         }
     }
 

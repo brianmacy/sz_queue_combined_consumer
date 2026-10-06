@@ -28,7 +28,8 @@
 //! moves messages that were received `maxReceiveCount` times without being
 //! deleted). So, exactly like `sz_sqs_consumer-v4`, a rejected record is
 //! `SendMessage`d to the dead-letter queue verbatim and only then deleted from
-//! the source. The DLQ is taken from `--dead-letter-queue-url`, else
+//! the source, with the reject reason in the `SzReason` message attribute
+//! (see [`SZ_REASON_ATTRIBUTE`]). The DLQ is taken from `--dead-letter-queue-url`, else
 //! discovered from the source queue's `RedrivePolicy` (`deadLetterTargetArn`
 //! -> `GetQueueUrl`), BEFORE anything is spawned. Without either the driver
 //! refuses to start unless `--allow-no-dlq` is given (bad records would be
@@ -44,7 +45,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -52,7 +52,8 @@ use aws_sdk_sqs::Client;
 use aws_sdk_sqs::config::retry::RetryConfig;
 use aws_sdk_sqs::operation::receive_message::ReceiveMessageOutput;
 use aws_sdk_sqs::types::{
-    DeleteMessageBatchRequestEntry, Message, MessageSystemAttributeName, QueueAttributeName,
+    DeleteMessageBatchRequestEntry, Message, MessageAttributeValue, MessageSystemAttributeName,
+    QueueAttributeName,
 };
 use sz_rust_sdk::prelude::*;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -63,19 +64,26 @@ use sz_combined_consumer_core::config::Config;
 use sz_combined_consumer_core::queue_loop::{self, DeadLetterReason, Delivery, Policy, Transport};
 use sz_combined_consumer_core::queue_run::RunOutcome;
 use sz_combined_consumer_core::record::{RecordInfo, parse_record};
-use sz_combined_consumer_core::stats::ADDS_REJECTED;
 
 use crate::SqsParams;
 
 /// SQS settle policy: extend visibility on long records (never dead-letter
-/// them) and leave in-worker messages for redelivery at shutdown. The final
-/// total counts acks only.
+/// them) and leave in-worker messages for redelivery at shutdown.
 const SQS_POLICY: Policy = Policy {
     dead_letter_long_records: false,
     dead_letter_in_worker_at_shutdown: false,
-    count_rejects_in_total: false,
     stuck_records_label: "records",
 };
+
+/// String message attribute on every DLQ copy carrying why it was rejected
+/// (the engine / parse error text), so the DLQ is triageable without the log.
+pub const SZ_REASON_ATTRIBUTE: &str = "SzReason";
+/// Cap on the `SzReason` value, in bytes (engine errors are short; this
+/// bounds a pathological one).
+const SZ_REASON_MAX_BYTES: usize = 1024;
+/// SQS message size limit the body AND attributes (name + type + value) must
+/// fit together (the classic 256 KiB, the smallest a DLQ may be set to allow).
+const SQS_MAX_MESSAGE_BYTES: usize = 262_144;
 
 /// SQS hard maximum for a message's visibility timeout (12 hours).
 pub const MAX_VISIBILITY_SECS: u64 = 43_200;
@@ -344,11 +352,11 @@ impl SqsTransport {
         let _ = self.delete_tx.send((tag, receipt_handle));
     }
 
-    /// Forwards `m` to the DLQ (v4 parity: `Sending to deadletter`) and, only
-    /// if that succeeded (or no DLQ is configured), deletes the source. On a
-    /// failed `SendMessage` the source is left alone so the visibility timeout
+    /// Forwards `m` to the DLQ (tagged with `reason`) and, only if that
+    /// succeeded (or no DLQ is configured), deletes the source. On a failed
+    /// `SendMessage` the source is left alone so the visibility timeout
     /// redelivers it — never delete what was not preserved.
-    async fn dead_letter_and_delete(&self, tag: u64, m: SqsMessage) {
+    async fn dead_letter_and_delete(&self, tag: u64, m: SqsMessage, reason: &DeadLetterReason) {
         let info = m.info();
         let Some(dl) = &self.dead_letter else {
             warn!(
@@ -360,11 +368,7 @@ impl SqsTransport {
             self.delete(tag, m.receipt_handle);
             return;
         };
-        println!(
-            "Sending to deadletter: {} : {}",
-            info.data_source, info.record_id
-        );
-        match send_to_dead_letter(&self.client, dl, &m, &info).await {
+        match send_to_dead_letter(&self.client, dl, &m, &info, reason).await {
             Ok(()) => self.delete(tag, m.receipt_handle),
             Err(e) => error!(
                 "SendMessage to DLQ {} failed for {} : {}: {e:#}; leaving the source \
@@ -394,14 +398,10 @@ impl Transport for SqsTransport {
 
     async fn dead_letter(&mut self, tag: u64, reason: DeadLetterReason) {
         let Some(m) = self.unsettled.remove(&tag) else {
-            warn!("no unsettled SQS message {tag} ({reason:?}); cannot dead-letter");
+            warn!("no unsettled SQS message {tag} ({reason}); cannot dead-letter");
             return;
         };
-        if reason == DeadLetterReason::Malformed {
-            // Counted here (never reaches a worker), as before the port.
-            ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
-        }
-        self.dead_letter_and_delete(tag, m).await;
+        self.dead_letter_and_delete(tag, m, &reason).await;
     }
 
     /// Leaves the message un-deleted: SQS redelivers it after its visibility
@@ -506,9 +506,18 @@ async fn send_to_dead_letter(
     dl: &DeadLetter,
     m: &SqsMessage,
     info: &RecordInfo,
+    reason: &DeadLetterReason,
 ) -> Result<()> {
     let body = std::str::from_utf8(&m.body).context("non-UTF-8 body cannot be forwarded to SQS")?;
     let mut req = client.send_message().queue_url(&dl.url).message_body(body);
+    if let Some(value) = sz_reason_value(&reason.to_string(), body.len()) {
+        let attr = MessageAttributeValue::builder()
+            .data_type("String")
+            .string_value(value)
+            .build()
+            .context("build SzReason message attribute")?;
+        req = req.message_attributes(SZ_REASON_ATTRIBUTE, attr);
+    }
     if dl.fifo {
         let group = m
             .message_group_id
@@ -521,6 +530,31 @@ async fn send_to_dead_letter(
         req = req.message_group_id(group).message_deduplication_id(dedup);
     }
     req.send().await.map(|_| ()).map_err(anyhow::Error::from)
+}
+
+/// The `SzReason` attribute value for `reason`: characters SQS rejects in
+/// attribute values replaced by a space, then cut (on a char boundary) to
+/// [`SZ_REASON_MAX_BYTES`] and to whatever room a `body_len`-byte body leaves
+/// under [`SQS_MAX_MESSAGE_BYTES`]. `None` when nothing fits.
+fn sz_reason_value(reason: &str, body_len: usize) -> Option<String> {
+    let overhead = body_len + SZ_REASON_ATTRIBUTE.len() + "String".len();
+    let limit = SZ_REASON_MAX_BYTES.min(SQS_MAX_MESSAGE_BYTES.saturating_sub(overhead));
+    let mut value = String::new();
+    for c in reason.chars() {
+        let c = if sqs_attribute_char(c) { c } else { ' ' };
+        if value.len() + c.len_utf8() > limit {
+            break;
+        }
+        value.push(c);
+    }
+    (!value.is_empty()).then_some(value)
+}
+
+/// Whether SQS accepts `c` in a message attribute value (#x9 | #xA | #xD |
+/// #x20-#xD7FF | #xE000-#xFFFD | #x10000-#x10FFFF; Rust `char` already
+/// excludes the surrogates).
+fn sqs_attribute_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r') || (c >= ' ' && c != '\u{fffe}' && c != '\u{ffff}')
 }
 
 /// Background delete batcher: `DeleteMessageBatch` when 10 are pending or
@@ -774,6 +808,21 @@ fn sqs_message(m: Message, slot: OwnedSemaphorePermit) -> Option<SqsMessage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sz_reason_value_sanitizes_and_fits_sqs_limits() {
+        assert_eq!(
+            sz_reason_value("SENZ2207|bad\u{1}source", 10).as_deref(),
+            Some("SENZ2207|bad source")
+        );
+        let long = "é".repeat(SZ_REASON_MAX_BYTES);
+        let v = sz_reason_value(&long, 0).expect("value");
+        assert!(v.len() <= SZ_REASON_MAX_BYTES && v.len() > SZ_REASON_MAX_BYTES - 2);
+        let full = SQS_MAX_MESSAGE_BYTES - SZ_REASON_ATTRIBUTE.len() - "String".len() - 3;
+        assert_eq!(sz_reason_value("abcdef", full).as_deref(), Some("abc"));
+        assert_eq!(sz_reason_value("abc", SQS_MAX_MESSAGE_BYTES), None);
+        assert_eq!(sz_reason_value("", 0), None);
+    }
 
     #[test]
     fn parses_standard_and_partitioned_queue_arns() {

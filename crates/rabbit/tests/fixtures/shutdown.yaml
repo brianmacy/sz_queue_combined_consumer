@@ -4,7 +4,8 @@
 # Lines the driver prints that the tests assert on.
 markers:
   final_total: "Processed total of "
-  shutdown_dead_letter: "REJECTING in-flight-in-worker on shutdown"
+  # The unified reject marker, with the shutdown reason.
+  shutdown_dead_letter: "REJECTING: TEST : E2E_DEADLINE_0 -> in-flight-in-worker on shutdown"
 
 # SIGHUP must shut down exactly like SIGTERM: drain, exit 0, print the total.
 sighup:
