@@ -195,12 +195,14 @@ sz_rabbit_combined_consumer --file records.jsonl \
   record. Deliveries stay unacked / un-deleted so the broker redelivers them
   once the process is restarted.
 * **Fatal errors** (Database, NotInitialized, License, …) → orderly teardown,
-  non-zero exit. Graceful shutdown drains in-flight work within a 10 s grace;
+  non-zero exit. Graceful shutdown (SIGINT, SIGTERM, or — RabbitMQ queue mode —
+  SIGHUP) drains in-flight work within a 10 s grace;
   deliveries still inside a worker are dead-lettered (the engine call may still
   complete — requeue would double-process), queued-but-unstarted deliveries are
   left unacked for broker requeue. If a worker is still inside an
-  uninterruptible engine call after the grace, the native environment destroy
-  is skipped (leak-on-exit over use-after-free).
+  uninterruptible engine call after the grace (the same deadline also bounds
+  the stats-thread join), the native environment destroy is skipped
+  (leak-on-exit over use-after-free).
 * A redo record fetched but not yet processed at crash/shutdown is lost from
   the redo queue's perspective (dequeued at fetch) — the tiny redo channel
   bounds this, and the harness's DB-side `SYS_EVAL_QUEUE` check remains the

@@ -2,6 +2,20 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
+## Unreleased — core queue loop; RabbitMQ ported onto it (2026-10-06)
+
+### Changed
+
+* **SIGHUP is now a graceful shutdown in queue mode (RabbitMQ)**, exactly like
+  SIGINT/SIGTERM (`SIGHUP received, shutting down gracefully`, drain, exit 0).
+  Previously SIGHUP killed the process with the default disposition.
+* RabbitMQ: the stats thread is now joined within the same shutdown deadline
+  as the engine workers instead of being detached (it holds an engine handle).
+* Internal: the queue-mode event loop (in-flight table, engine pool, stats,
+  long-record monitor, depth probe, shutdown) moved to core
+  `queue_loop::run` behind a `Transport` trait; RabbitMQ is now a
+  `RabbitTransport`. No other behavior change.
+
 ## Unreleased — shared args, validate before engine init (2026-10-06)
 
 ### Changed

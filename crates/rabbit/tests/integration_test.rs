@@ -286,18 +286,24 @@ fn rt() -> tokio::runtime::Runtime {
 /// awaiting each publisher confirm so we know the broker has them before the
 /// driver starts. Mirrors `sz_rabbit_publisher`'s confirm-based publish.
 async fn publish_records(url: &str, queue: &str, records: &[String]) -> anyhow::Result<()> {
+    publish_records_with_args(url, queue, lapin::types::FieldTable::default(), records).await
+}
+
+/// [`publish_records`] with explicit queue-declare arguments (e.g. a
+/// dead-letter exchange). Arguments must match any existing queue's.
+async fn publish_records_with_args(
+    url: &str,
+    queue: &str,
+    args: lapin::types::FieldTable,
+    records: &[String],
+) -> anyhow::Result<()> {
     use lapin::options::{BasicPublishOptions, QueueDeclareOptions, QueuePurgeOptions};
-    use lapin::types::FieldTable;
     use lapin::{BasicProperties, Confirmation, Connection, ConnectionProperties};
 
     let conn = Connection::connect(url, ConnectionProperties::default()).await?;
     let channel = conn.create_channel().await?;
     channel
-        .queue_declare(
-            queue.into(),
-            QueueDeclareOptions::default(),
-            FieldTable::default(),
-        )
+        .queue_declare(queue.into(), QueueDeclareOptions::default(), args)
         .await?;
     channel
         .queue_purge(queue.into(), QueuePurgeOptions::default())
@@ -373,12 +379,21 @@ fn driver_bin() -> &'static str {
 /// spawn-a-binary-and-SIGTERM e2e test hung to the 30s SIGKILL — the reason CI
 /// had never gone green. Fail LOUDLY if the syscall reports an error.
 fn sigterm(pid: u32) {
+    send_signal(pid, libc::SIGTERM, "SIGTERM");
+}
+
+/// Send SIGHUP to a child pid (graceful in queue mode, like SIGTERM).
+fn sighup(pid: u32) {
+    send_signal(pid, libc::SIGHUP, "SIGHUP");
+}
+
+fn send_signal(pid: u32, sig: libc::c_int, name: &str) {
     // SAFETY: kill(2) with a valid pid and signal number; no memory involved.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
     assert_eq!(
         rc,
         0,
-        "kill(pid={pid}, SIGTERM) failed: {}",
+        "kill(pid={pid}, {name}) failed: {}",
         std::io::Error::last_os_error()
     );
 }
@@ -1287,4 +1302,242 @@ fn e2e_file_mode_shares_redo_and_exits_when_drained() {
         "test cleanup failed: {cleanup_failures:?}"
     );
     eprintln!("e2e file-mode redo share: {adds} adds, {redos} redo, backlog 0, self-exit");
+}
+
+// ==========================================================================
+// SHUTDOWN e2e — SIGHUP is graceful, and a worker stuck in a long engine-side
+// call cannot keep the process alive past the shutdown deadline. Real broker,
+// real engine, real driver binary; test data in tests/fixtures/shutdown.yaml.
+// ==========================================================================
+
+/// `tests/fixtures/shutdown.yaml`.
+#[derive(serde::Deserialize)]
+struct ShutdownFixture {
+    markers: Markers,
+    sighup: SighupCase,
+    deadline: DeadlineCase,
+}
+
+#[derive(serde::Deserialize)]
+struct Markers {
+    final_total: String,
+    shutdown_dead_letter: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SighupCase {
+    queue: String,
+    exit_within_secs: u64,
+    records: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeadlineCase {
+    queue: String,
+    dead_letter_queue: String,
+    sleep_ms: u64,
+    settle_secs: u64,
+    exit_within_secs: u64,
+    record: String,
+}
+
+fn shutdown_fixture() -> ShutdownFixture {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shutdown.yaml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    serde_norway::from_str(&text).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+}
+
+/// Polls until `queue` has no ready messages (all delivered to the driver).
+fn wait_queue_empty(url: &str, queue: &str, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if let Ok(0) = rt().block_on(queue_ready_count(url, queue)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+/// The add count from the driver's final `Processed total of N adds ...` line.
+fn final_total(stdout: &str, marker: &str) -> usize {
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with(marker))
+        .unwrap_or_else(|| panic!("driver never printed {marker:?}\n{stdout}"));
+    line.trim_start_matches(marker)
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse add count from {line:?}"))
+}
+
+fn read_and_remove(path: &std::path::Path) -> String {
+    let mut out = String::new();
+    let _ = std::fs::File::open(path).and_then(|mut f| f.read_to_string(&mut out));
+    let _ = std::fs::remove_file(path);
+    out
+}
+
+/// SIGHUP in queue mode is a graceful shutdown (previously it killed the
+/// process with the default disposition): drain, exit 0, final total printed.
+#[test]
+fn e2e_rabbit_sighup_is_graceful() {
+    let (Some(_engine), Some(url)) = (engine_config(), amqp_url()) else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_sighup_is_graceful: engine config and/or SENZING_AMQP_URL not set"
+        ));
+        return;
+    };
+    let fx = shutdown_fixture();
+    let case = &fx.sighup;
+    rt().block_on(publish_records(&url, &case.queue, &case.records))
+        .expect("publish SIGHUP records");
+
+    let (mut child, out_path) = spawn_driver(0, 2, Some(&case.queue), "sighup");
+    let drained = wait_queue_empty(&url, &case.queue, Duration::from_secs(120));
+    // Let in-flight deliveries finish + ack before signalling.
+    std::thread::sleep(Duration::from_secs(3));
+    sighup(child.id());
+    let status = wait_bounded(&mut child, Duration::from_secs(case.exit_within_secs));
+    let stdout = read_and_remove(&out_path);
+
+    assert!(drained, "queue did not drain\n{stdout}");
+    let status = status.expect("driver did not exit within bound after SIGHUP");
+    assert!(
+        status.success(),
+        "driver exited non-zero after SIGHUP: {status:?}\n{stdout}"
+    );
+    assert!(
+        stdout.contains("SIGHUP received, shutting down gracefully"),
+        "SIGHUP not handled gracefully\n{stdout}"
+    );
+    let adds = final_total(&stdout, &fx.markers.final_total);
+    assert_eq!(adds, case.records.len(), "all records loaded\n{stdout}");
+    eprintln!("e2e_rabbit_sighup_is_graceful: {adds} loaded, exit 0 on SIGHUP");
+}
+
+/// Deletes then re-creates `queue` dead-lettering (default exchange) into
+/// `dlq`, and publishes `records` to it. Delete-first so a previous run's
+/// arguments can never conflict.
+async fn publish_dead_lettered(
+    url: &str,
+    queue: &str,
+    dlq: &str,
+    records: &[String],
+) -> anyhow::Result<()> {
+    use lapin::options::{QueueDeclareOptions, QueueDeleteOptions};
+    use lapin::types::{AMQPValue, FieldTable};
+    use lapin::{Connection, ConnectionProperties};
+
+    let conn = Connection::connect(url, ConnectionProperties::default()).await?;
+    let channel = conn.create_channel().await?;
+    for q in [queue, dlq] {
+        channel
+            .queue_delete(q.into(), QueueDeleteOptions::default())
+            .await?;
+    }
+    channel
+        .queue_declare(
+            dlq.into(),
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await?;
+    conn.close(0, "dlq declared".into()).await.ok();
+
+    let mut args = FieldTable::default();
+    args.insert(
+        "x-dead-letter-exchange".into(),
+        AMQPValue::LongString("".into()),
+    );
+    args.insert(
+        "x-dead-letter-routing-key".into(),
+        AMQPValue::LongString(dlq.into()),
+    );
+    publish_records_with_args(url, queue, args, records).await
+}
+
+/// A worker blocked far past the 10 s grace (example plugin `SLEEP_MS`) must
+/// not keep the process alive: SIGTERM -> exit within the bound, and the
+/// record still inside the worker is dead-lettered (RabbitMQ policy).
+#[test]
+fn e2e_rabbit_stuck_worker_cannot_outlive_shutdown_deadline() {
+    let (Some(_engine), Some(url)) = (engine_config(), amqp_url()) else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_stuck_worker_cannot_outlive_shutdown_deadline: engine config \
+             and/or SENZING_AMQP_URL not set"
+        ));
+        return;
+    };
+    let fx = shutdown_fixture();
+    let case = &fx.deadline;
+    let records = vec![case.record.clone()];
+    rt().block_on(publish_dead_lettered(
+        &url,
+        &case.queue,
+        &case.dead_letter_queue,
+        &records,
+    ))
+    .expect("declare dead-lettered queue + publish");
+
+    let out_path = std::env::temp_dir().join(format!("sz_e2e_deadline_{}.out", std::process::id()));
+    let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
+    let mut child = Command::new(driver_bin())
+        .env("SENZING_REDO_PERCENT", "0")
+        .env("SENZING_THREADS_PER_PROCESS", "2")
+        .env("SENZING_RABBITMQ_QUEUE", &case.queue)
+        .env(
+            "SENZING_RECORD_TRANSFORM_PLUGIN",
+            example_transform_plugin(),
+        )
+        .env(
+            "SENZING_RECORD_TRANSFORM_CONFIG",
+            format!(r#"{{"SLEEP_MS":{}}}"#, case.sleep_ms),
+        )
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn combined driver binary");
+
+    let delivered = wait_queue_empty(&url, &case.queue, Duration::from_secs(120));
+    std::thread::sleep(Duration::from_secs(case.settle_secs));
+    let signalled_at = Instant::now();
+    sigterm(child.id());
+    let status = wait_bounded(&mut child, Duration::from_secs(case.exit_within_secs));
+    let exit_after = signalled_at.elapsed();
+    let stdout = read_and_remove(&out_path);
+
+    assert!(delivered, "record was never delivered\n{stdout}");
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "driver still alive {}s after SIGTERM (stuck worker outlived the deadline)\n{stdout}",
+            case.exit_within_secs
+        )
+    });
+    assert!(
+        status.success(),
+        "driver exited non-zero: {status:?}\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&fx.markers.shutdown_dead_letter),
+        "in-worker record not dead-lettered at shutdown\n{stdout}"
+    );
+    assert_eq!(final_total(&stdout, &fx.markers.final_total), 0, "{stdout}");
+    let dlq = rt()
+        .block_on(queue_ready_count(&url, &case.dead_letter_queue))
+        .expect("probe DLQ");
+    let source = rt()
+        .block_on(queue_ready_count(&url, &case.queue))
+        .expect("probe source queue");
+    assert_eq!(
+        (dlq, source),
+        (1, 0),
+        "expected the record in the DLQ and not requeued (dlq, source)\n{stdout}"
+    );
+    eprintln!(
+        "e2e_rabbit_stuck_worker_cannot_outlive_shutdown_deadline: exited {exit_after:?} \
+         after SIGTERM, record dead-lettered"
+    );
 }

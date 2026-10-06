@@ -30,6 +30,7 @@ pub mod config_reload;
 pub mod file_loader;
 pub mod pool;
 pub mod pure_redoer;
+pub mod queue_loop;
 pub mod queue_run;
 pub mod record;
 pub mod redo;
