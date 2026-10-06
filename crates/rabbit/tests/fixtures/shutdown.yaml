@@ -1,0 +1,40 @@
+# Test data for the queue-mode shutdown e2e tests in integration_test.rs
+# (SIGHUP is graceful; a stuck worker cannot outlive the shutdown deadline, and
+# its record is requeued, not dead-lettered).
+
+# Lines the driver prints that the tests assert on.
+markers:
+  final_total: "Processed total of "
+  # The in-worker record named as released for redelivery at shutdown.
+  released_in_worker: "): TEST : E2E_DEADLINE_0"
+  released_prefix: "Still processing ("
+  # A released record is not a reject.
+  no_rejects: "(0 rejected, "
+  reject_marker: "REJECTING:"
+
+# SIGHUP must shut down exactly like SIGTERM: drain, exit 0, print the total.
+sighup:
+  queue: sz-combined-sighup-queue
+  # Seconds allowed for the driver to exit after SIGHUP.
+  exit_within_secs: 30
+  records:
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_SIGHUP_0","NAME_FULL":"Sighup Tester 0","ADDR_FULL":"0 Hangup St"}'
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_SIGHUP_1","NAME_FULL":"Sighup Tester 1","ADDR_FULL":"1 Hangup St"}'
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_SIGHUP_2","NAME_FULL":"Sighup Tester 2","ADDR_FULL":"2 Hangup St"}'
+
+# One record blocks a worker (example transform plugin SLEEP_MS) far longer
+# than the 10 s shutdown grace; SIGTERM must still end the process promptly
+# and the in-worker record must be requeued (ready on the source queue again),
+# never dead-lettered.
+deadline:
+  queue: sz-combined-deadline-queue
+  dead_letter_queue: sz-combined-deadline-dlq
+  # Plugin sleep per record, milliseconds.
+  sleep_ms: 60000
+  # Seconds to let the delivered record reach a worker before SIGTERM.
+  settle_secs: 3
+  # Hard bound on SIGTERM -> process exit (grace is 10 s).
+  exit_within_secs: 15
+  # Bound on the requeued record becoming ready again after the exit.
+  requeued_within_secs: 10
+  record: '{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_DEADLINE_0","NAME_FULL":"Deadline Stuck","ADDR_FULL":"0 Grace St"}'

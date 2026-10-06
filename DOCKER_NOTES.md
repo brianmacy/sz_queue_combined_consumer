@@ -168,6 +168,17 @@ additional system shared libraries. The binary is fully self-contained with
 respect to TLS; no `libssl`/`libcrypto` copy is needed beyond what cc-debian13
 already provides for libSz.
 
+## Backend binaries (`BIN`) and the CI Docker matrix
+
+`--build-arg BIN=` selects the workspace binary: `sz_rabbit_combined_consumer`
+(default), `sz_sqs_combined_consumer` or `sz_activemq_combined_consumer`.
+`cargo build -p ${BIN}` compiles only that binary's broker client (lapin /
+AWS SDK / fe2o3-amqp). All three are pure-Rust with rustls, so the runtime
+manifest above is identical for every `BIN`; only the DB-driver closure
+(`WITH_POSTGRES` / `WITH_MSSQL`) changes the image. CI therefore builds the
+postgres / mssql / both variants for RabbitMQ and SQS, and only the default
+`both` closure for ActiveMQ.
+
 ## SQL Server (MSSQL) — partially verified, BLOCKED locally
 
 `libmssqlplugin.so` reaches SQL Server through the unixODBC stack and the

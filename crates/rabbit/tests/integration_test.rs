@@ -14,8 +14,9 @@
 //!   load test (`SENZING_RABBITMQ_QUEUE` names an existing queue).
 //!
 //! Coverage vs the split-driver siblings (this binary subsumes BOTH):
-//!   * pure-logic scheduler behavior — `redo_preferring_count` and topology
-//!     validation at the 0% / 100% endpoints and interior redo% (always run);
+//!   * pure-logic scheduler behavior — `redo_preferring_count` at the 0% / 100%
+//!     endpoints and interior redo% (always run; AMQP topology validation is
+//!     unit-tested in the binary, `src/main.rs`);
 //!   * the LOAD path — `add_record` via the same call the load workers make;
 //!   * the REDO path — `count_redo_records` / `get_redo_record` /
 //!     `process_redo_record`, the same calls the fetcher + redo workers make;
@@ -34,11 +35,26 @@
 
 use std::sync::Arc;
 
-use sz_combined_consumer_core::config::{redo_preferring_count, validate_topology};
+use sz_combined_consumer_core::config::redo_preferring_count;
 use sz_combined_consumer_core::record::{ErrorClass, ParseError, classify_error, parse_record};
 use sz_rust_sdk::prelude::*;
 
 const INSTANCE: &str = "sz_rabbit_combined_consumer_it";
+
+/// True when CI demands real infrastructure (`IT_REQUIRE_INFRA=1`): a test that
+/// cannot run then FAILS instead of printing SKIP and passing.
+fn require_infra() -> bool {
+    std::env::var("IT_REQUIRE_INFRA").is_ok_and(|v| !v.is_empty() && v != "0")
+}
+
+/// Report a skipped test; panic instead when `IT_REQUIRE_INFRA` is set.
+fn skip(reason: std::fmt::Arguments<'_>) {
+    assert!(
+        !require_infra(),
+        "IT_REQUIRE_INFRA set but test cannot run: {reason}"
+    );
+    eprintln!("{reason}");
+}
 
 /// Returns the engine configuration JSON if the environment is fully set up for
 /// a real Senzing test, otherwise `None` (test is skipped).
@@ -87,22 +103,6 @@ fn scheduler_endpoint_and_interior_splits() {
     assert_eq!(redo_preferring_count(12, 99), 11);
 }
 
-/// Topology validation is the loud startup gate (design §5): AMQP is required
-/// below 100%, and an interior redo% needs at least two workers to host both
-/// preference classes. The 100% endpoint runs with AMQP entirely unset.
-#[test]
-fn scheduler_topology_validation() {
-    // redo% < 100 requires URL + queue.
-    assert!(validate_topology(12, 0, None, None).is_err());
-    assert!(validate_topology(12, 20, Some("amqp://h"), None).is_err());
-    assert!(validate_topology(12, 20, Some("amqp://h"), Some("q")).is_ok());
-    // Interior redo% needs >= 2 workers.
-    assert!(validate_topology(1, 20, Some("amqp://h"), Some("q")).is_err());
-    assert!(validate_topology(2, 20, Some("amqp://h"), Some("q")).is_ok());
-    // 100% pure redoer: no AMQP needed, single worker allowed.
-    assert!(validate_topology(1, 100, None, None).is_ok());
-}
-
 // --------------------------------------------------------------------------
 // Real-engine tests (skipped without SENZING_ENGINE_CONFIGURATION_JSON).
 // --------------------------------------------------------------------------
@@ -113,10 +113,10 @@ fn scheduler_topology_validation() {
 #[test]
 fn real_engine_load_path_add_record() {
     let Some(config) = engine_config() else {
-        eprintln!(
+        skip(format_args!(
             "SKIP real_engine_load_path_add_record: SENZING_ENGINE_CONFIGURATION_JSON not set \
              (requires /opt/senzing + an initialized backend)"
-        );
+        ));
         return;
     };
 
@@ -153,7 +153,9 @@ fn real_engine_load_path_add_record() {
 #[test]
 fn real_engine_redo_path() {
     let Some(config) = engine_config() else {
-        eprintln!("SKIP real_engine_redo_path: engine config not set");
+        skip(format_args!(
+            "SKIP real_engine_redo_path: engine config not set"
+        ));
         return;
     };
 
@@ -209,7 +211,9 @@ fn real_engine_redo_path() {
 #[test]
 fn real_engine_bad_record_is_dead_lettered() {
     let Some(config) = engine_config() else {
-        eprintln!("SKIP real_engine_bad_record_is_dead_lettered: engine config not set");
+        skip(format_args!(
+            "SKIP real_engine_bad_record_is_dead_lettered: engine config not set"
+        ));
         return;
     };
 
@@ -282,18 +286,24 @@ fn rt() -> tokio::runtime::Runtime {
 /// awaiting each publisher confirm so we know the broker has them before the
 /// driver starts. Mirrors `sz_rabbit_publisher`'s confirm-based publish.
 async fn publish_records(url: &str, queue: &str, records: &[String]) -> anyhow::Result<()> {
+    publish_records_with_args(url, queue, lapin::types::FieldTable::default(), records).await
+}
+
+/// [`publish_records`] with explicit queue-declare arguments (e.g. a
+/// dead-letter exchange). Arguments must match any existing queue's.
+async fn publish_records_with_args(
+    url: &str,
+    queue: &str,
+    args: lapin::types::FieldTable,
+    records: &[String],
+) -> anyhow::Result<()> {
     use lapin::options::{BasicPublishOptions, QueueDeclareOptions, QueuePurgeOptions};
-    use lapin::types::FieldTable;
     use lapin::{BasicProperties, Confirmation, Connection, ConnectionProperties};
 
     let conn = Connection::connect(url, ConnectionProperties::default()).await?;
     let channel = conn.create_channel().await?;
     channel
-        .queue_declare(
-            queue.into(),
-            QueueDeclareOptions::default(),
-            FieldTable::default(),
-        )
+        .queue_declare(queue.into(), QueueDeclareOptions::default(), args)
         .await?;
     channel
         .queue_purge(queue.into(), QueuePurgeOptions::default())
@@ -369,12 +379,21 @@ fn driver_bin() -> &'static str {
 /// spawn-a-binary-and-SIGTERM e2e test hung to the 30s SIGKILL — the reason CI
 /// had never gone green. Fail LOUDLY if the syscall reports an error.
 fn sigterm(pid: u32) {
+    send_signal(pid, libc::SIGTERM, "SIGTERM");
+}
+
+/// Send SIGHUP to a child pid (graceful in queue mode, like SIGTERM).
+fn sighup(pid: u32) {
+    send_signal(pid, libc::SIGHUP, "SIGHUP");
+}
+
+fn send_signal(pid: u32, sig: libc::c_int, name: &str) {
     // SAFETY: kill(2) with a valid pid and signal number; no memory involved.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
     assert_eq!(
         rc,
         0,
-        "kill(pid={pid}, SIGTERM) failed: {}",
+        "kill(pid={pid}, {name}) failed: {}",
         std::io::Error::last_os_error()
     );
 }
@@ -406,10 +425,10 @@ fn wait_bounded(
 /// then SIGTERMs and asserts a clean exit that loaded all N records.
 fn run_combined_e2e(redo_percent: u8) {
     let (Some(engine), Some(url)) = (engine_config(), amqp_url()) else {
-        eprintln!(
+        skip(format_args!(
             "SKIP run_combined_e2e({redo_percent}): SENZING_ENGINE_CONFIGURATION_JSON \
              and/or SENZING_AMQP_URL not set (requires the isolated test broker + DB)"
-        );
+        ));
         return;
     };
     let _ = &engine; // inherited into the child via the process environment.
@@ -503,36 +522,57 @@ fn e2e_combined_mixed_20pct() {
     run_combined_e2e(20);
 }
 
+/// Seed for the pure-redoer e2e (`tests/fixtures/redo.yaml`).
+#[derive(serde::Deserialize)]
+struct RedoSeedFixture {
+    seed_names: Vec<String>,
+    record_template: String,
+}
+
 /// 100% = pure redoer endpoint: no AMQP is opened, no tokio runtime is built;
 /// the binary runs the pure `std::thread` fetcher + redo-worker + monitor
 /// shape and drains the redo queue. We seed redo work via the real engine
-/// first, run the redoer, then SIGTERM and assert a clean exit with the redo
-/// backlog drained to zero.
+/// first (`tests/fixtures/redo.yaml`) and assert a NON-ZERO backlog, run the
+/// redoer, then SIGTERM and assert a clean exit with the redo backlog drained
+/// to zero.
 #[test]
 fn e2e_pure_redoer_100pct() {
     let Some(engine_cfg) = engine_config() else {
-        eprintln!("SKIP e2e_pure_redoer_100pct: engine config not set");
+        skip(format_args!(
+            "SKIP e2e_pure_redoer_100pct: engine config not set"
+        ));
         return;
     };
 
-    // Seed: add a batch of records through the real engine; add_record enqueues
-    // redo for affected entities, giving the redoer something to drain. (Even
-    // if the backend produces no redo, the run still exercises the full
-    // fetcher/worker/monitor/graceful-shutdown path.)
+    // Seed: records whose shared email goes generic, so the engine queues
+    // redo for the entity that resolved on it (see redo.yaml).
     let env: Arc<SzEnvironmentCore> = SzEnvironmentCore::get_instance(INSTANCE, &engine_cfg, false)
         .expect("failed to initialize Senzing environment");
     let engine = env.get_engine().expect("failed to get engine handle");
-    for rec in make_records("E2E_REDO_SEED", 12) {
+    let seed: RedoSeedFixture = load_fixture("redo.yaml");
+    let tag = run_tag("E2E_REDO_SEED");
+    for (i, name) in seed.seed_names.iter().enumerate() {
+        let rec = seed
+            .record_template
+            .replace("{tag}", &tag)
+            .replace("{i}", &i.to_string())
+            .replace("{name}", name);
         let info = parse_record(rec.as_bytes()).expect("seed record parses");
-        let _ = engine.add_record(
-            &info.data_source,
-            &info.record_id,
-            &rec,
-            Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
-        );
+        engine
+            .add_record(
+                &info.data_source,
+                &info.record_id,
+                &rec,
+                Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
+            )
+            .expect("seed record loads");
     }
-    let backlog_before = engine.count_redo_records().unwrap_or(0);
+    let backlog_before = engine.count_redo_records().expect("count redo");
     eprintln!("e2e_pure_redoer_100pct: redo backlog before = {backlog_before}");
+    assert!(
+        backlog_before > 0,
+        "the seed must leave a redo backlog for the redoer to drain"
+    );
 
     let out_path = std::env::temp_dir().join(format!("sz_e2e_redoer_{}.out", std::process::id()));
     let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
@@ -596,7 +636,7 @@ fn e2e_pure_redoer_100pct() {
 #[test]
 fn e2e_file_loader() {
     let Some(_engine_cfg) = engine_config() else {
-        eprintln!("SKIP e2e_file_loader: engine config not set");
+        skip(format_args!("SKIP e2e_file_loader: engine config not set"));
         return;
     };
 
@@ -700,7 +740,11 @@ fn example_transform_plugin() -> String {
         .parent()
         .expect("deps dir")
         .to_path_buf();
-    let p = deps.join("libsz_record_transform_example.so");
+    let p = deps.join(format!(
+        "{}sz_record_transform_example.{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_EXTENSION
+    ));
     assert!(p.exists(), "example transform plugin not built at {p:?}");
     p.to_string_lossy().into_owned()
 }
@@ -712,7 +756,9 @@ fn example_transform_plugin() -> String {
 #[test]
 fn e2e_file_loader_record_transform() {
     let Some(config) = engine_config() else {
-        eprintln!("SKIP e2e_file_loader_record_transform: engine config not set");
+        skip(format_args!(
+            "SKIP e2e_file_loader_record_transform: engine config not set"
+        ));
         return;
     };
 
@@ -930,7 +976,7 @@ fn spawn_driver(
 }
 
 /// Resolve the demo truth-set directory: `IT_TRUTHSET_DIR` if set, else the
-/// vendored git submodule at `<crate>/truth-sets/truthsets/demo`. Returns
+/// vendored git submodule at `<workspace>/truth-sets/truthsets/demo`. Returns
 /// `None` (test skips) when neither exists — e.g. the submodule was not checked
 /// out (`git submodule update --init`).
 fn truthset_dir() -> Option<std::path::PathBuf> {
@@ -938,7 +984,7 @@ fn truthset_dir() -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(d));
     }
     let submodule =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("truth-sets/truthsets/demo");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../truth-sets/truthsets/demo");
     submodule
         .join("customers.jsonl")
         .exists()
@@ -953,11 +999,11 @@ fn e2e_truthset_resolution_and_redo_drain() {
         truthset_dir(),
         env_nonempty("IT_PG_DSN"),
     ) else {
-        eprintln!(
+        skip(format_args!(
             "SKIP e2e_truthset_resolution_and_redo_drain: needs SENZING_ENGINE_CONFIGURATION_JSON, \
              SENZING_AMQP_URL, IT_PG_DSN (libpq DSN for psql), and the demo truth set (git \
              submodule at truth-sets/truthsets/demo, or IT_TRUTHSET_DIR)"
-        );
+        ));
         return;
     };
 
@@ -1130,11 +1176,11 @@ fn e2e_truthset_resolution_and_redo_drain() {
 #[test]
 fn e2e_file_mode_shares_redo_and_exits_when_drained() {
     let (Some(engine_cfg), Some(dir)) = (engine_config(), truthset_dir()) else {
-        eprintln!(
+        skip(format_args!(
             "SKIP e2e_file_mode_shares_redo_and_exits_when_drained: needs \
              SENZING_ENGINE_CONFIGURATION_JSON and the demo truth set (git submodule at \
              truth-sets/truthsets/demo, or IT_TRUTHSET_DIR)"
-        );
+        ));
         return;
     };
 
@@ -1275,4 +1321,709 @@ fn e2e_file_mode_shares_redo_and_exits_when_drained() {
         "test cleanup failed: {cleanup_failures:?}"
     );
     eprintln!("e2e file-mode redo share: {adds} adds, {redos} redo, backlog 0, self-exit");
+}
+
+// ==========================================================================
+// SHUTDOWN e2e — SIGHUP is graceful, and a worker stuck in a long engine-side
+// call cannot keep the process alive past the shutdown deadline. Real broker,
+// real engine, real driver binary; test data in tests/fixtures/shutdown.yaml.
+// ==========================================================================
+
+/// `tests/fixtures/shutdown.yaml`.
+#[derive(serde::Deserialize)]
+struct ShutdownFixture {
+    markers: Markers,
+    sighup: SighupCase,
+    deadline: DeadlineCase,
+}
+
+#[derive(serde::Deserialize)]
+struct Markers {
+    final_total: String,
+    released_in_worker: String,
+    released_prefix: String,
+    no_rejects: String,
+    reject_marker: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SighupCase {
+    queue: String,
+    exit_within_secs: u64,
+    records: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct DeadlineCase {
+    queue: String,
+    dead_letter_queue: String,
+    sleep_ms: u64,
+    settle_secs: u64,
+    exit_within_secs: u64,
+    requeued_within_secs: u64,
+    record: String,
+}
+
+/// Parses `tests/fixtures/<name>` (YAML test data).
+fn load_fixture<T: serde::de::DeserializeOwned>(name: &str) -> T {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    serde_norway::from_str(&text).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+}
+
+fn shutdown_fixture() -> ShutdownFixture {
+    load_fixture("shutdown.yaml")
+}
+
+/// Polls until `queue` has no ready messages (all delivered to the driver).
+fn wait_queue_empty(url: &str, queue: &str, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if let Ok(0) = rt().block_on(queue_ready_count(url, queue)) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+/// The add count from the driver's final `Processed total of N adds ...` line.
+fn final_total(stdout: &str, marker: &str) -> usize {
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with(marker))
+        .unwrap_or_else(|| panic!("driver never printed {marker:?}\n{stdout}"));
+    line.trim_start_matches(marker)
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse add count from {line:?}"))
+}
+
+fn read_and_remove(path: &std::path::Path) -> String {
+    let mut out = String::new();
+    let _ = std::fs::File::open(path).and_then(|mut f| f.read_to_string(&mut out));
+    let _ = std::fs::remove_file(path);
+    out
+}
+
+/// SIGHUP in queue mode is a graceful shutdown (previously it killed the
+/// process with the default disposition): drain, exit 0, final total printed.
+#[test]
+fn e2e_rabbit_sighup_is_graceful() {
+    let (Some(_engine), Some(url)) = (engine_config(), amqp_url()) else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_sighup_is_graceful: engine config and/or SENZING_AMQP_URL not set"
+        ));
+        return;
+    };
+    let fx = shutdown_fixture();
+    let case = &fx.sighup;
+    rt().block_on(publish_records(&url, &case.queue, &case.records))
+        .expect("publish SIGHUP records");
+
+    let (mut child, out_path) = spawn_driver(0, 2, Some(&case.queue), "sighup");
+    let drained = wait_queue_empty(&url, &case.queue, Duration::from_secs(120));
+    // Let in-flight deliveries finish + ack before signalling.
+    std::thread::sleep(Duration::from_secs(3));
+    sighup(child.id());
+    let status = wait_bounded(&mut child, Duration::from_secs(case.exit_within_secs));
+    let stdout = read_and_remove(&out_path);
+
+    assert!(drained, "queue did not drain\n{stdout}");
+    let status = status.expect("driver did not exit within bound after SIGHUP");
+    assert!(
+        status.success(),
+        "driver exited non-zero after SIGHUP: {status:?}\n{stdout}"
+    );
+    assert!(
+        stdout.contains("SIGHUP received, shutting down gracefully"),
+        "SIGHUP not handled gracefully\n{stdout}"
+    );
+    let adds = final_total(&stdout, &fx.markers.final_total);
+    assert_eq!(adds, case.records.len(), "all records loaded\n{stdout}");
+    eprintln!("e2e_rabbit_sighup_is_graceful: {adds} loaded, exit 0 on SIGHUP");
+}
+
+/// Deletes then re-creates `queue` dead-lettering (default exchange) into
+/// `dlq`, and publishes `records` to it. Delete-first so a previous run's
+/// arguments can never conflict.
+async fn publish_dead_lettered(
+    url: &str,
+    queue: &str,
+    dlq: &str,
+    records: &[String],
+) -> anyhow::Result<()> {
+    use lapin::options::{QueueDeclareOptions, QueueDeleteOptions};
+    use lapin::types::{AMQPValue, FieldTable};
+    use lapin::{Connection, ConnectionProperties};
+
+    let conn = Connection::connect(url, ConnectionProperties::default()).await?;
+    let channel = conn.create_channel().await?;
+    for q in [queue, dlq] {
+        channel
+            .queue_delete(q.into(), QueueDeleteOptions::default())
+            .await?;
+    }
+    channel
+        .queue_declare(
+            dlq.into(),
+            QueueDeclareOptions::default(),
+            FieldTable::default(),
+        )
+        .await?;
+    conn.close(0, "dlq declared".into()).await.ok();
+
+    let mut args = FieldTable::default();
+    args.insert(
+        "x-dead-letter-exchange".into(),
+        AMQPValue::LongString("".into()),
+    );
+    args.insert(
+        "x-dead-letter-routing-key".into(),
+        AMQPValue::LongString(dlq.into()),
+    );
+    publish_records_with_args(url, queue, args, records).await
+}
+
+/// What a SIGTERM during a stuck worker left behind.
+struct DeadlineRun {
+    status: Option<std::process::ExitStatus>,
+    exit_after: Duration,
+    delivered: bool,
+    stdout: String,
+}
+
+/// Spawns `cmd` with stdout captured to a temp file tagged `tag`.
+fn spawn_captured(cmd: &mut Command, tag: &str) -> (std::process::Child, std::path::PathBuf) {
+    let out_path = std::env::temp_dir().join(format!("sz_e2e_{tag}_{}.out", std::process::id()));
+    let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
+    let child = cmd
+        .stdout(Stdio::from(out_file))
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn driver ({tag}): {e}"));
+    (child, out_path)
+}
+
+/// A driver whose every load record sleeps `sleep_ms` in the worker (example
+/// transform plugin), consuming `queue` with `threads` workers at redo% 0.
+fn sleepy_driver(queue: &str, threads: usize, sleep_ms: u64) -> Command {
+    let mut cmd = Command::new(driver_bin());
+    cmd.env("SENZING_REDO_PERCENT", "0")
+        .env("SENZING_THREADS_PER_PROCESS", threads.to_string())
+        .env("SENZING_RABBITMQ_QUEUE", queue)
+        .env(
+            "SENZING_RECORD_TRANSFORM_PLUGIN",
+            example_transform_plugin(),
+        )
+        .env(
+            "SENZING_RECORD_TRANSFORM_CONFIG",
+            format!(r#"{{"SLEEP_MS":{sleep_ms}}}"#),
+        );
+    cmd
+}
+
+/// Publishes the deadline record to a dead-lettered queue, lets it reach a
+/// worker that sleeps far past the 10 s grace, then SIGTERMs the driver.
+fn run_stuck_worker(url: &str, case: &DeadlineCase, tag: &str) -> DeadlineRun {
+    rt().block_on(publish_dead_lettered(
+        url,
+        &case.queue,
+        &case.dead_letter_queue,
+        std::slice::from_ref(&case.record),
+    ))
+    .expect("declare dead-lettered queue + publish");
+    let (mut child, out_path) =
+        spawn_captured(&mut sleepy_driver(&case.queue, 2, case.sleep_ms), tag);
+    let delivered = wait_queue_empty(url, &case.queue, Duration::from_secs(120));
+    std::thread::sleep(Duration::from_secs(case.settle_secs));
+    let signalled_at = Instant::now();
+    sigterm(child.id());
+    let status = wait_bounded(&mut child, Duration::from_secs(case.exit_within_secs));
+    DeadlineRun {
+        status,
+        exit_after: signalled_at.elapsed(),
+        delivered,
+        stdout: read_and_remove(&out_path),
+    }
+}
+
+/// A worker blocked far past the 10 s grace (example plugin `SLEEP_MS`) must
+/// not keep the process alive: SIGTERM -> clean exit within the bound.
+#[test]
+fn e2e_rabbit_stuck_worker_cannot_outlive_shutdown_deadline() {
+    let (Some(_engine), Some(url)) = (engine_config(), amqp_url()) else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_stuck_worker_cannot_outlive_shutdown_deadline: engine config \
+             and/or SENZING_AMQP_URL not set"
+        ));
+        return;
+    };
+    let fx = shutdown_fixture();
+    let case = &fx.deadline;
+    let run = run_stuck_worker(&url, case, "deadline");
+    let stdout = &run.stdout;
+
+    assert!(run.delivered, "record was never delivered\n{stdout}");
+    let status = run.status.unwrap_or_else(|| {
+        panic!(
+            "driver still alive {}s after SIGTERM (stuck worker outlived the deadline)\n{stdout}",
+            case.exit_within_secs
+        )
+    });
+    assert!(
+        status.success(),
+        "driver exited non-zero: {status:?}\n{stdout}"
+    );
+    assert_eq!(final_total(stdout, &fx.markers.final_total), 0, "{stdout}");
+    eprintln!(
+        "e2e_rabbit_stuck_worker_cannot_outlive_shutdown_deadline: exited {:?} after SIGTERM",
+        run.exit_after
+    );
+}
+
+/// A record still inside a worker when the shutdown grace elapses is released
+/// for redelivery (re-adding it is idempotent), never dead-lettered: after the
+/// exit the DLQ is empty, the record is ready on the source queue again, it is
+/// named `Still processing (…): DS : ID` and not counted as rejected.
+#[test]
+fn e2e_rabbit_in_worker_record_is_requeued_at_shutdown() {
+    let (Some(_engine), Some(url)) = (engine_config(), amqp_url()) else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_in_worker_record_is_requeued_at_shutdown: engine config and/or \
+             SENZING_AMQP_URL not set"
+        ));
+        return;
+    };
+    let fx = shutdown_fixture();
+    let case = &fx.deadline;
+    let run = run_stuck_worker(&url, case, "requeue");
+    let stdout = &run.stdout;
+    let deadline = Instant::now() + Duration::from_secs(case.requeued_within_secs);
+    let source_ready = || {
+        rt().block_on(queue_ready_count(&url, &case.queue))
+            .expect("probe source queue")
+    };
+    while source_ready() != 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let source = source_ready();
+    let dlq = rt()
+        .block_on(queue_ready_count(&url, &case.dead_letter_queue))
+        .expect("probe DLQ");
+
+    assert!(run.delivered, "record was never delivered\n{stdout}");
+    let status = run
+        .status
+        .expect("driver did not exit within bound after SIGTERM");
+    assert!(status.success(), "driver exited {status:?}\n{stdout}");
+    assert_eq!(
+        (dlq, source),
+        (0, 1),
+        "expected the in-worker record requeued, not dead-lettered (dlq, source)\n{stdout}"
+    );
+    let released = stdout
+        .lines()
+        .find(|l| l.starts_with(&fx.markers.released_prefix))
+        .unwrap_or_else(|| panic!("in-worker record not named at shutdown\n{stdout}"));
+    assert!(
+        released.ends_with(&fx.markers.released_in_worker),
+        "{released:?}\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(&fx.markers.reject_marker),
+        "a released record must not be rejected\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&fx.markers.no_rejects),
+        "a released record must not be counted as rejected\n{stdout}"
+    );
+    eprintln!(
+        "e2e_rabbit_in_worker_record_is_requeued_at_shutdown: {released}; requeued, DLQ empty"
+    );
+}
+
+// ==========================================================================
+// REJECT e2e — total line, poison handling, reject marker. Real broker, real
+// engine, real driver binary; test data in tests/fixtures/rejects.yaml.
+// ==========================================================================
+
+/// `tests/fixtures/rejects.yaml`.
+#[derive(serde::Deserialize)]
+struct RejectsFixture {
+    queue: String,
+    dead_letter_queue: String,
+    valid: String,
+    unparseable: String,
+    engine_reject: String,
+    drain_within_secs: u64,
+    markers: RejectMarkers,
+}
+
+#[derive(serde::Deserialize)]
+struct RejectMarkers {
+    final_total: String,
+    rejected: String,
+    engine_reject: String,
+    poison_warn: String,
+    poison_reject: String,
+}
+
+fn rejects_fixture() -> RejectsFixture {
+    load_fixture("rejects.yaml")
+}
+
+/// Takes (acks) every ready message of `queue` and returns the bodies.
+async fn drain_bodies(url: &str, queue: &str) -> anyhow::Result<Vec<String>> {
+    use lapin::options::BasicGetOptions;
+    use lapin::{Connection, ConnectionProperties};
+
+    let conn = Connection::connect(url, ConnectionProperties::default()).await?;
+    let channel = conn.create_channel().await?;
+    let mut bodies = Vec::new();
+    while let Some(msg) = channel
+        .basic_get(queue.into(), BasicGetOptions { no_ack: true })
+        .await?
+    {
+        bodies.push(String::from_utf8_lossy(&msg.delivery.data).into_owned());
+    }
+    conn.close(0, "drain done".into()).await.ok();
+    Ok(bodies)
+}
+
+/// One valid, one unparseable and one engine-rejected record: the final line
+/// counts 1 add and 2 rejected, both bad messages land in the DLQ verbatim,
+/// and each carries the unified `REJECTING:` marker on stdout.
+#[test]
+fn e2e_rabbit_rejects_are_counted_and_dead_lettered() {
+    let (Some(_engine), Some(url)) = (engine_config(), amqp_url()) else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_rejects_are_counted_and_dead_lettered: engine config and/or \
+             SENZING_AMQP_URL not set"
+        ));
+        return;
+    };
+    let fx = rejects_fixture();
+    let records = vec![
+        fx.valid.clone(),
+        fx.unparseable.clone(),
+        fx.engine_reject.clone(),
+    ];
+    rt().block_on(publish_dead_lettered(
+        &url,
+        &fx.queue,
+        &fx.dead_letter_queue,
+        &records,
+    ))
+    .expect("declare dead-lettered queue + publish");
+
+    let (mut child, out_path) = spawn_driver(0, 2, Some(&fx.queue), "rejects");
+    let drained = wait_queue_empty(&url, &fx.queue, Duration::from_secs(fx.drain_within_secs));
+    // Let in-flight deliveries settle before signalling.
+    std::thread::sleep(Duration::from_secs(3));
+    sigterm(child.id());
+    let status = wait_bounded(&mut child, Duration::from_secs(30));
+    let stdout = read_and_remove(&out_path);
+    let mut dead_lettered = rt()
+        .block_on(drain_bodies(&url, &fx.dead_letter_queue))
+        .expect("drain DLQ");
+
+    assert!(drained, "queue did not drain\n{stdout}");
+    let status = status.expect("driver did not exit within bound after SIGTERM");
+    assert!(status.success(), "driver exited {status:?}\n{stdout}");
+    let total = stdout
+        .lines()
+        .find(|l| l.starts_with(&fx.markers.final_total))
+        .unwrap_or_else(|| panic!("expected {:?}\n{stdout}", fx.markers.final_total));
+    assert!(
+        total.contains(&fx.markers.rejected),
+        "expected {:?} in {total:?}\n{stdout}",
+        fx.markers.rejected
+    );
+    for marker in [
+        &fx.markers.engine_reject,
+        &fx.markers.poison_warn,
+        &fx.markers.poison_reject,
+    ] {
+        assert!(
+            stdout.contains(marker.as_str()),
+            "missing {marker:?}\n{stdout}"
+        );
+    }
+    let mut want = vec![fx.unparseable.clone(), fx.engine_reject.clone()];
+    dead_lettered.sort();
+    want.sort();
+    assert_eq!(dead_lettered, want, "DLQ content mismatch\n{stdout}");
+    eprintln!("e2e_rabbit_rejects_are_counted_and_dead_lettered: {total}");
+}
+
+// ==========================================================================
+// IN-FLIGHT CAP + MULTI-DRIVER e2e — `--prefetch` is the total in-flight cap,
+// and a SIGKILLed driver loses nothing. Real broker, real engine, real driver
+// binaries; test data in tests/fixtures/concurrency.yaml.
+// ==========================================================================
+
+/// `tests/fixtures/concurrency.yaml`.
+#[derive(serde::Deserialize)]
+struct ConcurrencyFixture {
+    prefetch: PrefetchCase,
+    sigkill: SigkillCase,
+}
+
+#[derive(serde::Deserialize)]
+struct PrefetchCase {
+    queue: String,
+    threads: usize,
+    prefetch: u64,
+    sleep_ms: u64,
+    count: usize,
+    sample_every_ms: u64,
+    loaded_within_secs: u64,
+    record_template: String,
+}
+
+#[derive(serde::Deserialize)]
+struct SigkillCase {
+    queue: String,
+    dead_letter_queue: String,
+    threads: usize,
+    count: usize,
+    kill_below_ready: u32,
+    loaded_within_secs: u64,
+    record_template: String,
+    reject_marker: String,
+    engine_error_marker: String,
+}
+
+fn concurrency_fixture() -> ConcurrencyFixture {
+    load_fixture("concurrency.yaml")
+}
+
+/// A run-unique record-id prefix (records stay in the repository).
+fn run_tag(prefix: &str) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{prefix}{}_{millis}", std::process::id())
+}
+
+/// `count` records from `template` (`{tag}` / `{i}` substituted).
+fn records_from(template: &str, tag: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|i| {
+            template
+                .replace("{tag}", tag)
+                .replace("{i}", &i.to_string())
+        })
+        .collect()
+}
+
+/// `(credentials, http://host:15672)` of the management API on the broker
+/// `amqp_url` points at (`amqp://user:pass@host:port/vhost`).
+fn management_api(amqp_url: &str) -> (String, String) {
+    let rest = amqp_url
+        .split_once("://")
+        .map_or(amqp_url, |(_, rest)| rest);
+    let (credentials, host_part) = rest.split_once('@').unwrap_or(("guest:guest", rest));
+    let host = host_part
+        .split(['/', ':'])
+        .next()
+        .expect("AMQP URL has a host");
+    (credentials.to_string(), format!("http://{host}:15672"))
+}
+
+/// The management API's view of `queue` on the default vhost (`curl`).
+fn management_queue(amqp_url: &str, queue: &str) -> serde_json::Value {
+    let (credentials, base) = management_api(amqp_url);
+    let out = Command::new("curl")
+        .args(["-sSf", "-u", &credentials])
+        .arg(format!("{base}/api/queues/%2F/{queue}"))
+        .output()
+        .expect("failed to run curl (management API)");
+    assert!(
+        out.status.success(),
+        "management API query failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("management API returned JSON")
+}
+
+/// Highest `messages_unacknowledged` and the consumer `prefetch_count` seen so
+/// far on one queue.
+#[derive(Default, Debug)]
+struct CapSamples {
+    max_unacked: u64,
+    prefetch_count: Option<u64>,
+}
+
+impl CapSamples {
+    fn observe(&mut self, q: &serde_json::Value) {
+        let unacked = q["messages_unacknowledged"].as_u64().unwrap_or(0);
+        self.max_unacked = self.max_unacked.max(unacked);
+        let seen = q["consumer_details"]
+            .as_array()
+            .and_then(|c| c.first())
+            .and_then(|c| c["prefetch_count"].as_u64());
+        self.prefetch_count = seen.or(self.prefetch_count);
+    }
+}
+
+/// `--prefetch N` is the TOTAL in-flight cap: the consumer's `basic_qos` is
+/// exactly N (not threads + N) and the broker never has more than N
+/// deliveries unacked to the driver, while every record still loads.
+#[test]
+fn e2e_rabbit_prefetch_is_the_total_in_flight_cap() {
+    let (Some(_engine), Some(url)) = (engine_config(), amqp_url()) else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_prefetch_is_the_total_in_flight_cap: engine config and/or \
+             SENZING_AMQP_URL not set"
+        ));
+        return;
+    };
+    let case = concurrency_fixture().prefetch;
+    let records = records_from(&case.record_template, &run_tag("PF"), case.count);
+    rt().block_on(publish_records(&url, &case.queue, &records))
+        .expect("publish prefetch records");
+
+    let mut cmd = sleepy_driver(&case.queue, case.threads, case.sleep_ms);
+    cmd.env("SENZING_PREFETCH", case.prefetch.to_string());
+    let (mut child, out_path) = spawn_captured(&mut cmd, "prefetch");
+    let mut samples = CapSamples::default();
+    let deadline = Instant::now() + Duration::from_secs(case.loaded_within_secs);
+    let marker = format!("Processed {} adds", case.count);
+    while !read_to_string_lossy(&out_path).contains(&marker) && Instant::now() < deadline {
+        samples.observe(&management_queue(&url, &case.queue));
+        std::thread::sleep(Duration::from_millis(case.sample_every_ms));
+    }
+    sigterm(child.id());
+    let status = wait_bounded(&mut child, Duration::from_secs(30));
+    let stdout = read_and_remove(&out_path);
+
+    let status = status.expect("driver did not exit within bound after SIGTERM");
+    assert!(status.success(), "driver exited {status:?}\n{stdout}");
+    assert_eq!(
+        final_total(&stdout, "Processed total of "),
+        case.count,
+        "every record must load\n{stdout}"
+    );
+    assert_eq!(
+        samples.prefetch_count,
+        Some(case.prefetch),
+        "basic_qos must be the total cap ({samples:?})\n{stdout}"
+    );
+    assert!(
+        samples.max_unacked <= case.prefetch,
+        "unacked exceeded the total cap ({samples:?})\n{stdout}"
+    );
+    eprintln!("e2e_rabbit_prefetch_is_the_total_in_flight_cap: {samples:?}");
+}
+
+/// Stdout of a still-running child (file may be partially written).
+fn read_to_string_lossy(path: &std::path::Path) -> String {
+    std::fs::read(path)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+/// Repository records whose RECORD_ID starts with `tag_` (the primary key is
+/// (record_id, dsrc_id), so this counts distinct records).
+fn records_with_tag(dsn: &str, tag: &str) -> i64 {
+    psql_scalar_i64(
+        dsn,
+        &format!("SELECT count(*) FROM dsrc_record WHERE starts_with(record_id, '{tag}_')"),
+    )
+}
+
+/// Two drivers share one queue and one is SIGKILLed mid-load (inside engine
+/// calls): the broker requeues its unacked deliveries, the survivor loads
+/// them, every record is in the repository exactly once and nothing is
+/// dead-lettered.
+#[test]
+fn e2e_rabbit_sigkill_one_of_two_drivers_loses_nothing() {
+    let (Some(_engine), Some(url), Some(dsn)) =
+        (engine_config(), amqp_url(), env_nonempty("IT_PG_DSN"))
+    else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_sigkill_one_of_two_drivers_loses_nothing: needs engine config, \
+             SENZING_AMQP_URL and IT_PG_DSN"
+        ));
+        return;
+    };
+    let case = concurrency_fixture().sigkill;
+    let tag = run_tag("S1_");
+    let records = records_from(&case.record_template, &tag, case.count);
+    rt().block_on(publish_dead_lettered(
+        &url,
+        &case.queue,
+        &case.dead_letter_queue,
+        &records,
+    ))
+    .expect("declare dead-lettered queue + publish");
+
+    let (mut victim, victim_out) = spawn_driver(0, case.threads, Some(&case.queue), "s1_victim");
+    let (mut survivor, survivor_out) =
+        spawn_driver(0, case.threads, Some(&case.queue), "s1_survivor");
+    let kill_deadline = Instant::now() + Duration::from_secs(case.loaded_within_secs);
+    while rt()
+        .block_on(queue_ready_count(&url, &case.queue))
+        .is_ok_and(|ready| ready >= case.kill_below_ready)
+        && Instant::now() < kill_deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Kill first, count after: a repository query before the kill would let
+    // the load run on and the kill land near the end.
+    victim.kill().expect("SIGKILL victim driver");
+    let _ = victim.wait();
+    let loaded_at_kill = records_with_tag(&dsn, &tag);
+    let victim_stdout = read_and_remove(&victim_out);
+
+    let deadline = Instant::now() + Duration::from_secs(case.loaded_within_secs);
+    while records_with_tag(&dsn, &tag) < case.count as i64 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let drained = wait_queue_empty(&url, &case.queue, Duration::from_secs(30));
+    // Let the survivor's last acks land before signalling.
+    std::thread::sleep(Duration::from_secs(3));
+    sigterm(survivor.id());
+    let status = wait_bounded(&mut survivor, Duration::from_secs(30));
+    let stdout = read_and_remove(&survivor_out);
+    let loaded = records_with_tag(&dsn, &tag);
+    let dlq = rt()
+        .block_on(queue_ready_count(&url, &case.dead_letter_queue))
+        .expect("probe DLQ");
+    let engine_errors: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.contains(&case.engine_error_marker))
+        .collect();
+
+    assert!(
+        loaded_at_kill > 0 && loaded_at_kill < case.count as i64,
+        "SIGKILL must land mid-load ({loaded_at_kill}/{} loaded)\n{stdout}",
+        case.count
+    );
+    assert!(drained, "source queue did not drain\n{stdout}");
+    let status = status.expect("survivor did not exit within bound after SIGTERM");
+    assert!(status.success(), "survivor exited {status:?}\n{stdout}");
+    assert_eq!(
+        loaded, case.count as i64,
+        "every record exactly once in the repository\n{stdout}"
+    );
+    assert_eq!(dlq, 0, "nothing may be dead-lettered\n{stdout}");
+    assert!(
+        !stdout.contains(&case.reject_marker),
+        "survivor rejected records\n{stdout}"
+    );
+    eprintln!(
+        "e2e_rabbit_sigkill_one_of_two_drivers_loses_nothing: {loaded_at_kill} loaded at \
+         SIGKILL, {loaded}/{} after; survivor: {} adds; victim stdout {} lines; survivor \
+         engine-error lines: {engine_errors:?}",
+        case.count,
+        final_total(&stdout, "Processed total of "),
+        victim_stdout.lines().count()
+    );
 }

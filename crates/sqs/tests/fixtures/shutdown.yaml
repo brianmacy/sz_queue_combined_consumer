@@ -1,0 +1,72 @@
+# Test data for the SQS queue-mode e2e tests in sqs_e2e.rs (shutdown deadline,
+# SIGHUP, receive-error fatality, depth probe). Queue names get the test pid
+# appended so parallel runs and leftovers never collide.
+
+# Lines the driver prints that the tests assert on.
+markers:
+  final_total: "Processed total of "
+  sighup: "SIGHUP received, shutting down gracefully"
+  # SQS leaves an in-worker message un-deleted at shutdown and names it.
+  left_for_redelivery: "Still processing ("
+  shutdown_error: "Shutting down due to error: SQS ReceiveMessage failed"
+  depth_drained: "MQ drained (depth 0)"
+  depth_active: "MQ active (depth "
+
+# SIGHUP must shut down exactly like SIGTERM: drain, exit 0, print the total.
+sighup:
+  queue: sz-e2e-sighup
+  # Seconds allowed for the driver to exit after SIGHUP.
+  exit_within_secs: 30
+  records:
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_SIGHUP_0","NAME_FULL":"Sighup Tester 0","ADDR_FULL":"0 Hangup St"}'
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_SIGHUP_1","NAME_FULL":"Sighup Tester 1","ADDR_FULL":"1 Hangup St"}'
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_SIGHUP_2","NAME_FULL":"Sighup Tester 2","ADDR_FULL":"2 Hangup St"}'
+
+# One record blocks a worker (example transform plugin SLEEP_MS) far longer
+# than the 10 s shutdown grace; SIGTERM must still end the process promptly,
+# and the message must NOT be deleted: it becomes visible again after the
+# (short) visibility timeout.
+deadline:
+  queue: sz-e2e-deadline
+  # Plugin sleep per record, milliseconds.
+  sleep_ms: 60000
+  # Short so the left message reappears quickly; settle_secs must stay below
+  # it so SQS does not redeliver to the driver before SIGTERM.
+  visibility_timeout_secs: 5
+  # Seconds to let the received record reach a worker before SIGTERM.
+  settle_secs: 2
+  # Hard bound on SIGTERM -> process exit (grace is 10 s).
+  exit_within_secs: 15
+  # Bound on the message becoming receivable again after the exit.
+  redelivered_within_secs: 30
+  record: '{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_DEADLINE_0","NAME_FULL":"Deadline Stuck","ADDR_FULL":"0 Grace St"}'
+
+# ReceiveMessage against a closed local port fails every call; after
+# RECEIVE_ERROR_MAX (30) consecutive failures 1 s apart the driver must shut
+# down in order and exit 255.
+receive_error:
+  # Arbitrary; never reached (the endpoint is dead).
+  queue_path: /000000000000/sz-e2e-dead
+  dead_letter_path: /000000000000/sz-e2e-dead-dlq
+  exit_code: 255
+  # 30 failures with 1 s backoff: never fatal sooner than this...
+  min_exit_secs: 25
+  # ...and always fatal within this.
+  max_exit_secs: 90
+
+# With --mq-recheck-secs 1, both workers held by the plugin and no prefetch
+# (in-flight cap = 2 threads), queued records stay visible: the probe must log
+# drained (empty start) -> active (backlog) -> drained (all loaded).
+depth:
+  queue: sz-e2e-depth
+  mq_recheck_secs: 1
+  sleep_ms: 3000
+  # Seconds to wait for the initial "drained" log before publishing.
+  startup_within_secs: 60
+  # Seconds to wait for every record to load.
+  loaded_within_secs: 60
+  records:
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_DEPTH_0","NAME_FULL":"Depth Tester 0","ADDR_FULL":"0 Probe St"}'
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_DEPTH_1","NAME_FULL":"Depth Tester 1","ADDR_FULL":"1 Probe St"}'
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_DEPTH_2","NAME_FULL":"Depth Tester 2","ADDR_FULL":"2 Probe St"}'
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_DEPTH_3","NAME_FULL":"Depth Tester 3","ADDR_FULL":"3 Probe St"}'

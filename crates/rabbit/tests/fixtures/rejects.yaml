@@ -1,0 +1,22 @@
+# Test data for e2e_rabbit_rejects_are_counted_and_dead_lettered in
+# integration_test.rs: one valid record, one unparseable message and one record
+# the engine rejects (unknown DATA_SOURCE). Only the valid one is an add; the
+# other two are dead-lettered, reported as rejected and marked on stdout.
+queue: sz-combined-rejects-queue
+dead_letter_queue: sz-combined-rejects-dlq
+valid: '{"DATA_SOURCE":"TEST","RECORD_ID":"RABBIT_REJ_OK","NAME_FULL":"Reject Tester","ADDR_FULL":"1 Valid St"}'
+unparseable: '{"DATA_SOURCE":"TEST","RECORD_ID":"RABBIT_REJ_PARSE",'
+engine_reject: '{"DATA_SOURCE":"E2E_NO_SUCH_DSRC","RECORD_ID":"RABBIT_REJ_DSRC","NAME_FULL":"X Y"}'
+# Seconds to wait for the source queue to drain.
+drain_within_secs: 120
+
+# Lines the driver prints that the test asserts on.
+markers:
+  # The final line: N = successful adds only, rejects in the parenthetical.
+  final_total: "Processed total of 1 adds, "
+  rejected: "(2 rejected, "
+  # The unified reject marker for the engine-rejected record.
+  engine_reject: "REJECTING: E2E_NO_SUCH_DSRC : RABBIT_REJ_DSRC -> "
+  # The poison message: one warn, then the marker with its parse error.
+  poison_warn: "DEAD-LETTERING malformed record: "
+  poison_reject: "REJECTING:  :  -> malformed record: "

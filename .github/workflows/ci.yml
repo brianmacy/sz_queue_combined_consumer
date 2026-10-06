@@ -87,12 +87,12 @@ jobs:
           key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-build-
 
-      - name: Build release (whole workspace — both backend bins + core)
+      - name: Build release (whole workspace — all backend bins + core)
         run: cargo build --release --workspace
 
       - name: Run unit tests (core lib + bin unit tests; no infra)
-        # --lib + --bins only: the integration test (which needs RabbitMQ + a
-        # Senzing engine) runs in the dedicated `integration` job below.
+        # --lib + --bins only: the integration/e2e suites (which need a broker
+        # + a Senzing engine) run in the dedicated `integration` job below.
         run: cargo test --workspace --lib --bins
 
   integration:
@@ -130,6 +130,26 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
+      # Apache ActiveMQ Artemis for the ActiveMQ e2e suite
+      # (crates/activemq/tests/activemq_e2e.rs): AMQP 1.0 on 5672, Jolokia
+      # management (queue counts) on 8161. Service containers start before
+      # checkout, so all broker settings come from env. ANONYMOUS_LOGIN=false
+      # makes Artemis enforce credentials (the bad-credentials test needs it);
+      # --http-host 0.0.0.0 + --relax-jolokia expose Jolokia to the job
+      # container. The image has no curl/wget, so the health check is a bash
+      # /dev/tcp probe of both listeners (opened once the broker is up).
+      activemq:
+        image: apache/artemis:2.57.0
+        env:
+          ARTEMIS_USER: artemis
+          ARTEMIS_PASSWORD: artemis
+          ANONYMOUS_LOGIN: "false"
+          EXTRA_ARGS: --http-host 0.0.0.0 --relax-jolokia --no-autotune
+        options: >-
+          --health-cmd "bash -c '</dev/tcp/localhost/5672 && </dev/tcp/localhost/8161'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     env:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
@@ -147,12 +167,19 @@ jobs:
       # Slash-form libpq DSN for the truth-set test's psql scoped entity-count
       # query (distinct from the engine's colon-form connection string above).
       IT_PG_DSN: postgresql://senzing:senzing@postgres:5432/G2
+      # A test that cannot run (missing broker/engine/truth set) must FAIL here,
+      # not print SKIP and pass.
+      IT_REQUIRE_INFRA: "1"
       # SQS e2e: point the standard AWS provider chain at ElasticMQ. The suite
       # is gated on AWS_ENDPOINT_URL and skips when it is unset.
       AWS_ENDPOINT_URL: http://elasticmq:9324
       AWS_ACCESS_KEY_ID: elasticmq
       AWS_SECRET_ACCESS_KEY: elasticmq
       AWS_REGION: elasticmq
+      # ActiveMQ e2e: AMQP endpoint (credentials in the URL) + Jolokia for
+      # queue counts. The suite is gated on both.
+      SENZING_ACTIVEMQ_URL: amqp://artemis:artemis@activemq:5672
+      IT_ARTEMIS_JOLOKIA_URL: http://artemis:artemis@activemq:8161/console/jolokia
     steps:
       # The senzingsdk-runtime image ships without git, so actions/checkout falls
       # back to the GitHub REST tarball download, which cannot fetch submodules
@@ -248,6 +275,9 @@ jobs:
       - name: Run SQS e2e tests (ElasticMQ)
         run: cargo test -p sz_sqs_combined_consumer --test sqs_e2e -- --nocapture --test-threads=1
 
+      - name: Run ActiveMQ e2e tests (Artemis)
+        run: cargo test -p sz_activemq_combined_consumer --test activemq_e2e -- --nocapture --test-threads=1
+
   docker:
     name: Docker build (${{ matrix.bin }} / ${{ matrix.backend }})
     runs-on: ubuntu-latest
@@ -264,9 +294,9 @@ jobs:
           # `docker build --build-arg WITH_MSSQL=1 --build-arg WITH_POSTGRES=0`
           # and the "both" default both succeed. (An earlier "SHA1 apt-key"
           # claim carried over from the sibling CI was incorrect.)
-          # Both queue backends (BIN) x the DB-driver closure. BIN selects which
-          # workspace binary is built: the RabbitMQ image never pulls the AWS SDK
-          # and the SQS image never pulls lapin (cargo build -p ${BIN}).
+          # Queue backends (BIN) x the DB-driver closure. BIN selects which
+          # workspace binary is built: each image pulls only its own broker
+          # client (lapin / AWS SDK / fe2o3-amqp) via cargo build -p ${BIN}.
           - bin: sz_rabbit_combined_consumer
             backend: postgres
             args: "WITH_POSTGRES=1 WITH_MSSQL=0"
@@ -283,6 +313,11 @@ jobs:
             backend: mssql
             args: "WITH_POSTGRES=0 WITH_MSSQL=1"
           - bin: sz_sqs_combined_consumer
+            backend: both
+            args: "WITH_POSTGRES=1 WITH_MSSQL=1"
+          # ActiveMQ: the default "both" DB closure only — the DB-driver
+          # variants are BIN-independent and already covered by the rows above.
+          - bin: sz_activemq_combined_consumer
             backend: both
             args: "WITH_POSTGRES=1 WITH_MSSQL=1"
     steps:

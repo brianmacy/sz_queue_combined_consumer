@@ -66,8 +66,7 @@ use crate::config::{Config, redo_preferring_count};
 use crate::record::parse_record;
 use crate::redo::{DrainExit, fetcher_loop};
 use crate::stats::{
-    self, ADDS_PROCESSED, ADDS_REJECTED, ERRORS, REDOS_DROPPED, REDOS_PROCESSED, RUNNING,
-    WORKER_FATAL,
+    self, ADDS_PROCESSED, ADDS_REJECTED, ERRORS, REDOS_PROCESSED, RUNNING, WORKER_FATAL,
 };
 use crate::worker::{
     Action, Class, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
@@ -405,8 +404,6 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
                 redos,
                 redos_rate: redos.saturating_sub(prev_redos) as f64 / dt,
                 mq_depth: None, // no MQ in file mode
-                redo_backlog: None,
-                redo_backlog_slope: None,
             });
             monitor_redo_in_flight(&redo_in_flight, config.long_record_secs, redo_pref);
             prev_adds = adds;
@@ -437,21 +434,14 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
         .watermark();
     let adds = ADDS_PROCESSED.load(Ordering::Relaxed);
     let rejected = ADDS_REJECTED.load(Ordering::Relaxed);
-    let redos = REDOS_PROCESSED.load(Ordering::Relaxed);
-    let redos_dropped = REDOS_DROPPED.load(Ordering::Relaxed);
-    let errors = ERRORS.load(Ordering::Relaxed);
     let written = sink
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .written();
 
-    // "Processed total of N adds, M redo records (...)" is the SAME line the
-    // queue paths print (e2e tests / tooling scrape it); the resume hint is
-    // file-mode specific.
-    println!(
-        "Processed total of {adds} adds, {redos} redo records ({redos_dropped} redo dropped, \
-         {errors} errors)"
-    );
+    // The SAME "Processed total of N adds, ..." line the queue paths print
+    // (e2e tests / tooling scrape it); the resume hint is file-mode specific.
+    crate::stats::print_final_totals(adds as u64);
     println!(
         "File load: {rejected} record(s) dead-lettered ({written} written to {reject_path}); \
          safe resume with --skip-lines {watermark}"
@@ -605,7 +595,7 @@ fn result_consumer(
                 ADDS_PROCESSED.fetch_add(1, Ordering::Relaxed);
                 complete(&resume, delivery_tag);
             }
-            Action::RejectNoRequeue => {
+            Action::RejectNoRequeue(_) => {
                 // The worker already logged WHY (engine error text); log WHERE.
                 warn!(
                     "REJECTING line {delivery_tag} ({} : {}) -> {:?}",
