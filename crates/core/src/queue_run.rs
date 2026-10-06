@@ -1,13 +1,12 @@
 //! Queue-mode (redo% < 100) run plumbing shared by every async backend
 //! (RabbitMQ, SQS): the [`RunOutcome`] a backend loop reports, the tokio
 //! runtime bring-up + use-after-free exit discipline in [`run_queue_mode`],
-//! and the small identical pieces of loop setup (signals, monitor cadence).
+//! and the monitor cadence shared by the loop.
 
 use std::future::Future;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use tokio::signal::unix::{Signal, SignalKind, signal};
+use anyhow::Result;
 use tokio::time::{Interval, MissedTickBehavior};
 
 use crate::runtime;
@@ -93,13 +92,6 @@ fn exit_code(outcome: &RunOutcome) -> u8 {
             255
         }
     }
-}
-
-/// Installs the SIGINT and SIGTERM streams the backend loop selects on.
-pub fn install_signals() -> Result<(Signal, Signal)> {
-    let sigint = signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?;
-    let sigterm = signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?;
-    Ok((sigint, sigterm))
 }
 
 /// Long-record monitor cadence: `LONG_RECORD / 2` (min 1 s), skipping missed

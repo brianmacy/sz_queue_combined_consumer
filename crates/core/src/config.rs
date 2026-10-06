@@ -22,6 +22,10 @@ pub const DEFAULT_REDO_PERCENT: u8 = 20;
 /// compatibility, but is a known foot-gun at 96+ cores.
 pub const DEFAULT_THREADS: usize = 12;
 
+/// Default cadence of the diagnostic MQ depth probe (`--mq-recheck-secs`),
+/// seconds. Each queue backend exposes the flag with this default.
+pub const DEFAULT_MQ_RECHECK_SECS: u64 = 30;
+
 /// Default fetcher pause when `get_redo_record()` returns empty, seconds
 /// (redoer-compatible name/default).
 pub const DEFAULT_REDO_SLEEP_SECS: u64 = 60;
@@ -150,7 +154,8 @@ pub struct Config {
     pub threads: usize,
     /// RabbitMQ only (`basic_qos`); inert 0 from [`Config::from_common`].
     pub prefetch: u16,
-    /// RabbitMQ only (MQ depth probe); inert 0 from [`Config::from_common`].
+    /// Queue mode: depth-probe cadence (`--mq-recheck-secs`, set by each queue
+    /// backend); inert 0 from [`Config::from_common`].
     pub mq_recheck_secs: u64,
     pub redo_sleep_secs: u64,
     pub long_record_secs: u64,

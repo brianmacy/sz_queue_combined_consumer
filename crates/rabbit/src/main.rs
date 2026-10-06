@@ -18,7 +18,7 @@ use clap::Parser;
 use sz_rust_sdk::prelude::*;
 
 use sz_combined_consumer_core::config::{
-    CommonArgs, Config, engine_config_from_env, validate_split_threads,
+    CommonArgs, Config, DEFAULT_MQ_RECHECK_SECS, engine_config_from_env, validate_split_threads,
 };
 use sz_combined_consumer_core::{queue_run, runtime};
 
@@ -29,9 +29,6 @@ mod combined;
 /// Instance/module name passed to the Senzing environment; also the AMQP
 /// consumer tag.
 pub(crate) const INSTANCE_NAME: &str = "sz_rabbit_combined_consumer";
-
-/// Default cadence of the diagnostic passive-declare MQ depth probe, seconds.
-const DEFAULT_MQ_RECHECK_SECS: u64 = 30;
 
 /// Combined RabbitMQ load + redo Senzing driver.
 #[derive(Parser, Debug, Clone)]
