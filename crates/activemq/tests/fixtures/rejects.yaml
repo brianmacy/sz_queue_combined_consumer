@@ -1,0 +1,24 @@
+# Test data for e2e_activemq_rejects_land_on_the_dead_letter_address in
+# activemq_e2e.rs: valid records, one unparseable message and one record the
+# engine rejects (unknown DATA_SOURCE). Only the valid ones are adds; the
+# other two are `rejected` and Artemis moves them to the dead-letter address
+# (DLQ, `artemis create` default), annotated with their original queue. The
+# queue name gets the test pid appended.
+queue: sz-amq-rejects
+dead_letter_queue: DLQ
+valid_count: 6
+valid_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_E2E_{i}","NAME_FULL":"Amq Tester {i}","EMAIL_ADDRESS":"amqr{i}@example.com"}'
+unparseable: '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_BAD_PARSE",'
+engine_reject: '{"DATA_SOURCE":"E2E_NO_SUCH_DSRC","RECORD_ID":"AMQ_BAD_DSRC","NAME_FULL":"X Y"}'
+# Seconds to wait for the two dead-lettered copies, then for the source to
+# settle.
+dlq_within_secs: 90
+settle_within_secs: 60
+
+markers:
+  # The final line: rejects in the parenthetical ("{N}" = valid_count).
+  final_total: "Processed total of {N} adds, "
+  rejected: "(2 rejected, "
+  engine_reject: "REJECTING: E2E_NO_SUCH_DSRC : AMQ_BAD_DSRC -> "
+  poison_warn: "DEAD-LETTERING malformed record: "
+  poison_reject: "REJECTING:  :  -> malformed record: "
