@@ -12,8 +12,9 @@
 //! * records load at redo% 0 / 20, and the pure redoer (100) runs with no
 //!   broker settings at all (`load.yaml`);
 //! * a Data-section body and an AmqpValue string (JMS TextMessage) both load;
-//! * an engine reject and an unparseable body are `rejected` and Artemis moves
-//!   both, verbatim, to the dead-letter address (`rejects.yaml`);
+//! * an engine reject, an unparseable body and a message the AMQP receiver
+//!   cannot decode are `rejected` (the driver keeps running) and Artemis
+//!   moves all three, verbatim, to the dead-letter address (`rejects.yaml`);
 //! * shutdown: a stuck worker cannot outlive the deadline and its delivery is
 //!   released for redelivery (not dead-lettered); SIGHUP is graceful; losing
 //!   the broker connection is fatal (exit 255, orderly); bad credentials and a
@@ -28,7 +29,7 @@ use fe2o3_amqp::connection::ConnectionHandle;
 use fe2o3_amqp::session::SessionHandle;
 use fe2o3_amqp::types::messaging::annotations::OwnedKey;
 use fe2o3_amqp::types::messaging::{Body, Message, Modified, Source, Target};
-use fe2o3_amqp::types::primitives::{Binary, Symbol, Value};
+use fe2o3_amqp::types::primitives::{Binary, LazyValue, Symbol, Value};
 use fe2o3_amqp::{Connection, Receiver, Sender, Session};
 use serde_json::json;
 use sz_rust_sdk::prelude::*;
@@ -110,6 +111,9 @@ enum BodyKind {
     Data,
     /// An AmqpValue string (what a JMS TextMessage sends).
     Text,
+    /// An AmqpValue holding the hex-encoded AMQP bytes verbatim (lets a test
+    /// send a value the driver's receiver cannot decode).
+    RawValue,
 }
 
 struct Broker {
@@ -153,6 +157,11 @@ impl Broker {
                     let text = Value::String(b.clone());
                     sender.send(Message::builder().value(text).build()).await
                 }
+                BodyKind::RawValue => {
+                    let raw: LazyValue =
+                        serde_amqp::from_slice(&hex_decode(b)).expect("one framed AMQP value");
+                    sender.send(Message::builder().value(raw).build()).await
+                }
             };
             outcome
                 .expect("send")
@@ -170,7 +179,7 @@ impl Broker {
         address: &str,
         want: usize,
         within: Duration,
-        keep: impl Fn(&Message<Body<Value>>) -> bool,
+        keep: impl Fn(&Message<Body<LazyValue>>) -> bool,
     ) -> Vec<String> {
         let source = Source::builder()
             .address(address)
@@ -186,7 +195,10 @@ impl Broker {
         let mut got = Vec::new();
         while got.len() < want {
             let left = deadline.saturating_duration_since(Instant::now());
-            let Ok(next) = tokio::time::timeout(left, receiver.recv::<Body<Value>>()).await else {
+            // Bodies stay undecoded (`LazyValue`): an undecodable message on
+            // the shared DLQ must not break this probe.
+            let Ok(next) = tokio::time::timeout(left, receiver.recv::<Body<LazyValue>>()).await
+            else {
                 break;
             };
             let delivery = next.expect("receive");
@@ -234,18 +246,29 @@ impl Broker {
     }
 }
 
-fn body_text(body: &Body<Value>) -> String {
+/// A body as text: Data sections as (lossy) UTF-8, an AmqpValue string as
+/// itself, any other (or undecodable) AmqpValue as the hex of its AMQP bytes.
+fn body_text(body: &Body<LazyValue>) -> String {
     match body {
         Body::Data(batch) => batch
             .iter()
             .map(|d| String::from_utf8_lossy(&d.0).into_owned())
             .collect(),
-        Body::Value(v) => match &v.0 {
-            Value::String(s) => s.clone(),
-            other => format!("{other:?}"),
-        },
+        Body::Value(v) => serde_amqp::from_slice::<String>(v.0.as_slice())
+            .unwrap_or_else(|_| hex_encode(v.0.as_slice())),
         other => format!("{other:?}"),
     }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
+        .collect()
 }
 
 // --------------------------------------------------------------------------
@@ -473,7 +496,7 @@ struct CombinedCase {
 
 #[derive(serde::Deserialize)]
 struct RedoerCase {
-    seed_count: usize,
+    seed_names: Vec<String>,
     started: String,
     started_within_secs: u64,
     threads: usize,
@@ -555,7 +578,9 @@ async fn e2e_activemq_combined_mixed_20pct() {
 }
 
 /// 100% = pure redoer: no broker settings at all (the binary never opens
-/// AMQP). Redo is seeded through the real engine; the redoer must drain it.
+/// AMQP). Redo is seeded through the real engine (a non-zero backlog is
+/// asserted first, so the drain cannot pass vacuously); the redoer must drain
+/// it to 0.
 #[tokio::test]
 async fn e2e_activemq_pure_redoer_100pct() {
     let Some(_) = gate() else { return };
@@ -566,17 +591,27 @@ async fn e2e_activemq_pure_redoer_100pct() {
         SzEnvironmentCore::get_instance(INSTANCE, &engine_config, false)
             .expect("initialize Senzing environment");
     let engine = env.get_engine().expect("engine handle");
-    for (i, rec) in records(&case.record_template, "AMQ_REDO_SEED", case.seed_count)
-        .iter()
-        .enumerate()
-    {
-        let _ = engine.add_record(
-            "TEST",
-            &format!("AMQ_REDO_SEED_{i}"),
-            rec,
-            Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
-        );
+    let tag = unique("AMQ_REDO_SEED");
+    for (i, name) in case.seed_names.iter().enumerate() {
+        let rec = case
+            .record_template
+            .replace("{tag}", &tag)
+            .replace("{i}", &i.to_string())
+            .replace("{name}", name);
+        engine
+            .add_record(
+                "TEST",
+                &format!("{tag}_{i}"),
+                &rec,
+                Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
+            )
+            .expect("seed record loads");
     }
+    let backlog_before = engine.count_redo_records().expect("count redo");
+    assert!(
+        backlog_before > 0,
+        "the seed must leave a redo backlog for the redoer to drain"
+    );
 
     let mut driver_cmd = Command::new(driver_bin());
     let out = std::env::temp_dir().join(format!("{}.out", unique("sz-amq-redoer")));
@@ -620,7 +655,9 @@ async fn e2e_activemq_pure_redoer_100pct() {
         0,
         "redo backlog must drain to 0\n{stdout}"
     );
-    eprintln!("e2e_activemq_pure_redoer_100pct: redo drained, clean shutdown");
+    eprintln!(
+        "e2e_activemq_pure_redoer_100pct: redo backlog {backlog_before} -> 0, clean shutdown"
+    );
 }
 
 /// Contract: a Data-section body (bytes) and an AmqpValue string (JMS
@@ -674,6 +711,7 @@ struct RejectsFixture {
     valid_count: usize,
     valid_template: String,
     unparseable: String,
+    undecodable_value_hex: String,
     engine_reject: String,
     dlq_within_secs: u64,
     settle_within_secs: u64,
@@ -687,11 +725,14 @@ struct RejectMarkers {
     engine_reject: String,
     poison_warn: String,
     poison_reject: String,
+    undecodable_warn: String,
 }
 
-/// An engine reject and an unparseable body are `rejected`; Artemis moves both
-/// verbatim to the dead-letter address. The final line counts only the adds
-/// and reports 2 rejected; each reject carries the unified marker.
+/// An engine reject, an unparseable body and a message the receiver cannot
+/// decode (`RecvError::MessageDecode`: per-message, not fatal) are
+/// `rejected`; Artemis moves all three verbatim to the dead-letter address.
+/// The final line counts only the adds and reports 3 rejected; each reject
+/// carries the unified marker.
 #[tokio::test]
 async fn e2e_activemq_rejects_land_on_the_dead_letter_address() {
     let Some(url) = gate() else { return };
@@ -703,17 +744,22 @@ async fn e2e_activemq_rejects_land_on_the_dead_letter_address() {
     all.push(fx.unparseable.clone());
     let mut broker = Broker::connect(&url).await;
     broker.send(&queue, &all, BodyKind::Data).await;
+    let undecodable = std::slice::from_ref(&fx.undecodable_value_hex);
+    broker.send(&queue, undecodable, BodyKind::RawValue).await;
+    let want_rejects = 3;
 
     let driver = Driver::spawn(&queue, &[], &[]);
     let dlq_within = Duration::from_secs(fx.dlq_within_secs);
     let deadline = Instant::now() + dlq_within;
-    while dead_letter_count(&queue) < 2 && Instant::now() < deadline {
+    while dead_letter_count(&queue) < want_rejects && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     let settled = wait_queue_empty(&queue, Duration::from_secs(fx.settle_within_secs)).await;
     driver.signal(libc::SIGTERM);
     let (status, stdout, stderr) = driver.finish(Duration::from_secs(30)).await;
-    let mut rejects = broker.dead_lettered(&queue, 2, dlq_within).await;
+    let mut rejects = broker
+        .dead_lettered(&queue, want_rejects as usize, dlq_within)
+        .await;
     broker.close().await;
 
     assert!(status.expect("exit").success(), "{stdout}\n{stderr}");
@@ -722,6 +768,7 @@ async fn e2e_activemq_rejects_land_on_the_dead_letter_address() {
         &fx.markers.poison_warn,
         &fx.markers.poison_reject,
         &fx.markers.engine_reject,
+        &fx.markers.undecodable_warn,
     ] {
         assert!(
             stdout.contains(marker.as_str()),
@@ -729,7 +776,11 @@ async fn e2e_activemq_rejects_land_on_the_dead_letter_address() {
         );
     }
     rejects.sort();
-    let mut want = vec![fx.engine_reject.clone(), fx.unparseable.clone()];
+    let mut want = vec![
+        fx.engine_reject.clone(),
+        fx.unparseable.clone(),
+        fx.undecodable_value_hex.clone(),
+    ];
     want.sort();
     assert_eq!(rejects, want, "dead-lettered content mismatch\n{stdout}");
     let total_prefix = fx

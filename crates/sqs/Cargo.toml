@@ -33,7 +33,8 @@ libc.workspace = true
 sz-rust-sdk.workspace = true
 aws-config.workspace = true
 aws-sdk-sqs.workspace = true
-tokio.workspace = true
+# net: the unit test's silent TCP endpoint (a hung SQS API at close).
+tokio = { workspace = true, features = ["net"] }
 # YAML test fixtures (tests/fixtures/): data in YAML, not hardcoded.
 serde = { version = "1", features = ["derive"] }
 serde_norway = "0.9"

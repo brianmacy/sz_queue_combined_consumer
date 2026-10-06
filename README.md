@@ -51,7 +51,7 @@ the redo tail. Here the same capacity flows to whichever work exists:
 | redo% | Behavior | Same work as |
 |---|---|---|
 | 0 | Pure loader. No redo fetcher, zero redo-related calls. | `sz_rabbit_consumer` |
-| 100 | Pure redoer. AMQP never opened; tokio runtime never built; `SENZING_AMQP_URL`/queue may be unset. | `sz_simple_redoer` |
+| 100 | Pure redoer. No broker connection is opened and no tokio runtime is built; the broker URL/queue settings may be unset. | `sz_simple_redoer` |
 | (0,100) | While the MQ is busy, redo gets exactly \|B\|/N of the pool (a hard share — size it for load-phase keep-up). When the MQ drains, ALL workers fall into redo automatically; a new publish flips them back instantly (push-based, no polling). | both |
 
 ## Concurrency model
@@ -116,14 +116,15 @@ verbatim-compatible with the sibling drivers.
 | `-t`/`--debugTrace` | off | engine debug trace |
 
 Validation is loud (exit 1) and completes before the Senzing engine is
-initialized, in both binaries: redo% ∉ [0,100]; redo% < 100 without URL/queue
+initialized, in all three binaries: redo% ∉ [0,100]; redo% < 100 without URL/queue
 (queue mode; SQS: `--queue-url`); 0 < redo% < 100 with fewer than 2 threads
 (queue and file mode); `LONG_RECORD` < 1; SQS `--wait-time` ∉ 0..=20,
-`--max-messages` ∉ 1..=10, `--visibility-timeout` ∉ 0..=43200. Exit codes:
+`--max-messages` ∉ 1..=10, `--visibility-timeout` ∉ 0..=43200; ActiveMQ URL
+not `amqp://` / `amqps://` with a host, or a password without a user. Exit codes:
 **1** = configuration/validation failure at startup, **255** = fatal runtime
 error (engine/DB/broker) after an orderly teardown, **0** = clean shutdown or
 file EOF. (The standalone drivers disagreed with each other here; the combined
-driver uses this one convention for both binaries.)
+driver uses this one convention for all three binaries.)
 
 ## SQS specifics
 
@@ -203,13 +204,20 @@ driver uses this one convention for both binaries.)
 * **In-flight cap.** Manual link credit: credit is re-granted on every settle
   as `--prefetch` − unsettled, so the broker never has more than `--prefetch`
   deliveries outstanding to the driver (default threads + 2).
-* **Link loss.** Any receive error (connection, session or link gone; a
-  60 s idle timeout catches a silent broker) is **fatal**: orderly shutdown,
-  final totals, exit 255. Unsettled deliveries are redelivered by the broker.
+* **Receive errors.** Per-message errors leave the link usable and are **not**
+  fatal: a message the receiver cannot decode (e.g. invalid UTF-8 in an
+  `AmqpValue` string) logs `undecodable AMQP message (dead-lettering it): …`
+  and is `rejected` like any unparseable body (`REJECTING:  :  -> malformed
+  record: …`, counted as rejected); a message over the link's max message size
+  (none is set today) is rejected by the AMQP library itself and counted the
+  same way. Every other receive error — connection, session or link gone (a
+  60 s idle timeout catches a silent broker), or a protocol violation — is
+  **fatal**: orderly shutdown, final totals, exit 255. Unsettled deliveries
+  are redelivered by the broker.
 * **Bodies.** An AMQP `Data` section (bytes; multiple sections are
   concatenated) or an `AmqpValue` string (what a JMS `TextMessage` sends) is
-  the record JSON; an `AmqpValue` binary is accepted too. Anything else is
-  dead-lettered as malformed.
+  the record JSON; an `AmqpValue` binary is accepted too. Anything else
+  (including an undecodable message) is dead-lettered as malformed.
 * **Credentials / TLS.** SASL PLAIN from the URL userinfo or
   `SENZING_ACTIVEMQ_USER` / `SENZING_ACTIVEMQ_PASSWORD`; the password is never
   logged. `amqps://` uses rustls with the webpki root store.
@@ -226,7 +234,7 @@ rewrites each load record before `add_record` — e.g. to add derived features.
 It is `dlopen`ed once at startup (a load/init failure exits 1, before engine
 init) and called concurrently from every worker thread, so the plugin's
 transform MUST be thread-safe on one handle. It runs on the worker side, so it
-applies identically to RabbitMQ, SQS and file mode, and scales with
+applies identically to RabbitMQ, SQS, ActiveMQ and file mode, and scales with
 `SENZING_THREADS_PER_PROCESS`. Redo records are never transformed.
 
 - **Unchanged** → the original body is loaded (no copy).
@@ -251,10 +259,13 @@ sz_rabbit_combined_consumer --file records.jsonl \
 ## Failure handling
 
 * **Poison MQ record** (bad JSON / missing DATA_SOURCE/RECORD_ID / non-UTF-8 /
-  engine BadInput / SENZ0082 / long-record give-up — the last RabbitMQ only;
-  SQS extends visibility instead) → dead-letter (RabbitMQ: `basic_reject`, no
-  requeue — AMQP cannot carry the reason; SQS: `SendMessage` to the DLQ with
-  `SzReason`, then delete), keep running. Identical on both transports:
+  undecodable AMQP message (ActiveMQ) / engine BadInput / SENZ0082 /
+  long-record give-up — the last RabbitMQ only; SQS extends visibility and
+  ActiveMQ only logs instead) → dead-letter (RabbitMQ: `basic_reject`, no
+  requeue — AMQP 0-9-1 cannot carry the reason; SQS: `SendMessage` to the DLQ
+  with `SzReason`, then delete; ActiveMQ: the `rejected` outcome with the
+  reason in its error description, routed by Artemis to the dead-letter
+  address), keep running. Identical on every transport:
   * every dead-lettered record prints ONE stdout marker
     `REJECTING: DATA_SOURCE : RECORD_ID -> <reason>` (an unparseable body has
     no DS/ID: `REJECTING:  :  -> malformed record: <parse error>`); an engine
@@ -277,19 +288,23 @@ sz_rabbit_combined_consumer --file records.jsonl \
   the first number after `Processed total of `.
 * **File mode** has no queue: rejects go verbatim to the JSONL reject file
   (`--reject-file`, see above). **SQS** sends them to the dead-letter queue
-  (see [SQS specifics](#sqs-specifics)).
+  (see [SQS specifics](#sqs-specifics)); **ActiveMQ** leaves that to Artemis'
+  dead-letter address (see
+  [ActiveMQ Artemis specifics](#activemq-artemis-specifics)).
 * **Database connection lost / transient DB error** → **fatal** (orderly
   shutdown, exit 255), never dead-lettered: the database is unhealthy, not the
-  record. Deliveries stay unacked / un-deleted so the broker redelivers them
-  once the process is restarted.
+  record. Deliveries stay unacked / un-deleted / unsettled so the broker
+  redelivers them once the process is restarted.
 * **Fatal errors** (Database, NotInitialized, License, …; SQS also 30
-  consecutive `ReceiveMessage` failures) → orderly teardown, non-zero exit.
+  consecutive `ReceiveMessage` failures; ActiveMQ also a lost broker link) →
+  orderly teardown, non-zero exit.
   Graceful shutdown (SIGINT, SIGTERM, or — queue mode — SIGHUP) drains
   in-flight work within a 10 s grace; whatever is still unsettled then is
   **released for redelivery on every transport, never dead-lettered or counted
   as rejected** — queued-but-unstarted deliveries and those still inside a
   worker alike (RabbitMQ: left unacked, requeued when the connection closes;
-  SQS: left un-deleted, redelivered after the visibility timeout). Each one
+  SQS: left un-deleted, redelivered after the visibility timeout; ActiveMQ:
+  `released`, immediately redeliverable). Each one
   still inside a worker is printed as `Still processing (… min): DS : ID`.
   Redelivery is safe: `add_record` with an existing key replaces the record
   (idempotent) and the engine handles same-key contention itself; the
@@ -303,6 +318,21 @@ sz_rabbit_combined_consumer --file records.jsonl \
   the redo queue's perspective (dequeued at fetch) — the tiny redo channel
   bounds this, and the harness's DB-side `SYS_EVAL_QUEUE` check remains the
   completion authority.
+
+### Known limitations
+
+* **Shutdown can outlast the 10 s grace** by the transport close that follows
+  it: the SQS close flushes pending deletes (bounded at 5 s; an unflushed
+  delete only redelivers that message after its visibility timeout), the
+  ActiveMQ link/session/connection close is bounded at 5 s, and the RabbitMQ
+  connection close is unbounded. Size the container stop timeout for grace +
+  close (+ the 5 s native-teardown bound).
+* **A signal can wait on a busy pool when `--prefetch` > 2 × threads.** The
+  loop hands each delivery to a worker channel of `threads` slots; with every
+  worker busy and that channel full, the hand-off waits for a worker to finish
+  before the loop sees SIGINT/SIGTERM/SIGHUP. At the defaults (threads + 2,
+  SQS 2 × threads) the in-flight cap never exceeds what workers plus the
+  channel hold, so this cannot happen.
 
 ## Memory under sustained load
 

@@ -522,11 +522,19 @@ fn e2e_combined_mixed_20pct() {
     run_combined_e2e(20);
 }
 
+/// Seed for the pure-redoer e2e (`tests/fixtures/redo.yaml`).
+#[derive(serde::Deserialize)]
+struct RedoSeedFixture {
+    seed_names: Vec<String>,
+    record_template: String,
+}
+
 /// 100% = pure redoer endpoint: no AMQP is opened, no tokio runtime is built;
 /// the binary runs the pure `std::thread` fetcher + redo-worker + monitor
 /// shape and drains the redo queue. We seed redo work via the real engine
-/// first, run the redoer, then SIGTERM and assert a clean exit with the redo
-/// backlog drained to zero.
+/// first (`tests/fixtures/redo.yaml`) and assert a NON-ZERO backlog, run the
+/// redoer, then SIGTERM and assert a clean exit with the redo backlog drained
+/// to zero.
 #[test]
 fn e2e_pure_redoer_100pct() {
     let Some(engine_cfg) = engine_config() else {
@@ -536,24 +544,35 @@ fn e2e_pure_redoer_100pct() {
         return;
     };
 
-    // Seed: add a batch of records through the real engine; add_record enqueues
-    // redo for affected entities, giving the redoer something to drain. (Even
-    // if the backend produces no redo, the run still exercises the full
-    // fetcher/worker/monitor/graceful-shutdown path.)
+    // Seed: records whose shared email goes generic, so the engine queues
+    // redo for the entity that resolved on it (see redo.yaml).
     let env: Arc<SzEnvironmentCore> = SzEnvironmentCore::get_instance(INSTANCE, &engine_cfg, false)
         .expect("failed to initialize Senzing environment");
     let engine = env.get_engine().expect("failed to get engine handle");
-    for rec in make_records("E2E_REDO_SEED", 12) {
+    let seed: RedoSeedFixture = load_fixture("redo.yaml");
+    let tag = run_tag("E2E_REDO_SEED");
+    for (i, name) in seed.seed_names.iter().enumerate() {
+        let rec = seed
+            .record_template
+            .replace("{tag}", &tag)
+            .replace("{i}", &i.to_string())
+            .replace("{name}", name);
         let info = parse_record(rec.as_bytes()).expect("seed record parses");
-        let _ = engine.add_record(
-            &info.data_source,
-            &info.record_id,
-            &rec,
-            Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
-        );
+        engine
+            .add_record(
+                &info.data_source,
+                &info.record_id,
+                &rec,
+                Some(SzFlags::ADD_RECORD_DEFAULT_FLAGS),
+            )
+            .expect("seed record loads");
     }
-    let backlog_before = engine.count_redo_records().unwrap_or(0);
+    let backlog_before = engine.count_redo_records().expect("count redo");
     eprintln!("e2e_pure_redoer_100pct: redo backlog before = {backlog_before}");
+    assert!(
+        backlog_before > 0,
+        "the seed must leave a redo backlog for the redoer to drain"
+    );
 
     let out_path = std::env::temp_dir().join(format!("sz_e2e_redoer_{}.out", std::process::id()));
     let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
@@ -1345,11 +1364,17 @@ struct DeadlineCase {
     record: String,
 }
 
-fn shutdown_fixture() -> ShutdownFixture {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shutdown.yaml");
+/// Parses `tests/fixtures/<name>` (YAML test data).
+fn load_fixture<T: serde::de::DeserializeOwned>(name: &str) -> T {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
     serde_norway::from_str(&text).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+}
+
+fn shutdown_fixture() -> ShutdownFixture {
+    load_fixture("shutdown.yaml")
 }
 
 /// Polls until `queue` has no ready messages (all delivered to the driver).
@@ -1648,9 +1673,7 @@ struct RejectMarkers {
 }
 
 fn rejects_fixture() -> RejectsFixture {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rejects.yaml");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-    serde_norway::from_str(&text).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+    load_fixture("rejects.yaml")
 }
 
 /// Takes (acks) every ready message of `queue` and returns the bodies.
@@ -1776,10 +1799,7 @@ struct SigkillCase {
 }
 
 fn concurrency_fixture() -> ConcurrencyFixture {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/concurrency.yaml");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-    serde_norway::from_str(&text).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+    load_fixture("concurrency.yaml")
 }
 
 /// A run-unique record-id prefix (records stay in the repository).
@@ -1955,9 +1975,11 @@ fn e2e_rabbit_sigkill_one_of_two_drivers_loses_nothing() {
     {
         std::thread::sleep(Duration::from_millis(20));
     }
-    let loaded_at_kill = records_with_tag(&dsn, &tag);
+    // Kill first, count after: a repository query before the kill would let
+    // the load run on and the kill land near the end.
     victim.kill().expect("SIGKILL victim driver");
     let _ = victim.wait();
+    let loaded_at_kill = records_with_tag(&dsn, &tag);
     let victim_stdout = read_and_remove(&victim_out);
 
     let deadline = Instant::now() + Duration::from_secs(case.loaded_within_secs);
@@ -1979,6 +2001,11 @@ fn e2e_rabbit_sigkill_one_of_two_drivers_loses_nothing() {
         .filter(|l| l.contains(&case.engine_error_marker))
         .collect();
 
+    assert!(
+        loaded_at_kill > 0 && loaded_at_kill < case.count as i64,
+        "SIGKILL must land mid-load ({loaded_at_kill}/{} loaded)\n{stdout}",
+        case.count
+    );
     assert!(drained, "source queue did not drain\n{stdout}");
     let status = status.expect("survivor did not exit within bound after SIGTERM");
     assert!(status.success(), "survivor exited {status:?}\n{stdout}");
