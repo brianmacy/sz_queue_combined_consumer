@@ -101,7 +101,7 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_SQS_WAIT_TIME` (`--wait-time`) | 20 | SQS binary only: long-poll seconds (0..=20) |
 | `SENZING_SQS_MAX_MESSAGES` (`--max-messages`) | 10 | SQS binary only: receive batch size (1..=10); further capped by free in-flight room |
 | `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_ENDPOINT_URL`, … | provider chain | SQS binary only: standard AWS SDK resolution (env, `~/.aws`, IMDS/ECS role, web identity). SSO / `credential_process` are not compiled in (see Cargo.toml). |
-| `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | diagnostic MQ depth probe cadence (not a correctness poll) |
+| `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | both binaries, queue mode: diagnostic MQ depth probe cadence (RabbitMQ: passive declare; SQS: `ApproximateNumberOfMessages`) and the `MQ drained (depth 0)` / `MQ active (depth N)` transition log. Not a correctness poll. |
 | `SENZING_REDO_SLEEP_TIME_IN_SECONDS` (`--redo-sleep-secs`) | 60 | fetcher pause on empty redo queue (auto-shortened to 2 s while redo is still in flight, for cascade drain) |
 | `LONG_RECORD` (`--long-record`) | 300 | long-record threshold, seconds; stats cadence = LONG_RECORD/2 |
 | `SENZING_LOG_LEVEL` | info | log level (`RUST_LOG` overrides) |
@@ -136,14 +136,23 @@ driver uses this one convention for both binaries.)
   `LONG_RECORD × (n+1)` has its visibility extended to `(n+2) × LONG_RECORD`
   (`ChangeMessageVisibility`, capped at the SQS 12 h maximum) and is logged as
   `Extended visibility (… min, extended n times): DS : ID`. When every worker
-  is on such a record: `All N threads are stuck on long running records`.
+  is on such a record (every record past `LONG_RECORD` counts, not only those
+  extended on that tick): `All N threads are stuck on long running records`.
+  SQS never dead-letters a record for running long (Senzing v4 SQS consumer
+  parity); only RabbitMQ gives up at `2 × LONG_RECORD`.
+* **Receive errors.** A failed `ReceiveMessage` is retried every second; 30
+  consecutive failures (≈ 30 s of an unreachable or denying endpoint) are
+  fatal — orderly shutdown, exit 255. Any successful receive resets the count.
 * **Settle.** Deletes are batched (`DeleteMessageBatch`, 10 per call, flushed
   every second and at shutdown). A fatal engine error leaves the message
-  un-deleted so SQS redelivers it. Messages still in a worker at SIGTERM are
-  printed as `Still processing (… min): DS : ID` and left for redelivery.
+  un-deleted so SQS redelivers it. At shutdown (SIGINT / SIGTERM / SIGHUP,
+  bounded by the same 10 s grace as RabbitMQ) messages still in — or queued
+  for — a worker are printed as `Still processing (… min): DS : ID` and left
+  un-deleted for redelivery after their visibility timeout (never
+  dead-lettered).
 * **Stats.** Same `Processed N adds, R records per second`, `Engine stats:` and
   `Combined stats:` lines as the RabbitMQ binary; `mq_depth` is the source
-  queue's `ApproximateNumberOfMessages`.
+  queue's `ApproximateNumberOfMessages`, probed every `--mq-recheck-secs`.
 * **IAM.** On the source queue: `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
   `sqs:ChangeMessageVisibility`, `sqs:GetQueueAttributes`. On the DLQ:
   `sqs:SendMessage`, `sqs:GetQueueUrl` (discovery only).
@@ -180,8 +189,10 @@ sz_rabbit_combined_consumer --file records.jsonl \
 ## Failure handling
 
 * **Poison MQ record** (bad JSON / missing DATA_SOURCE/RECORD_ID / non-UTF-8 /
-  engine BadInput / SENZ0082 / long-record give-up) → dead-letter
-  (`basic_reject`, no requeue) + loud warn, keep running.
+  engine BadInput / SENZ0082 / long-record give-up — the last RabbitMQ only;
+  SQS extends visibility instead) → dead-letter (RabbitMQ: `basic_reject`, no
+  requeue; SQS: `SendMessage` to the DLQ, then delete) + loud warn, keep
+  running.
 * **Poison redo record** (BadInput / retry timeout / SENZ0082) → warn (with the
   engine error text) + drop (no queue to reject to; counted as
   `redos_dropped`). SENZ0082 on a redo record is dropped rather than fatal on
@@ -194,12 +205,14 @@ sz_rabbit_combined_consumer --file records.jsonl \
   shutdown, exit 255), never dead-lettered: the database is unhealthy, not the
   record. Deliveries stay unacked / un-deleted so the broker redelivers them
   once the process is restarted.
-* **Fatal errors** (Database, NotInitialized, License, …) → orderly teardown,
-  non-zero exit. Graceful shutdown (SIGINT, SIGTERM, or — RabbitMQ queue mode —
-  SIGHUP) drains in-flight work within a 10 s grace;
-  deliveries still inside a worker are dead-lettered (the engine call may still
-  complete — requeue would double-process), queued-but-unstarted deliveries are
-  left unacked for broker requeue. If a worker is still inside an
+* **Fatal errors** (Database, NotInitialized, License, …; SQS also 30
+  consecutive `ReceiveMessage` failures) → orderly teardown, non-zero exit.
+  Graceful shutdown (SIGINT, SIGTERM, or — queue mode — SIGHUP) drains
+  in-flight work within a 10 s grace; queued-but-unstarted deliveries are left
+  for broker redelivery. Deliveries still inside a worker: **RabbitMQ**
+  dead-letters them (the engine call may still complete — requeue would
+  double-process); **SQS** leaves them un-deleted for redelivery after the
+  visibility timeout (`add_record` is idempotent). If a worker is still inside an
   uninterruptible engine call after the grace (the same deadline also bounds
   the stats-thread join), the native environment destroy is skipped
   (leak-on-exit over use-after-free).

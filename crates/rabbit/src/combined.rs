@@ -29,6 +29,8 @@ use sz_combined_consumer_core::queue_run::RunOutcome;
 const RABBIT_POLICY: Policy = Policy {
     dead_letter_long_records: true,
     dead_letter_in_worker_at_shutdown: true,
+    count_rejects_in_total: true,
+    stuck_records_label: "load records",
 };
 
 /// Runs the combined driver until SIGINT/SIGTERM/SIGHUP or a fatal engine

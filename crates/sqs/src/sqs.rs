@@ -1,65 +1,81 @@
-//! Amazon SQS ingestion loop.
-//!
-//! The SQS analogue of the RabbitMQ `combined` loop. It reuses the SAME core
-//! worker pool + redo fetcher + stats; only the ingestion and settle differ:
+//! Amazon SQS [`Transport`] for the shared core queue loop
+//! ([`queue_loop::run`]), which owns the engine worker pool, the redo fetcher
+//! (redo% > 0), stats, the long-record monitor, the depth probe and the
+//! bounded-grace shutdown. Only ingestion and settle are SQS-specific:
 //!
 //! | Concern      | RabbitMQ (combined.rs)        | SQS (here)                                   |
 //! |--------------|-------------------------------|----------------------------------------------|
-//! | ingest       | lapin push consumer stream    | ReceiveMessage long-poll                     |
+//! | ingest       | lapin push consumer stream    | ReceiveMessage long-poll task -> channel     |
 //! | backpressure | basic_qos prefetch            | bounded in-flight count (threads + prefetch) |
 //! | ack success  | basic_ack(delivery_tag)       | DeleteMessageBatch(receipt_handle)           |
 //! | dead-letter  | basic_reject(requeue=false)   | SendMessage to the DLQ, then delete          |
 //! | long record  | reject at 2x LONG_RECORD      | ChangeMessageVisibility heartbeat            |
 //! | fatal/leave  | leave unacked -> redeliver    | don't delete -> visibility expiry            |
-//! | identity     | u64 delivery tag              | synthetic u64 -> in-flight entry map         |
+//! | identity     | u64 delivery tag              | synthetic u64 -> receipt-handle map          |
+//!
+//! ## Receiving
+//! A poller task long-polls `ReceiveMessage` and feeds a bounded channel that
+//! [`Transport::recv`] reads (cancel-safe): cancelling a raw `ReceiveMessage`
+//! inside the loop's `select!` could orphan messages SQS already handed out.
+//! The poller holds one semaphore permit per received-but-unsettled message
+//! (cap `threads + prefetch`, v4 parity) so queued messages never sit with
+//! their visibility timer running down. [`RECEIVE_ERROR_MAX`] consecutive
+//! `ReceiveMessage` failures are fatal (orderly shutdown, exit 255).
 //!
 //! ## Dead-letter queue
 //! SQS has no reject verb. An explicit `DeleteMessage` removes the message for
 //! good and NEVER routes it through the queue's redrive policy (redrive only
 //! moves messages that were received `maxReceiveCount` times without being
 //! deleted). So, exactly like `sz_sqs_consumer-v4`, a rejected record is
-//! `SendMessage`d to the dead-letter queue and only then deleted from the
-//! source. The DLQ is taken from `--dead-letter-queue-url`, else discovered
-//! from the source queue's `RedrivePolicy` (`deadLetterTargetArn` ->
-//! `GetQueueUrl`). Without either the driver refuses to start unless
-//! `--allow-no-dlq` is given (bad records would be silently destroyed).
+//! `SendMessage`d to the dead-letter queue verbatim and only then deleted from
+//! the source. The DLQ is taken from `--dead-letter-queue-url`, else
+//! discovered from the source queue's `RedrivePolicy` (`deadLetterTargetArn`
+//! -> `GetQueueUrl`), BEFORE anything is spawned. Without either the driver
+//! refuses to start unless `--allow-no-dlq` is given (bad records would be
+//! silently destroyed).
 //!
 //! ## Long records
 //! A record still processing past `LONG_RECORD * (n + 1)` seconds has its
 //! visibility extended to `(n + 2) * LONG_RECORD` so SQS does not redeliver it
-//! mid-`add_record` (duplicate add). Cadence `LONG_RECORD / 2`, redoer/consumer
-//! parity. SQS caps visibility at 12 h; extensions are clamped.
-//!
-//! Worker code is keyed by an opaque `u64` (see `worker.rs`); each received
-//! message is assigned a monotonic `u64` id mapped to its [`SqsInFlight`] entry
-//! (receipt handle, body, ids, start time, extension count).
+//! mid-`add_record` (duplicate add); it is never dead-lettered for running
+//! long (Senzing v4 SQS consumer parity). SQS caps visibility at 12 h;
+//! extensions are clamped. At shutdown a record still inside a worker is left
+//! un-deleted for redelivery after its visibility timeout.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_sqs::Client;
+use aws_sdk_sqs::config::retry::RetryConfig;
+use aws_sdk_sqs::operation::receive_message::ReceiveMessageOutput;
 use aws_sdk_sqs::types::{
-    DeleteMessageBatchRequestEntry, MessageSystemAttributeName, QueueAttributeName,
+    DeleteMessageBatchRequestEntry, Message, MessageSystemAttributeName, QueueAttributeName,
 };
 use sz_rust_sdk::prelude::*;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use sz_combined_consumer_core::config::Config;
-use sz_combined_consumer_core::pool::{EnginePool, spawn_engine_pool};
-use sz_combined_consumer_core::queue_run::{RunOutcome, install_signals, monitor_interval};
+use sz_combined_consumer_core::queue_loop::{self, DeadLetterReason, Delivery, Policy, Transport};
+use sz_combined_consumer_core::queue_run::RunOutcome;
 use sz_combined_consumer_core::record::{RecordInfo, parse_record};
-use sz_combined_consumer_core::stats::{
-    self, ADDS_PROCESSED, ADDS_REJECTED, RUNNING, StatsThread, StatusTicker, ThroughputTicker,
-};
-use sz_combined_consumer_core::worker::{
-    Action, LoadItem, Outcome, SHUTDOWN_GRACE, monitor_redo_in_flight,
-};
+use sz_combined_consumer_core::stats::ADDS_REJECTED;
 
 use crate::SqsParams;
+
+/// SQS settle policy: extend visibility on long records (never dead-letter
+/// them) and leave in-worker messages for redelivery at shutdown. The final
+/// total counts acks only.
+const SQS_POLICY: Policy = Policy {
+    dead_letter_long_records: false,
+    dead_letter_in_worker_at_shutdown: false,
+    count_rejects_in_total: false,
+    stuck_records_label: "records",
+};
 
 /// SQS hard maximum for a message's visibility timeout (12 hours).
 pub const MAX_VISIBILITY_SECS: u64 = 43_200;
@@ -69,23 +85,14 @@ const DELETE_BATCH_MAX: usize = 10;
 const DELETE_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 /// Backoff after a `ReceiveMessage` API error.
 const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_secs(1);
-
-/// A received-but-unsettled message.
-pub struct SqsInFlight {
-    pub receipt_handle: String,
-    /// Original body, forwarded verbatim to the DLQ on reject.
-    pub body: Vec<u8>,
-    pub info: RecordInfo,
-    pub started: Instant,
-    /// Number of visibility extensions granted so far.
-    pub extended: u32,
-    /// FIFO source queues: the received message's group id, reused on the DLQ.
-    pub message_group_id: Option<String>,
-    /// SQS message id; used as the FIFO dedup id on the DLQ.
-    pub message_id: Option<String>,
-}
-
-pub type InFlightMap = Arc<Mutex<HashMap<u64, SqsInFlight>>>;
+/// Consecutive `ReceiveMessage` failures that make the run fatal (exit 255
+/// after the orderly shutdown). With [`RECEIVE_ERROR_BACKOFF`] spacing and
+/// SDK-internal retries disabled for this call, that is ~30 s of an
+/// unreachable/denying SQS endpoint. Any success resets the count.
+const RECEIVE_ERROR_MAX: u32 = 30;
+/// Bound on one diagnostic depth probe, so a hung endpoint cannot stall the
+/// loop that also handles signals.
+const DEPTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Resolved dead-letter destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,28 +192,12 @@ pub async fn resolve_dead_letter(
     Ok(Some(DeadLetter::from_url(url)))
 }
 
-/// Runs the SQS combined driver until SIGINT/SIGTERM or a fatal engine error.
-pub async fn run(
-    config: &Config,
-    params: &SqsParams,
-    env: Arc<SzEnvironmentCore>,
-) -> Result<RunOutcome> {
-    let threads = config.threads;
-    let redo_pref = config.redo_pref_workers();
-    let load_pref = threads - redo_pref;
-    info!(
-        "SQS threads: {threads} (load-preferring: {load_pref}, redo-preferring: {redo_pref}, \
-         redo%: {}, queue: {}, prefetch: {})",
-        config.redo_percent, params.queue_url, params.prefetch
-    );
-
-    // --- SQS client + dead-letter resolution (fail fast, before any engine work)
-    let aws_cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-    let client = Arc::new(Client::new(&aws_cfg));
-    let dead_letter = match resolve_dead_letter(&client, params).await? {
+/// Resolves the DLQ (or the `--allow-no-dlq` opt-out) and announces it.
+async fn dead_letter_or_refuse(client: &Client, params: &SqsParams) -> Result<Option<DeadLetter>> {
+    match resolve_dead_letter(client, params).await? {
         Some(dl) => {
             println!("DeadLetter: {}", dl.url);
-            Some(Arc::new(dl))
+            Ok(Some(dl))
         }
         None if params.allow_no_dlq => {
             warn!(
@@ -215,390 +206,236 @@ pub async fn run(
                  be DELETED and lost. Only the application log will name them.",
                 params.queue_url
             );
-            None
+            Ok(None)
         }
-        None => {
-            return Err(anyhow!(
-                "no dead-letter queue: {} has no RedrivePolicy and --dead-letter-queue-url \
-                 (SENZING_SQS_DEAD_LETTER_QUEUE_URL) is unset. Rejected records would be \
-                 silently destroyed. Attach a redrive policy, pass --dead-letter-queue-url, \
-                 or pass --allow-no-dlq to accept the loss.",
-                params.queue_url
-            ));
-        }
+        None => Err(anyhow!(
+            "no dead-letter queue: {} has no RedrivePolicy and --dead-letter-queue-url \
+             (SENZING_SQS_DEAD_LETTER_QUEUE_URL) is unset. Rejected records would be \
+             silently destroyed. Attach a redrive policy, pass --dead-letter-queue-url, \
+             or pass --allow-no-dlq to accept the loss.",
+            params.queue_url
+        )),
+    }
+}
+
+/// Runs the SQS driver until SIGINT/SIGTERM/SIGHUP, a fatal engine error or
+/// [`RECEIVE_ERROR_MAX`] consecutive receive failures.
+pub async fn run(
+    config: &Config,
+    params: &SqsParams,
+    env: Arc<SzEnvironmentCore>,
+) -> Result<RunOutcome> {
+    let threads = config.threads;
+    let redo_pref = config.redo_pref_workers();
+    info!(
+        "SQS threads: {threads} (load-preferring: {}, redo-preferring: {redo_pref}, \
+         redo%: {}, queue: {}, prefetch: {})",
+        threads - redo_pref,
+        config.redo_percent,
+        params.queue_url,
+        params.prefetch
+    );
+
+    // Client + DLQ resolution fail fast, before any engine thread is spawned.
+    let aws_cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let client = Client::new(&aws_cfg);
+    let dead_letter = dead_letter_or_refuse(&client, params).await?;
+
+    let poll = PollParams {
+        queue_url: params.queue_url.clone(),
+        visibility_timeout: params.visibility_timeout,
+        wait_time: params.wait_time,
+        max_messages: params.max_messages,
+        // Overshoot so workers never idle waiting on a receive (v4 parity).
+        cap: threads + params.prefetch,
     };
+    // The core loop spawns the engine pool BEFORE awaiting this, so the
+    // poller only starts once the workers exist.
+    let connect = async move {
+        Ok(SqsTransport::start(
+            client,
+            poll,
+            dead_letter,
+            config.long_record_secs,
+        ))
+    };
+    queue_loop::run(config, env, connect, SQS_POLICY).await
+}
 
-    // --- Engine pool: bridge channels, redo fetcher (redo% > 0), workers ----
-    let EnginePool {
-        work_tx,
-        mut result_rx,
-        started: _,
-        shutdown_notify,
-        redo_in_flight,
-        threads: engine_threads,
-    } = spawn_engine_pool(config, &env)?;
+/// A received-but-unsettled message.
+struct SqsMessage {
+    receipt_handle: String,
+    /// Original body, forwarded verbatim to the DLQ on reject.
+    body: Vec<u8>,
+    /// FIFO source queues: the received message's group id, reused on the DLQ.
+    message_group_id: Option<String>,
+    /// SQS message id; used as the FIFO dedup id on the DLQ.
+    message_id: Option<String>,
+    /// Receive time: the visibility clock started here.
+    received: Instant,
+    /// Number of visibility extensions granted so far.
+    extended: u32,
+    /// In-flight cap slot, released when the message is settled.
+    _slot: OwnedSemaphorePermit,
+}
 
-    // --- Stats thread (blocking get_stats only; shared core impl) ------------
-    let StatsThread {
-        req_tx: stats_req_tx,
-        resp_rx: mut stats_resp_rx,
-        handle: stats_handle,
-    } = stats::spawn_stats_thread(&env)?;
+impl SqsMessage {
+    /// `DATA_SOURCE` / `RECORD_ID` for log lines (empty for a poison body).
+    fn info(&self) -> RecordInfo {
+        parse_record(&self.body).unwrap_or_else(|_| RecordInfo::empty())
+    }
+}
 
-    // Synthetic id -> in-flight entry for received-but-not-settled messages.
-    let in_flight: InFlightMap = Arc::new(Mutex::new(HashMap::new()));
+/// What the poller hands to [`Transport::recv`].
+type Received = Result<(u64, SqsMessage)>;
 
-    // --- Poller task: ReceiveMessage -> parse -> work channel ----------------
-    let poller = {
-        let client = client.clone();
-        let in_flight = in_flight.clone();
-        let notify = shutdown_notify.clone();
-        let dead_letter = dead_letter.clone();
-        let p = PollParams {
-            queue_url: params.queue_url.clone(),
-            visibility_timeout: params.visibility_timeout,
-            wait_time: params.wait_time,
-            max_messages: params.max_messages,
-            // Overshoot so workers never idle waiting on a receive (v4 parity).
-            cap: threads + params.prefetch,
+/// The SQS transport: a poller task feeding a bounded channel, the receipt
+/// handles of everything unsettled, and a background delete batcher.
+pub struct SqsTransport {
+    client: Client,
+    queue_url: String,
+    dead_letter: Option<DeadLetter>,
+    long_record_secs: u64,
+    rx: mpsc::Receiver<Received>,
+    unsettled: HashMap<u64, SqsMessage>,
+    delete_tx: mpsc::UnboundedSender<(u64, String)>,
+    stop_tx: watch::Sender<bool>,
+    poller: JoinHandle<()>,
+    deleter: JoinHandle<()>,
+}
+
+impl SqsTransport {
+    /// Spawns the poller and the delete batcher.
+    fn start(
+        client: Client,
+        poll: PollParams,
+        dead_letter: Option<DeadLetter>,
+        long_record_secs: u64,
+    ) -> Self {
+        let queue_url = poll.queue_url.clone();
+        let (tx, rx) = mpsc::channel(poll.max_messages.max(1) as usize);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (delete_tx, delete_rx) = mpsc::unbounded_channel();
+        let poller = Poller {
+            client: client.clone(),
+            slots: Arc::new(Semaphore::new(poll.cap.max(1))),
+            p: poll,
+            tx,
+            stop: stop_rx,
+            next_tag: 1,
         };
-        tokio::spawn(async move {
-            poll_loop(client, p, dead_letter, work_tx, in_flight, notify).await;
-        })
-    };
-
-    // --- Main loop: signals + outcomes + monitor + stats + delete flush ------
-    let (mut sigint, mut sigterm) = install_signals()?;
-
-    let mut monitor = monitor_interval(config.long_record_secs);
-    let mut flush_tick = tokio::time::interval(DELETE_FLUSH_INTERVAL);
-    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    let mut deletes = DeleteBatcher::default();
-    let mut throughput = ThroughputTicker::default();
-    let mut processed: u64 = 0;
-    let mut fatal: Option<String> = None;
-    let mut shutting_down = false;
-    let mut queue_depth: Option<u32> = None;
-    let mut status = StatusTicker::new(config.redo_percent, load_pref, redo_pref);
-
-    loop {
-        tokio::select! {
-            biased;
-
-            _ = sigint.recv(), if !shutting_down => {
-                info!("SIGINT received, shutting down gracefully");
-                shutting_down = true;
-                RUNNING.store(false, Ordering::Relaxed);
-                shutdown_notify.notify_waiters();
-            }
-            _ = sigterm.recv(), if !shutting_down => {
-                info!("SIGTERM received, shutting down gracefully");
-                shutting_down = true;
-                RUNNING.store(false, Ordering::Relaxed);
-                shutdown_notify.notify_waiters();
-            }
-            maybe = result_rx.recv() => {
-                match maybe {
-                    Some(outcome) => {
-                        let before = processed;
-                        let settled = handle_outcome(
-                            &client, dead_letter.as_deref(), &in_flight,
-                            &mut deletes, outcome,
-                        ).await;
-                        match settled {
-                            Settled::Added => processed += 1,
-                            Settled::Rejected => {}
-                            Settled::Fatal(msg) => {
-                                if fatal.is_none() {
-                                    fatal = Some(msg);
-                                }
-                                shutting_down = true;
-                                RUNNING.store(false, Ordering::Relaxed);
-                                shutdown_notify.notify_waiters();
-                            }
-                        }
-                        throughput.report(before, processed);
-                        if deletes.len() >= DELETE_BATCH_MAX {
-                            deletes.flush(&client, &params.queue_url).await;
-                        }
-                    }
-                    // All worker + fetcher result senders dropped -> everyone
-                    // finished. Only happens after RUNNING=false stops the poller.
-                    None => break,
-                }
-            }
-            _ = flush_tick.tick() => {
-                deletes.flush(&client, &params.queue_url).await;
-            }
-            _ = monitor.tick() => {
-                let _ = stats_req_tx.send(());
-                extend_long_records(
-                    &client, &params.queue_url, &in_flight, config.long_record_secs, threads,
-                ).await;
-                if config.redo_percent > 0 {
-                    monitor_redo_in_flight(&redo_in_flight, config.long_record_secs, redo_pref);
-                }
-                queue_depth = approximate_depth(&client, &params.queue_url).await;
-            }
-            Some(payload) = stats_resp_rx.recv() => {
-                status.on_payload(&payload, queue_depth);
-            }
+        let deleter = tokio::spawn(delete_loop(client.clone(), queue_url.clone(), delete_rx));
+        Self {
+            client,
+            queue_url,
+            dead_letter,
+            long_record_secs,
+            rx,
+            unsettled: HashMap::new(),
+            delete_tx,
+            stop_tx,
+            poller: tokio::spawn(poller.run()),
+            deleter,
         }
     }
 
-    // --- Shutdown: poller already stopping; bounded worker join --------------
-    let _ = poller.await;
-    drop(stats_req_tx);
-    // Unlike RabbitMQ (which detaches it), the stats thread is joined too.
-    let join_deadline = Instant::now() + SHUTDOWN_GRACE;
-    let all_workers_joined = engine_threads
-        .join_bounded(join_deadline, Some(stats_handle))
-        .await;
-
-    // Settled adds whose delete is still pending must not be redelivered.
-    deletes.flush(&client, &params.queue_url).await;
-
-    // Messages received but never settled are left un-deleted; SQS redelivers
-    // them after the visibility timeout expires (at-least-once). Name them
-    // (v4 parity) so an operator can correlate a later duplicate.
-    {
-        let now = Instant::now();
-        let map = in_flight.lock().unwrap_or_else(PoisonError::into_inner);
-        for f in map.values() {
-            println!(
-                "Still processing ({:.1} min): {} : {}",
-                now.duration_since(f.started).as_secs_f64() / 60.0,
-                f.info.data_source,
-                f.info.record_id
-            );
-        }
+    fn delete(&self, tag: u64, receipt_handle: String) {
+        // The batcher only exits after `close` drops the sender.
+        let _ = self.delete_tx.send((tag, receipt_handle));
     }
 
-    // Ack-only total (rejects are not counted, unlike RabbitMQ's `processed`).
-    stats::print_final_totals(ADDS_PROCESSED.load(Ordering::Relaxed) as u64);
-
-    Ok(RunOutcome {
-        all_workers_joined,
-        fatal,
-    })
-}
-
-/// What `handle_outcome` did with a delivery.
-enum Settled {
-    Added,
-    Rejected,
-    Fatal(String),
-}
-
-/// Applies a worker outcome to SQS. Ack -> queue a delete; Reject -> forward to
-/// the DLQ then queue a delete; Fatal -> leave un-deleted so SQS redelivers it.
-async fn handle_outcome(
-    client: &Client,
-    dead_letter: Option<&DeadLetter>,
-    in_flight: &InFlightMap,
-    deletes: &mut DeleteBatcher,
-    outcome: Outcome,
-) -> Settled {
-    let Outcome {
-        delivery_tag,
-        info,
-        action,
-    } = outcome;
-    let entry = in_flight
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(&delivery_tag);
-    match action {
-        Action::Ack(maybe_info) => {
-            if let Some(resp) = maybe_info {
-                println!("{resp}");
-            }
-            ADDS_PROCESSED.fetch_add(1, Ordering::Relaxed);
-            if let Some(f) = entry {
-                deletes.push(delivery_tag, f.receipt_handle);
-            }
-            Settled::Added
-        }
-        Action::RejectNoRequeue => {
-            ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
-            match entry {
-                Some(f) => {
-                    // A failed DLQ send leaves the source message for
-                    // redelivery; either way this delivery is settled here.
-                    dead_letter_and_delete(client, dead_letter, &f, deletes, delivery_tag).await;
-                    Settled::Rejected
-                }
-                None => {
-                    warn!(
-                        "no in-flight entry for rejected SQS message {delivery_tag} ({} : {}); \
-                         cannot dead-letter",
-                        info.data_source, info.record_id
-                    );
-                    Settled::Rejected
-                }
-            }
-        }
-        Action::Fatal(msg) => {
-            error!("fatal engine error on SQS message {delivery_tag}: {msg}");
-            // Entry already removed WITHOUT a delete: the visibility timeout
-            // redelivers the record after this process exits.
-            Settled::Fatal(msg)
-        }
-    }
-}
-
-/// Forwards a rejected message to the DLQ (v4 parity: `Sending to deadletter`)
-/// and, only if that succeeded (or no DLQ is configured), queues the source
-/// delete. On a failed `SendMessage` the source message is left alone so the
-/// visibility timeout redelivers it — never delete what was not preserved.
-async fn dead_letter_and_delete(
-    client: &Client,
-    dead_letter: Option<&DeadLetter>,
-    f: &SqsInFlight,
-    deletes: &mut DeleteBatcher,
-    id: u64,
-) {
-    match dead_letter {
-        Some(dl) => {
-            println!(
-                "Sending to deadletter: {} : {}",
-                f.info.data_source, f.info.record_id
-            );
-            match send_to_dead_letter(client, dl, f).await {
-                Ok(()) => deletes.push(id, f.receipt_handle.clone()),
-                Err(e) => error!(
-                    "SendMessage to DLQ {} failed for {} : {}: {e:#}; leaving the source \
-                     message for redelivery",
-                    dl.url, f.info.data_source, f.info.record_id
-                ),
-            }
-        }
-        None => {
+    /// Forwards `m` to the DLQ (v4 parity: `Sending to deadletter`) and, only
+    /// if that succeeded (or no DLQ is configured), deletes the source. On a
+    /// failed `SendMessage` the source is left alone so the visibility timeout
+    /// redelivers it — never delete what was not preserved.
+    async fn dead_letter_and_delete(&self, tag: u64, m: SqsMessage) {
+        let info = m.info();
+        let Some(dl) = &self.dead_letter else {
             warn!(
                 "REJECTING (no DLQ, --allow-no-dlq): deleting {} : {}; body follows: {}",
-                f.info.data_source,
-                f.info.record_id,
-                String::from_utf8_lossy(&f.body)
+                info.data_source,
+                info.record_id,
+                String::from_utf8_lossy(&m.body)
             );
-            deletes.push(id, f.receipt_handle.clone());
+            self.delete(tag, m.receipt_handle);
+            return;
+        };
+        println!(
+            "Sending to deadletter: {} : {}",
+            info.data_source, info.record_id
+        );
+        match send_to_dead_letter(&self.client, dl, &m, &info).await {
+            Ok(()) => self.delete(tag, m.receipt_handle),
+            Err(e) => error!(
+                "SendMessage to DLQ {} failed for {} : {}: {e:#}; leaving the source \
+                 message for redelivery",
+                dl.url, info.data_source, info.record_id
+            ),
         }
     }
 }
 
-async fn send_to_dead_letter(client: &Client, dl: &DeadLetter, f: &SqsInFlight) -> Result<()> {
-    let body = std::str::from_utf8(&f.body).context("non-UTF-8 body cannot be forwarded to SQS")?;
-    let mut req = client.send_message().queue_url(&dl.url).message_body(body);
-    if dl.fifo {
-        let group = f
-            .message_group_id
-            .clone()
-            .unwrap_or_else(|| f.info.data_source.clone());
-        let dedup = f
-            .message_id
-            .clone()
-            .unwrap_or_else(|| format!("{}-{}", f.info.data_source, f.info.record_id));
-        req = req.message_group_id(group).message_deduplication_id(dedup);
-    }
-    req.send().await.map(|_| ()).map_err(anyhow::Error::from)
-}
-
-/// Accumulates receipt handles and deletes them in batches of up to 10.
-#[derive(Default)]
-struct DeleteBatcher {
-    pending: Vec<(u64, String)>,
-}
-
-impl DeleteBatcher {
-    fn push(&mut self, id: u64, receipt_handle: String) {
-        self.pending.push((id, receipt_handle));
+impl Transport for SqsTransport {
+    async fn recv(&mut self) -> Option<Result<Delivery>> {
+        let (tag, m) = match self.rx.recv().await? {
+            Ok(received) => received,
+            Err(e) => return Some(Err(e)),
+        };
+        let body = m.body.clone();
+        self.unsettled.insert(tag, m);
+        Some(Ok(Delivery { tag, body }))
     }
 
-    fn len(&self) -> usize {
-        self.pending.len()
-    }
-
-    /// Issues `DeleteMessageBatch` for everything pending. A failed entry is
-    /// logged (the message redelivers after its visibility timeout, and
-    /// `add_record` is idempotent), never retried here.
-    async fn flush(&mut self, client: &Client, queue_url: &str) {
-        while !self.pending.is_empty() {
-            let take = self.pending.len().min(DELETE_BATCH_MAX);
-            let chunk: Vec<(u64, String)> = self.pending.drain(..take).collect();
-            let entries: Vec<DeleteMessageBatchRequestEntry> = chunk
-                .iter()
-                .filter_map(|(id, handle)| {
-                    DeleteMessageBatchRequestEntry::builder()
-                        .id(id.to_string())
-                        .receipt_handle(handle)
-                        .build()
-                        .ok()
-                })
-                .collect();
-            match client
-                .delete_message_batch()
-                .queue_url(queue_url)
-                .set_entries(Some(entries))
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    for failed in resp.failed() {
-                        warn!(
-                            "SQS DeleteMessageBatch entry {} failed: {} ({}); message will \
-                             redeliver after its visibility timeout",
-                            failed.id(),
-                            failed.code(),
-                            failed.message().unwrap_or("")
-                        );
-                    }
-                }
-                Err(e) => warn!(
-                    "SQS DeleteMessageBatch of {} message(s) failed: {e}; they will redeliver \
-                     after their visibility timeout",
-                    chunk.len()
-                ),
-            }
+    async fn ack(&mut self, tag: u64) {
+        if let Some(m) = self.unsettled.remove(&tag) {
+            self.delete(tag, m.receipt_handle);
         }
     }
-}
 
-/// Visibility heartbeat + long-record report (v4 parity). Extends every record
-/// past its current threshold and prints the all-stuck warning.
-async fn extend_long_records(
-    client: &Client,
-    queue_url: &str,
-    in_flight: &InFlightMap,
-    long_record_secs: u64,
-    max_workers: usize,
-) {
-    let now = Instant::now();
-    // Decide under the lock, call the API outside it.
-    let mut to_extend: Vec<(u64, String, u64, u32, RecordInfo, Duration)> = Vec::new();
-    let mut num_stuck = 0usize;
-    {
-        let mut map = in_flight.lock().unwrap_or_else(PoisonError::into_inner);
-        for (id, f) in map.iter_mut() {
-            let elapsed = now.duration_since(f.started);
-            if let Some(new_vis) = visibility_extension(elapsed, long_record_secs, f.extended) {
-                num_stuck += 1;
-                f.extended += 1;
-                to_extend.push((
-                    *id,
-                    f.receipt_handle.clone(),
-                    new_vis,
-                    f.extended,
-                    f.info.clone(),
-                    elapsed,
-                ));
-            }
+    async fn dead_letter(&mut self, tag: u64, reason: DeadLetterReason) {
+        let Some(m) = self.unsettled.remove(&tag) else {
+            warn!("no unsettled SQS message {tag} ({reason:?}); cannot dead-letter");
+            return;
+        };
+        if reason == DeadLetterReason::Malformed {
+            // Counted here (never reaches a worker), as before the port.
+            ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+        }
+        self.dead_letter_and_delete(tag, m).await;
+    }
+
+    /// Leaves the message un-deleted: SQS redelivers it after its visibility
+    /// timeout (at-least-once). Named (v4 parity) so an operator can correlate
+    /// a later duplicate.
+    async fn release(&mut self, tag: u64) {
+        if let Some(m) = self.unsettled.remove(&tag) {
+            let info = m.info();
+            println!(
+                "Still processing ({:.1} min): {} : {}",
+                m.received.elapsed().as_secs_f64() / 60.0,
+                info.data_source,
+                info.record_id
+            );
         }
     }
-    for (id, handle, new_vis, times, info, elapsed) in to_extend {
-        match client
+
+    /// Visibility heartbeat, measured from the receive time (the visibility
+    /// clock), not the loop's dispatch time.
+    async fn extend_lease(&mut self, tag: u64, _elapsed: Duration) {
+        let Some(m) = self.unsettled.get_mut(&tag) else {
+            return;
+        };
+        let elapsed = m.received.elapsed();
+        let Some(new_vis) = visibility_extension(elapsed, self.long_record_secs, m.extended) else {
+            return;
+        };
+        m.extended += 1;
+        let (handle, times, info) = (m.receipt_handle.clone(), m.extended, m.info());
+        match self
+            .client
             .change_message_visibility()
-            .queue_url(queue_url)
-            .receipt_handle(&handle)
+            .queue_url(&self.queue_url)
+            .receipt_handle(handle)
             .visibility_timeout(new_vis as i32)
             .send()
             .await
@@ -610,31 +447,149 @@ async fn extend_long_records(
                 info.record_id
             ),
             Err(e) => warn!(
-                "ChangeMessageVisibility failed for {id} ({} : {}): {e}; SQS may redeliver \
+                "ChangeMessageVisibility failed for {tag} ({} : {}): {e}; SQS may redeliver \
                  this in-progress record",
                 info.data_source, info.record_id
             ),
         }
     }
-    if num_stuck >= max_workers {
-        println!("All {max_workers} threads are stuck on long running records");
+
+    fn stop_intake(&mut self) {
+        let _ = self.stop_tx.send(true);
+    }
+
+    /// `ApproximateNumberOfMessages` (visible messages only).
+    async fn depth(&mut self) -> Option<u32> {
+        let probe = self
+            .client
+            .get_queue_attributes()
+            .queue_url(&self.queue_url)
+            .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
+            .send();
+        let resp = match tokio::time::timeout(DEPTH_PROBE_TIMEOUT, probe).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                warn!("MQ depth probe failed: {e}");
+                return None;
+            }
+            Err(_) => {
+                warn!("MQ depth probe timed out after {DEPTH_PROBE_TIMEOUT:?}");
+                return None;
+            }
+        };
+        resp.attributes()?
+            .get(&QueueAttributeName::ApproximateNumberOfMessages)?
+            .parse()
+            .ok()
+    }
+
+    /// Stops the poller, flushes every pending delete (settled adds must not
+    /// be redelivered) and names messages received but never dispatched (left
+    /// for redelivery).
+    async fn close(mut self) {
+        self.stop_intake();
+        let _ = self.poller.await;
+        let mut undispatched = 0usize;
+        while let Ok(Ok(_)) = self.rx.try_recv() {
+            undispatched += 1;
+        }
+        if undispatched > 0 {
+            info!("leaving {undispatched} received-but-undispatched SQS message(s) for redelivery");
+        }
+        drop(self.delete_tx);
+        let _ = self.deleter.await;
     }
 }
 
-/// Diagnostic `ApproximateNumberOfMessages` for the status line (one cheap
-/// attribute call per monitor tick; not a correctness poll).
-async fn approximate_depth(client: &Client, queue_url: &str) -> Option<u32> {
-    let resp = client
-        .get_queue_attributes()
-        .queue_url(queue_url)
-        .attribute_names(QueueAttributeName::ApproximateNumberOfMessages)
-        .send()
-        .await
-        .ok()?;
-    resp.attributes()?
-        .get(&QueueAttributeName::ApproximateNumberOfMessages)?
-        .parse()
-        .ok()
+async fn send_to_dead_letter(
+    client: &Client,
+    dl: &DeadLetter,
+    m: &SqsMessage,
+    info: &RecordInfo,
+) -> Result<()> {
+    let body = std::str::from_utf8(&m.body).context("non-UTF-8 body cannot be forwarded to SQS")?;
+    let mut req = client.send_message().queue_url(&dl.url).message_body(body);
+    if dl.fifo {
+        let group = m
+            .message_group_id
+            .clone()
+            .unwrap_or_else(|| info.data_source.clone());
+        let dedup = m
+            .message_id
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", info.data_source, info.record_id));
+        req = req.message_group_id(group).message_deduplication_id(dedup);
+    }
+    req.send().await.map(|_| ()).map_err(anyhow::Error::from)
+}
+
+/// Background delete batcher: `DeleteMessageBatch` when 10 are pending or
+/// every [`DELETE_FLUSH_INTERVAL`]; flushes the rest when the sender drops.
+async fn delete_loop(
+    client: Client,
+    queue_url: String,
+    mut rx: mpsc::UnboundedReceiver<(u64, String)>,
+) {
+    let mut pending: Vec<(u64, String)> = Vec::new();
+    let mut tick = tokio::time::interval(DELETE_FLUSH_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            item = rx.recv() => {
+                let Some(item) = item else { break };
+                pending.push(item);
+                if pending.len() >= DELETE_BATCH_MAX {
+                    flush_deletes(&client, &queue_url, &mut pending).await;
+                }
+            }
+            _ = tick.tick() => flush_deletes(&client, &queue_url, &mut pending).await,
+        }
+    }
+    flush_deletes(&client, &queue_url, &mut pending).await;
+}
+
+/// Issues `DeleteMessageBatch` for everything pending. A failed entry is
+/// logged (the message redelivers after its visibility timeout, and
+/// `add_record` is idempotent), never retried here.
+async fn flush_deletes(client: &Client, queue_url: &str, pending: &mut Vec<(u64, String)>) {
+    while !pending.is_empty() {
+        let take = pending.len().min(DELETE_BATCH_MAX);
+        let chunk: Vec<(u64, String)> = pending.drain(..take).collect();
+        let entries: Vec<DeleteMessageBatchRequestEntry> = chunk
+            .iter()
+            .filter_map(|(id, handle)| {
+                DeleteMessageBatchRequestEntry::builder()
+                    .id(id.to_string())
+                    .receipt_handle(handle)
+                    .build()
+                    .ok()
+            })
+            .collect();
+        match client
+            .delete_message_batch()
+            .queue_url(queue_url)
+            .set_entries(Some(entries))
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                for failed in resp.failed() {
+                    warn!(
+                        "SQS DeleteMessageBatch entry {} failed: {} ({}); message will \
+                         redeliver after its visibility timeout",
+                        failed.id(),
+                        failed.code(),
+                        failed.message().unwrap_or("")
+                    );
+                }
+            }
+            Err(e) => warn!(
+                "SQS DeleteMessageBatch of {} message(s) failed: {e}; they will redeliver \
+                 after their visibility timeout",
+                chunk.len()
+            ),
+        }
+    }
 }
 
 struct PollParams {
@@ -645,127 +600,175 @@ struct PollParams {
     cap: usize,
 }
 
-/// Long-polls SQS and feeds parsed records to the worker pool, bounded by
-/// `cap` outstanding messages. Aborts promptly on `notify` (shutdown) so
-/// `work_tx` is dropped and idle workers observe end-of-stream. Unparseable
-/// messages are dead-lettered (DLQ send, then delete) immediately.
-async fn poll_loop(
-    client: Arc<Client>,
+/// Consecutive `ReceiveMessage` failure counter ([`RECEIVE_ERROR_MAX`]).
+#[derive(Default)]
+struct ReceiveFailures(u32);
+
+impl ReceiveFailures {
+    /// Records one failure; `true` once the run must become fatal.
+    fn failed(&mut self) -> bool {
+        self.0 += 1;
+        self.0 >= RECEIVE_ERROR_MAX
+    }
+
+    fn succeeded(&mut self) {
+        self.0 = 0;
+    }
+}
+
+/// Waits until `stop` is set (or its sender is gone). Cancel-safe.
+async fn stopped(stop: &mut watch::Receiver<bool>) {
+    let _ = stop.wait_for(|s| *s).await;
+}
+
+/// The `ReceiveMessage` long-poll task. Every await point races the stop
+/// signal, so intake ends promptly at shutdown.
+struct Poller {
+    client: Client,
     p: PollParams,
-    dead_letter: Option<Arc<DeadLetter>>,
-    work_tx: mpsc::Sender<LoadItem>,
-    in_flight: InFlightMap,
-    notify: Arc<Notify>,
-) {
-    let mut next_id: u64 = 1;
-    let mut poison_deletes = DeleteBatcher::default();
-    while RUNNING.load(Ordering::Relaxed) {
-        // Backpressure: cap outstanding received-but-unsettled messages so we do
-        // not let their visibility timers run down while queued.
-        let outstanding = in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len();
-        if outstanding >= p.cap {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                _ = notify.notified() => break,
-            }
-            continue;
-        }
-        // Never receive more than we have room for (v4 parity).
-        let room = (p.cap - outstanding).min(p.max_messages as usize).max(1) as i32;
+    slots: Arc<Semaphore>,
+    tx: mpsc::Sender<Received>,
+    stop: watch::Receiver<bool>,
+    next_tag: u64,
+}
 
-        let recv = client
-            .receive_message()
-            .queue_url(&p.queue_url)
-            .max_number_of_messages(room)
-            .wait_time_seconds(p.wait_time)
-            .visibility_timeout(p.visibility_timeout)
-            .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
-            .send();
-        let resp = tokio::select! {
-            r = recv => r,
-            _ = notify.notified() => break,
-        };
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("SQS ReceiveMessage error: {e}; retrying");
-                tokio::time::sleep(RECEIVE_ERROR_BACKOFF).await;
-                continue;
-            }
-        };
-
-        for m in resp.messages() {
-            let (Some(body), Some(handle)) = (m.body(), m.receipt_handle()) else {
-                continue;
+impl Poller {
+    async fn run(mut self) {
+        let mut failures = ReceiveFailures::default();
+        loop {
+            let Some(slots) = self.reserve().await else {
+                return;
             };
-            let id = next_id;
-            next_id += 1;
-            let message_group_id = m
-                .attributes()
-                .and_then(|a| a.get(&MessageSystemAttributeName::MessageGroupId))
-                .cloned();
-            match parse_record(body.as_bytes()) {
-                Ok(info) => {
-                    in_flight
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(
-                            id,
-                            SqsInFlight {
-                                receipt_handle: handle.to_string(),
-                                body: body.as_bytes().to_vec(),
-                                info: info.clone(),
-                                started: Instant::now(),
-                                extended: 0,
-                                message_group_id,
-                                message_id: m.message_id().map(str::to_string),
-                            },
-                        );
-                    let item = LoadItem {
-                        delivery_tag: id,
-                        body: body.as_bytes().to_vec(),
-                        info,
-                    };
-                    if work_tx.send(item).await.is_err() {
-                        // Worker pool gone (fatal) -> stop; work_tx drops on return.
-                        in_flight
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .remove(&id);
-                        poison_deletes.flush(&client, &p.queue_url).await;
-                        return;
-                    }
+            let resp = tokio::select! {
+                biased;
+                () = stopped(&mut self.stop) => return,
+                r = receive_batch(&self.client, &self.p, slots.len()) => r,
+            };
+            let more = match resp {
+                Ok(resp) => {
+                    failures.succeeded();
+                    self.forward(resp, slots).await
+                }
+                Err(e) if failures.failed() => {
+                    let msg = format!(
+                        "SQS ReceiveMessage failed {RECEIVE_ERROR_MAX} consecutive times; \
+                         last error: {e}"
+                    );
+                    self.send(Err(anyhow!(msg))).await;
+                    false
                 }
                 Err(e) => {
-                    // Poison message: cannot even name DATA_SOURCE/RECORD_ID.
-                    warn!("REJECTING unparseable SQS message {id}: {e}");
-                    ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
-                    let f = SqsInFlight {
-                        receipt_handle: handle.to_string(),
-                        body: body.as_bytes().to_vec(),
-                        info: RecordInfo::empty(),
-                        started: Instant::now(),
-                        extended: 0,
-                        message_group_id,
-                        message_id: m.message_id().map(str::to_string),
-                    };
-                    dead_letter_and_delete(
-                        &client,
-                        dead_letter.as_deref(),
-                        &f,
-                        &mut poison_deletes,
-                        id,
-                    )
-                    .await;
+                    warn!("SQS ReceiveMessage error: {e}; retrying");
+                    self.backoff().await
                 }
+            };
+            if !more {
+                return;
             }
         }
-        poison_deletes.flush(&client, &p.queue_url).await;
     }
-    poison_deletes.flush(&client, &p.queue_url).await;
+
+    /// Waits for at least one free in-flight slot, then takes up to one batch
+    /// worth. `None` on stop.
+    async fn reserve(&mut self) -> Option<Vec<OwnedSemaphorePermit>> {
+        let first = tokio::select! {
+            biased;
+            () = stopped(&mut self.stop) => return None,
+            permit = self.slots.clone().acquire_owned() => permit.ok()?,
+        };
+        let mut slots = vec![first];
+        while slots.len() < self.p.max_messages.max(1) as usize {
+            match self.slots.clone().try_acquire_owned() {
+                Ok(permit) => slots.push(permit),
+                Err(_) => break,
+            }
+        }
+        Some(slots)
+    }
+
+    /// Hands each received message (with its slot) to the loop; unused slots
+    /// are released. `false` when stopping.
+    async fn forward(
+        &mut self,
+        resp: ReceiveMessageOutput,
+        mut slots: Vec<OwnedSemaphorePermit>,
+    ) -> bool {
+        for m in resp.messages.unwrap_or_default() {
+            let Some(slot) = slots.pop() else {
+                break;
+            };
+            let Some(msg) = sqs_message(m, slot) else {
+                continue;
+            };
+            let tag = self.next_tag;
+            self.next_tag += 1;
+            if !self.send(Ok((tag, msg))).await {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Bounded channel send, cancelable by stop. `false` when stopping or the
+    /// transport is gone.
+    async fn send(&mut self, item: Received) -> bool {
+        tokio::select! {
+            biased;
+            () = stopped(&mut self.stop) => false,
+            res = self.tx.send(item) => res.is_ok(),
+        }
+    }
+
+    /// Sleeps [`RECEIVE_ERROR_BACKOFF`]; `false` if stopped meanwhile.
+    async fn backoff(&mut self) -> bool {
+        tokio::select! {
+            biased;
+            () = stopped(&mut self.stop) => false,
+            () = tokio::time::sleep(RECEIVE_ERROR_BACKOFF) => true,
+        }
+    }
+}
+
+/// One `ReceiveMessage` for at most `room` messages. SDK-internal retries are
+/// disabled: the poller is the retry policy, so the fatal window stays
+/// [`RECEIVE_ERROR_MAX`] x [`RECEIVE_ERROR_BACKOFF`] (with SDK retries each
+/// failed call would add its own jittered backoff and draw on the client's
+/// retry quota, making the window nondeterministic).
+async fn receive_batch(
+    client: &Client,
+    p: &PollParams,
+    room: usize,
+) -> Result<ReceiveMessageOutput> {
+    client
+        .receive_message()
+        .queue_url(&p.queue_url)
+        .max_number_of_messages(room as i32)
+        .wait_time_seconds(p.wait_time)
+        .visibility_timeout(p.visibility_timeout)
+        .message_system_attribute_names(MessageSystemAttributeName::MessageGroupId)
+        .customize()
+        .config_override(aws_sdk_sqs::config::Builder::new().retry_config(RetryConfig::disabled()))
+        .send()
+        .await
+        .map_err(|e| anyhow!("{}", aws_sdk_sqs::error::DisplayErrorContext(e)))
+}
+
+/// A received SQS message ready to track; `None` (slot released) when it
+/// lacks a body or receipt handle.
+fn sqs_message(m: Message, slot: OwnedSemaphorePermit) -> Option<SqsMessage> {
+    let message_group_id = m
+        .attributes()
+        .and_then(|a| a.get(&MessageSystemAttributeName::MessageGroupId))
+        .cloned();
+    Some(SqsMessage {
+        receipt_handle: m.receipt_handle?,
+        body: m.body?.into_bytes(),
+        message_group_id,
+        message_id: m.message_id,
+        received: Instant::now(),
+        extended: 0,
+        _slot: slot,
+    })
 }
 
 #[cfg(test)]
@@ -829,5 +832,51 @@ mod tests {
             visibility_extension(Duration::from_secs(u64::MAX / 4), 40_000, 5),
             Some(MAX_VISIBILITY_SECS)
         );
+    }
+
+    #[test]
+    fn receive_failures_are_fatal_only_after_max_consecutive() {
+        let mut f = ReceiveFailures::default();
+        for _ in 1..RECEIVE_ERROR_MAX {
+            assert!(!f.failed());
+        }
+        f.succeeded();
+        for _ in 1..RECEIVE_ERROR_MAX {
+            assert!(!f.failed(), "a success resets the count");
+        }
+        assert!(
+            f.failed(),
+            "the {RECEIVE_ERROR_MAX}th consecutive failure is fatal"
+        );
+    }
+
+    #[test]
+    fn sqs_message_requires_body_and_receipt_handle() {
+        let slots = Arc::new(Semaphore::new(2));
+        let full = Message::builder()
+            .body("{}")
+            .receipt_handle("h")
+            .message_id("m")
+            .build();
+        let m = sqs_message(full, slots.clone().try_acquire_owned().unwrap()).unwrap();
+        assert_eq!(
+            (m.receipt_handle.as_str(), m.body.as_slice()),
+            ("h", &b"{}"[..])
+        );
+        assert_eq!(m.message_id.as_deref(), Some("m"));
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "a tracked message holds its slot"
+        );
+        let no_handle = Message::builder().body("{}").build();
+        assert!(sqs_message(no_handle, slots.clone().try_acquire_owned().unwrap()).is_none());
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "a skipped message frees its slot"
+        );
+        drop(m);
+        assert_eq!(slots.available_permits(), 2, "settling frees the slot");
     }
 }

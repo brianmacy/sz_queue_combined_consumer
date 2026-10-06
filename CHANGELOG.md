@@ -2,6 +2,43 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
+## Unreleased — SQS ported onto the core queue loop (2026-10-06)
+
+### Fixed (SQS)
+
+* **Shutdown is bounded by the same 10 s `SHUTDOWN_GRACE` deadline as
+  RabbitMQ.** Previously the loop only exited once every worker had returned,
+  so a worker stuck in an engine call kept the process alive until SIGKILL.
+  Messages still in a worker are left un-deleted (redelivered after the
+  visibility timeout), as before.
+* **SIGHUP is a graceful shutdown** (drain, exit 0, final total), like
+  SIGINT/SIGTERM. Previously it killed the process.
+* **Persistent `ReceiveMessage` failure is fatal**: 30 consecutive failures
+  (1 s apart, SDK-internal retries off for this call) → orderly shutdown, exit
+  255. Previously it retried every second forever. A success resets the count.
+* The poller's hand-off to the loop is cancelable by shutdown (it could block
+  on a full channel).
+* `All N threads are stuck on long running records` now counts every record
+  past `LONG_RECORD`, not only those extended on that tick.
+* The stats thread is joined within the shutdown deadline.
+
+### Changed (SQS)
+
+* New `--mq-recheck-secs` / `SENZING_MQ_RECHECK_SECONDS` (default 30, same as
+  RabbitMQ): the `ApproximateNumberOfMessages` depth probe runs at this cadence
+  (was every `LONG_RECORD / 2`) and logs `MQ drained (depth 0)` /
+  `MQ active (depth N)` transitions.
+* Deletes are batched by a background task (still 10 per call, 1 s flush,
+  flushed at shutdown). Rejects also print the shared
+  `REJECTING due to bad data or timeout: DS : ID` line; a poison message logs
+  `DEAD-LETTERING malformed record` (was `REJECTING unparseable SQS message`).
+* Unchanged: long records extend visibility and are never dead-lettered; the
+  final total counts adds only; `Sending to deadletter`, `Extended visibility`
+  and `Still processing` lines.
+* Internal: `SqsTransport` on core `queue_loop::run`; `Policy` gained
+  `count_rejects_in_total` / `stuck_records_label`, `Transport` gained
+  `stop_intake`; `queue_run::install_signals` removed (unused).
+
 ## Unreleased — core queue loop; RabbitMQ ported onto it (2026-10-06)
 
 ### Changed

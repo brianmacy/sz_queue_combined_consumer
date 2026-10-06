@@ -8,7 +8,7 @@
 //! Modes:
 //! * `--file` — file loader + redo share (shared core path; no SQS, no tokio).
 //! * redo% = 100 — pure `std::thread` redoer (shared core path; no SQS).
-//! * redo% < 100 — the SQS ingestion loop (this bin's `sqs` module).
+//! * redo% < 100 — the shared core queue loop with this bin's `SqsTransport`.
 //!
 //! Credentials/region come from the standard AWS provider chain (env,
 //! `~/.aws`, IMDS, ...) resolved by `aws-config`.
@@ -20,7 +20,7 @@ use clap::Parser;
 use sz_rust_sdk::prelude::*;
 
 use sz_combined_consumer_core::config::{
-    CommonArgs, Config, DEFAULT_LONG_RECORD_SECS, engine_config_from_env,
+    CommonArgs, Config, DEFAULT_LONG_RECORD_SECS, DEFAULT_MQ_RECHECK_SECS, engine_config_from_env,
 };
 use sz_combined_consumer_core::{queue_run, runtime};
 
@@ -93,6 +93,16 @@ struct Args {
     #[arg(long = "prefetch", env = "SENZING_PREFETCH")]
     prefetch: Option<usize>,
 
+    /// Cadence of the diagnostic queue-depth probe (GetQueueAttributes
+    /// ApproximateNumberOfMessages) and its drained/active transition log.
+    /// NOT a correctness poll — the receive long-poll picks up a refill itself.
+    #[arg(
+        long = "mq-recheck-secs",
+        env = "SENZING_MQ_RECHECK_SECONDS",
+        default_value_t = DEFAULT_MQ_RECHECK_SECS
+    )]
+    mq_recheck_secs: u64,
+
     #[command(flatten)]
     common: CommonArgs,
 }
@@ -138,11 +148,12 @@ fn main() -> ExitCode {
 }
 
 /// Resolves and validates everything before engine init: the shared config via
-/// [`Config::from_common`] (url/queue stay `None` and prefetch/mq-recheck stay
-/// inert — SQS has no AMQP topology), plus the SQS params when the SQS load
-/// path will run (redo% < 100, not file mode). Pure (no engine).
+/// [`Config::from_common`] plus the depth-probe cadence (url/queue/prefetch
+/// stay inert — SQS has no AMQP topology), and the SQS params when the SQS
+/// load path will run (redo% < 100, not file mode). Pure (no engine).
 fn build(args: &Args, engine_config: String) -> Result<(Config, Option<SqsParams>), String> {
-    let config = Config::from_common(&args.common, engine_config)?;
+    let mut config = Config::from_common(&args.common, engine_config)?;
+    config.mq_recheck_secs = args.mq_recheck_secs;
     let params = if config.input_file.is_none() && config.redo_percent < 100 {
         Some(sqs_params(args, config.threads)?)
     } else {
@@ -347,6 +358,18 @@ mod tests {
     fn build_leaves_amqp_fields_inert() {
         let (c, _) = build(&args(&["--queue-url", "u"]), "{}".into()).unwrap();
         assert_eq!((c.url, c.queue), (None, None));
-        assert_eq!((c.prefetch, c.mq_recheck_secs), (0, 0));
+        assert_eq!(c.prefetch, 0);
+    }
+
+    #[test]
+    fn build_sets_mq_recheck_secs() {
+        let (c, _) = build(&args(&["--queue-url", "u"]), "{}".into()).unwrap();
+        assert_eq!(c.mq_recheck_secs, DEFAULT_MQ_RECHECK_SECS);
+        let (c, _) = build(
+            &args(&["--queue-url", "u", "--mq-recheck-secs", "1"]),
+            "{}".into(),
+        )
+        .unwrap();
+        assert_eq!(c.mq_recheck_secs, 1);
     }
 }

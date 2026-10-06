@@ -82,6 +82,11 @@ pub trait Transport {
     fn extend_lease(&mut self, _tag: u64, _elapsed: Duration) -> impl Future<Output = ()> + Send {
         async {}
     }
+    /// Stops taking new deliveries (called once, when the running loop ends
+    /// and before the drain), so a backend that prefetches on its own (e.g. a
+    /// polling task) does not keep pulling messages nobody will process.
+    /// Default: no-op (push consumers stop with the connection close).
+    fn stop_intake(&mut self) {}
     /// Current queue depth for the diagnostic probe; `None` if unknown.
     fn depth(&mut self) -> impl Future<Output = Option<u32>> + Send;
     /// Closes the broker connection (last call of a run).
@@ -98,6 +103,13 @@ pub struct Policy {
     /// call may still complete, so a requeue would double-process). `false`:
     /// [`Transport::release`] it like an unstarted one.
     pub dead_letter_in_worker_at_shutdown: bool,
+    /// Count dead-lettered deliveries in the final `Processed total of` line
+    /// and the throughput line (RabbitMQ). `false`: acks only (SQS).
+    pub count_rejects_in_total: bool,
+    /// What the all-workers-stuck warning calls the records
+    /// (`All N threads are stuck on long running <label>`); kept per backend
+    /// so existing log searches keep matching.
+    pub stuck_records_label: &'static str,
 }
 
 /// In-flight bookkeeping for one load delivery the loop is tracking.
@@ -295,6 +307,7 @@ where
 
     // --- Stopping: one deadline bounds the drain AND the join ------------------
     let deadline = Instant::now() + SHUTDOWN_GRACE;
+    s.transport.stop_intake();
     // Stop the redo fetcher (it drops the redo sender on exit) and let idle
     // workers observe end-of-stream on both channels.
     RUNNING.store(false, Ordering::Relaxed);
@@ -336,7 +349,6 @@ where
         ..
     } = s;
     transport.close().await;
-    // `processed` counts acks AND rejects (unlike SQS's ack-only total).
     stats::print_final_totals(processed);
 
     Ok(RunOutcome {
@@ -350,7 +362,8 @@ struct Session<T> {
     transport: T,
     policy: Policy,
     in_flight: HashMap<u64, InFlight>,
-    /// Settled deliveries (acks AND rejects) for the final total.
+    /// Settled deliveries for the final total: acks, plus rejects when
+    /// [`Policy::count_rejects_in_total`].
     processed: u64,
     fatal: Option<String>,
 }
@@ -454,7 +467,9 @@ impl<T: Transport> Session<T> {
                         .dead_letter(delivery_tag, DeadLetterReason::Rejected)
                         .await;
                 }
-                self.processed += 1;
+                if self.policy.count_rejects_in_total {
+                    self.processed += 1;
+                }
                 ADDS_REJECTED.fetch_add(1, Ordering::Relaxed);
                 false
             }
@@ -491,8 +506,13 @@ impl<T: Transport> Session<T> {
                 );
             }
         }
+        // Every delivery past LONG_RECORD counts, not only those touched this
+        // tick.
         if long.len() >= max_workers {
-            println!("All {max_workers} threads are stuck on long running load records");
+            println!(
+                "All {max_workers} threads are stuck on long running {}",
+                self.policy.stuck_records_label
+            );
         }
         for (tag, duration) in long {
             self.transport.extend_lease(tag, duration).await;
