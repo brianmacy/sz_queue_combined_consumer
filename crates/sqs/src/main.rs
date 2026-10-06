@@ -22,7 +22,7 @@ use sz_rust_sdk::prelude::*;
 use sz_combined_consumer_core::config::{
     CommonArgs, Config, DEFAULT_LONG_RECORD_SECS, engine_config_from_env,
 };
-use sz_combined_consumer_core::runtime;
+use sz_combined_consumer_core::{queue_run, runtime};
 
 mod sqs;
 
@@ -198,43 +198,14 @@ fn sqs_params(args: &Args, threads: usize) -> Result<SqsParams, String> {
 /// run on the dedicated `sz-worker` OS threads, never on tokio workers) and run
 /// the SQS ingestion loop, then apply the shared use-after-free exit discipline.
 fn run_sqs(config: Config, params: SqsParams, env: Arc<SzEnvironmentCore>) -> ! {
-    let rt = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("Failed to build tokio runtime: {e}");
-            runtime::leak_and_exit(255);
-        }
-    };
-
-    match rt.block_on(sqs::run(&config, &params, env)) {
-        Ok(outcome) => {
-            let code: u8 = match &outcome.fatal {
-                None => 0,
-                Some(msg) => {
-                    eprintln!("Shutting down due to error: {msg}");
-                    255
-                }
-            };
-            if outcome.all_workers_joined {
-                runtime::teardown_and_exit(code);
-            } else {
-                tracing::warn!(
-                    "skipping Senzing environment destroy: a worker may still be in an \
-                     engine call (leak-on-exit); forcing process exit"
-                );
-                runtime::leak_and_exit(code);
-            }
-        }
-        Err(e) => {
-            eprintln!("{e:#}");
-            tracing::warn!("SQS run() failed; leak-on-exit, forcing process exit");
-            runtime::leak_and_exit(255);
-        }
-    }
+    queue_run::run_queue_mode(
+        sqs::run(&config, &params, env),
+        &queue_run::ExitLogs {
+            leak: "skipping Senzing environment destroy: a worker may still be in an \
+                   engine call (leak-on-exit); forcing process exit",
+            run_failed: "SQS run() failed; leak-on-exit, forcing process exit",
+        },
+    )
 }
 
 #[cfg(test)]

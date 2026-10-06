@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -28,17 +28,16 @@ use lapin::options::{
 use lapin::types::FieldTable;
 use lapin::{Connection, ConnectionProperties};
 use sz_rust_sdk::prelude::*;
-use tokio::sync::{Notify, mpsc};
 
 use sz_combined_consumer_core::config::Config;
+use sz_combined_consumer_core::pool::{EnginePool, spawn_engine_pool};
+use sz_combined_consumer_core::queue_run::{RunOutcome, install_signals, monitor_interval};
 use sz_combined_consumer_core::record::{RecordInfo, parse_record};
-use sz_combined_consumer_core::redo::fetcher_loop;
 use sz_combined_consumer_core::stats::{
-    self, ADDS_PROCESSED, ADDS_REJECTED, RUNNING, StatsPayload, ThroughputTicker, stats_loop,
+    self, ADDS_PROCESSED, ADDS_REJECTED, RUNNING, StatsThread, StatusTicker, ThroughputTicker,
 };
 use sz_combined_consumer_core::worker::{
-    Action, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
-    WorkerCtx, add_record_flags, monitor_redo_in_flight, redo_flags, worker_class, worker_loop,
+    Action, LoadItem, Outcome, SHUTDOWN_GRACE, monitor_redo_in_flight,
 };
 
 /// In-flight bookkeeping for one load delivery the async task is tracking.
@@ -48,18 +47,6 @@ struct InFlight {
     /// Set once we have rejected this delivery to the dead-letter queue so we
     /// do not also ack it when the (now ignored) worker result arrives.
     rejected: bool,
-}
-
-/// Outcome of [`run`], reported to `main` so it can decide whether tearing
-/// down the global Senzing environment is safe and what exit code to use
-/// (consumer parity — see `main.rs`).
-pub struct RunOutcome {
-    /// `true` only if EVERY engine thread (workers + redo fetcher) actually
-    /// finished before the shutdown grace elapsed. When `false`, `main` must
-    /// SKIP the native environment `destroy()` (leak-on-exit over use-after-free).
-    pub all_workers_joined: bool,
-    /// `Some(message)` if shutting down due to a non-recoverable error.
-    pub fatal: Option<String>,
 }
 
 /// Runs the combined driver until SIGINT/SIGTERM or a fatal engine error.
@@ -103,81 +90,16 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
         .clone()
         .context("queue required for redo% < 100 (validated at startup)")?;
 
-    // --- Bridge channels -----------------------------------------------------
-    let (work_tx, work_rx) = mpsc::channel::<LoadItem>(threads);
-    let (result_tx, mut result_rx) = mpsc::channel::<Outcome>(threads * 2);
-    let work_rx = Arc::new(Mutex::new(work_rx));
-    let started: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
-    let shutdown_notify = Arc::new(Notify::new());
-
-    let add_flags = add_record_flags(config.info);
-    let rflags = redo_flags(config.info);
-    let want_info = config.info;
-
-    // --- Redo side (only when redo% > 0) -------------------------------------
-    // At redo% = 0 the process issues ZERO redo-related calls: no channel, no
-    // fetcher, no count_redo_records (design §3 endpoint branching).
-    let redo_in_flight: Arc<Mutex<RedoInFlight>> = Arc::new(Mutex::new(HashMap::new()));
-    let (redo_side, fetcher_handle) = if config.redo_percent > 0 {
-        let (redo_tx, redo_rx) = std::sync::mpsc::sync_channel::<RedoJob>(redo_pref + 2);
-        let redo_rx = Arc::new(Mutex::new(redo_rx));
-        let fetcher_env = env.clone();
-        let sleep_secs = config.redo_sleep_secs;
-        let fetcher_result_tx = result_tx.clone();
-        let fetcher_notify = shutdown_notify.clone();
-        let handle = std::thread::Builder::new()
-            .name("sz-redo-fetcher".to_string())
-            .spawn(move || {
-                fetcher_loop(
-                    fetcher_env,
-                    redo_tx,
-                    sleep_secs,
-                    Some(fetcher_result_tx),
-                    Some(fetcher_notify),
-                    None, // queue mode never self-terminates on an empty redo queue
-                )
-            })
-            .context("failed to spawn redo fetcher thread")?;
-        (
-            Some(RedoSide {
-                redo_rx,
-                in_flight: redo_in_flight.clone(),
-            }),
-            Some(handle),
-        )
-    } else {
-        (None, None)
-    };
-
-    // --- Spawn engine worker threads -----------------------------------------
-    let mut workers = Vec::with_capacity(threads + 1);
-    for worker_id in 0..threads {
-        let class = worker_class(worker_id, redo_pref);
-        let ctx = WorkerCtx {
-            worker_id,
-            class,
-            env: env.clone(),
-            load: Some(LoadSide {
-                work_rx: work_rx.clone(),
-                result_tx: result_tx.clone(),
-                started: started.clone(),
-                shutdown_notify: shutdown_notify.clone(),
-            }),
-            redo: redo_side.clone(),
-            add_flags,
-            redo_flags: rflags,
-            want_info,
-            transform: config.transform.clone(),
-        };
-        let handle = std::thread::Builder::new()
-            .name(format!("sz-worker-{worker_id}"))
-            .spawn(move || worker_loop(ctx))
-            .context("failed to spawn worker thread")?;
-        workers.push(handle);
-    }
-    // Drop our extra clones so the channels close once their users exit.
-    drop(result_tx);
-    drop(redo_side);
+    // --- Engine pool: bridge channels, redo fetcher (redo% > 0), workers ----
+    // Spawned BEFORE connecting (a connect failure stops them via run()).
+    let EnginePool {
+        work_tx,
+        mut result_rx,
+        started,
+        shutdown_notify,
+        redo_in_flight,
+        threads: engine_threads,
+    } = spawn_engine_pool(&config, &env)?;
 
     // --- Connect to RabbitMQ -------------------------------------------------
     tracing::info!("Connecting to RabbitMQ");
@@ -222,10 +144,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
         .context("failed to start consuming")?;
 
     // --- Signal handling -----------------------------------------------------
-    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .context("failed to install SIGINT handler")?;
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .context("failed to install SIGTERM handler")?;
+    let (mut sigint, mut sigterm) = install_signals()?;
 
     // --- Stats thread (blocking get_stats only) ------------------------------
     // NOTE: redo backlog is NO LONGER polled here. count_redo_records() issues a
@@ -235,19 +154,15 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
     // total worker_time on the live MSSQL run). Emptiness/drain is already
     // detected by the fetcher's get_redo_record() returning empty, so the count
     // was pure monitoring cost. Removed.
-    let stats_env = env.clone();
-    let (stats_req_tx, stats_req_rx) = std::sync::mpsc::channel::<()>();
-    let (stats_resp_tx, mut stats_resp_rx) = mpsc::channel::<StatsPayload>(1);
-    let stats_handle = std::thread::Builder::new()
-        .name("sz-stats".to_string())
-        .spawn(move || stats_loop(stats_env, stats_req_rx, stats_resp_tx))
-        .context("failed to spawn stats thread")?;
+    let StatsThread {
+        req_tx: stats_req_tx,
+        resp_rx: mut stats_resp_rx,
+        handle: stats_handle,
+    } = stats::spawn_stats_thread(&env)?;
 
     // --- Main event loop -----------------------------------------------------
     let long_record = Duration::from_secs(config.long_record_secs);
-    let monitor_interval = Duration::from_secs(config.long_record_secs.max(2) / 2);
-    let mut monitor = tokio::time::interval(monitor_interval);
-    monitor.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut monitor = monitor_interval(config.long_record_secs);
     // Diagnostic MQ depth probe: one passive declare per interval (NOT a
     // correctness poll — the push consumer detects refill instantly, §2.2).
     let mut mq_probe = tokio::time::interval(Duration::from_secs(config.mq_recheck_secs.max(1)));
@@ -263,9 +178,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
     // Status-line state.
     let mut mq_depth: Option<u32> = None;
     let mut mq_was_empty: Option<bool> = None;
-    let mut last_status_at = Instant::now();
-    let mut prev_adds: usize = 0;
-    let mut prev_redos: usize = 0;
+    let mut status = StatusTicker::new(config.redo_percent, load_pref, redo_pref);
 
     loop {
         tokio::select! {
@@ -324,29 +237,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
 
             // Stats answer arrived: engine stats + status line.
             Some(payload) = stats_resp_rx.recv() => {
-                if let Some(engine_stats) = &payload.engine_stats {
-                    // The prefix is MANDATORY: the harness scrapes on
-                    // "Engine stats:" (the bare {"workload":...} line broke
-                    // scrape_engine_stats — FAQ-documented bug).
-                    println!("Engine stats: {engine_stats}");
-                }
-                let now = Instant::now();
-                let dt = now.duration_since(last_status_at).as_secs_f64().max(0.001);
-                let adds = ADDS_PROCESSED.load(Ordering::Relaxed);
-                let redos = stats::REDOS_PROCESSED.load(Ordering::Relaxed);
-                stats::emit_status_line(&stats::StatusLine {
-                    redo_percent: config.redo_percent,
-                    load_pref,
-                    redo_pref,
-                    adds,
-                    adds_rate: (adds - prev_adds) as f64 / dt,
-                    redos,
-                    redos_rate: (redos - prev_redos) as f64 / dt,
-                    mq_depth,
-                });
-                prev_adds = adds;
-                prev_redos = redos;
-                last_status_at = now;
+                status.on_payload(&payload, mq_depth);
             }
 
             // Diagnostic MQ depth probe + mode-transition logging.
@@ -496,26 +387,8 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
 
     // Bounded join over workers AND the redo fetcher (both hold engine
     // handles; destroying the environment under either is a use-after-free).
-    if let Some(handle) = fetcher_handle {
-        workers.push(handle);
-    }
     let join_deadline = shutdown_deadline.unwrap_or_else(|| Instant::now() + SHUTDOWN_GRACE);
-    while Instant::now() < join_deadline && workers.iter().any(|h| !h.is_finished()) {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let all_workers_joined = workers.iter().all(|h| h.is_finished());
-    if all_workers_joined {
-        for handle in workers {
-            let _ = handle.join();
-        }
-        tracing::info!("all engine workers finished; safe to destroy environment");
-    } else {
-        tracing::warn!(
-            "shutdown grace elapsed with workers still in engine calls; \
-             skipping environment destroy to avoid use-after-free (leak-on-exit)"
-        );
-        drop(workers);
-    }
+    let all_workers_joined = engine_threads.join_bounded(join_deadline, None).await;
     // The stats thread only blocks on a channel recv or a short engine call;
     // detaching it is safe and it is reaped at process exit (consumer parity).
     drop(stats_handle);
@@ -565,12 +438,8 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
         tracing::warn!("error closing connection: {e:#}");
     }
 
-    println!(
-        "Processed total of {processed} adds, {} redo records ({} redo dropped, {} errors)",
-        stats::REDOS_PROCESSED.load(Ordering::Relaxed),
-        stats::REDOS_DROPPED.load(Ordering::Relaxed),
-        stats::ERRORS.load(Ordering::Relaxed),
-    );
+    // `processed` counts acks AND rejects (unlike SQS's ack-only total).
+    stats::print_final_totals(processed);
 
     Ok(RunOutcome {
         all_workers_joined,

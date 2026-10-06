@@ -19,7 +19,7 @@ use sz_rust_sdk::prelude::*;
 use sz_combined_consumer_core::config::{
     CommonArgs, Config, engine_config_from_env, validate_split_threads,
 };
-use sz_combined_consumer_core::runtime;
+use sz_combined_consumer_core::{queue_run, runtime};
 
 /// RabbitMQ ingestion loop (AMQP-specific; lives in this bin so `lapin` never
 /// compiles into the SQS binary).
@@ -156,60 +156,18 @@ fn validate_topology(
     validate_split_threads(threads, redo_percent)
 }
 
-/// redo% < 100: tokio runtime for the AMQP I/O layer only.
-///
-/// worker_threads is pinned to 2 (not the num_cpus default): this runtime only
-/// drives AMQP consume/ack + a few timers and hands every record to the
-/// dedicated `sz-worker` OS threads via channels — no Senzing/libSz FFI ever
-/// runs on a tokio worker. On a high-core host the default (one worker per core,
-/// e.g. 64) spawns dozens of idle runtime threads per process, each able to seed
-/// its own glibc malloc arena; 2 is ample for the I/O layer.
+/// redo% < 100: tokio runtime for the AMQP I/O layer only (worker_threads
+/// pinned to 2 — see [`queue_run::run_queue_mode`]), then the shared
+/// use-after-free exit discipline.
 fn run_combined(config: Config, env: Arc<SzEnvironmentCore>) -> ! {
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("Failed to build tokio runtime: {e}");
-            runtime::leak_and_exit(255);
-        }
-    };
-
-    let result = runtime.block_on(combined::run(config, env));
-
-    // Use-after-free guard (consumer FIX-2): only tear down the Senzing
-    // environment when EVERY engine thread actually finished. A startup `Err`
-    // from `run()` is also treated conservatively as "do not destroy". In every
-    // case we terminate via `process::exit` rather than returning: returning would
-    // drop the tokio runtime and `Arc<env>`, either of which can wedge on a stuck
-    // native thread and overrun the SIGTERM grace (issue #4).
-    match result {
-        Ok(outcome) => {
-            let code: u8 = match &outcome.fatal {
-                None => 0,
-                Some(msg) => {
-                    eprintln!("Shutting down due to error: {msg}");
-                    255
-                }
-            };
-            if outcome.all_workers_joined {
-                runtime::teardown_and_exit(code);
-            } else {
-                tracing::warn!(
-                    "skipping Senzing environment destroy: a worker may still be in an \
-                     engine call (leak-on-exit to avoid use-after-free); forcing process exit"
-                );
-                runtime::leak_and_exit(code);
-            }
-        }
-        Err(e) => {
-            eprintln!("{e:#}");
-            tracing::warn!("run() failed; skipping native teardown (leak-on-exit), forcing exit");
-            runtime::leak_and_exit(255);
-        }
-    }
+    queue_run::run_queue_mode(
+        combined::run(config, env),
+        &queue_run::ExitLogs {
+            leak: "skipping Senzing environment destroy: a worker may still be in an \
+                   engine call (leak-on-exit to avoid use-after-free); forcing process exit",
+            run_failed: "run() failed; skipping native teardown (leak-on-exit), forcing exit",
+        },
+    )
 }
 
 #[cfg(test)]
