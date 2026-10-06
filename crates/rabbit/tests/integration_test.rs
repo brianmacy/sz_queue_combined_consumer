@@ -14,8 +14,9 @@
 //!   load test (`SENZING_RABBITMQ_QUEUE` names an existing queue).
 //!
 //! Coverage vs the split-driver siblings (this binary subsumes BOTH):
-//!   * pure-logic scheduler behavior — `redo_preferring_count` and topology
-//!     validation at the 0% / 100% endpoints and interior redo% (always run);
+//!   * pure-logic scheduler behavior — `redo_preferring_count` at the 0% / 100%
+//!     endpoints and interior redo% (always run; AMQP topology validation is
+//!     unit-tested in the binary, `src/main.rs`);
 //!   * the LOAD path — `add_record` via the same call the load workers make;
 //!   * the REDO path — `count_redo_records` / `get_redo_record` /
 //!     `process_redo_record`, the same calls the fetcher + redo workers make;
@@ -34,7 +35,7 @@
 
 use std::sync::Arc;
 
-use sz_combined_consumer_core::config::{redo_preferring_count, validate_topology};
+use sz_combined_consumer_core::config::redo_preferring_count;
 use sz_combined_consumer_core::record::{ErrorClass, ParseError, classify_error, parse_record};
 use sz_rust_sdk::prelude::*;
 
@@ -100,22 +101,6 @@ fn scheduler_endpoint_and_interior_splits() {
     // Large interior clamps to N-1 so at least one load-preferring worker
     // remains (the interior case always keeps both classes populated).
     assert_eq!(redo_preferring_count(12, 99), 11);
-}
-
-/// Topology validation is the loud startup gate (design §5): AMQP is required
-/// below 100%, and an interior redo% needs at least two workers to host both
-/// preference classes. The 100% endpoint runs with AMQP entirely unset.
-#[test]
-fn scheduler_topology_validation() {
-    // redo% < 100 requires URL + queue.
-    assert!(validate_topology(12, 0, None, None).is_err());
-    assert!(validate_topology(12, 20, Some("amqp://h"), None).is_err());
-    assert!(validate_topology(12, 20, Some("amqp://h"), Some("q")).is_ok());
-    // Interior redo% needs >= 2 workers.
-    assert!(validate_topology(1, 20, Some("amqp://h"), Some("q")).is_err());
-    assert!(validate_topology(2, 20, Some("amqp://h"), Some("q")).is_ok());
-    // 100% pure redoer: no AMQP needed, single worker allowed.
-    assert!(validate_topology(1, 100, None, None).is_ok());
 }
 
 // --------------------------------------------------------------------------

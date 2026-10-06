@@ -36,7 +36,4 @@ pub mod stats;
 pub mod transform;
 pub mod worker;
 
-pub use config::{Args, Config};
-
-/// Instance/module name passed to the Senzing environment.
-pub const INSTANCE_NAME: &str = "sz_rabbit_combined_consumer";
+pub use config::{CommonArgs, Config};

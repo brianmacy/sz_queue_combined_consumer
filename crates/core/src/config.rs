@@ -1,12 +1,12 @@
-//! Configuration: CLI arguments (clap derive) with environment-variable
-//! fallbacks.
+//! Configuration: shared CLI arguments (clap derive) with environment-variable
+//! fallbacks, and the resolved runtime [`Config`]. Transport-specific flags
+//! live in each backend binary, which flattens [`CommonArgs`] into its own
+//! `Args`.
 //!
 //! Priority: CLI argument > environment variable > default. Environment
 //! variable names are kept verbatim-compatible with the sibling drivers
 //! (`sz_rabbit_consumer_rust` / `sz_simple_redoer_rust`) so existing compose
 //! files need minimal changes.
-
-use clap::Parser;
 
 /// Default long-record threshold, in seconds (matches both sibling drivers).
 pub const DEFAULT_LONG_RECORD_SECS: u64 = 300;
@@ -22,35 +22,20 @@ pub const DEFAULT_REDO_PERCENT: u8 = 20;
 /// compatibility, but is a known foot-gun at 96+ cores.
 pub const DEFAULT_THREADS: usize = 12;
 
-/// Default cadence of the diagnostic passive-declare MQ depth probe, seconds.
-pub const DEFAULT_MQ_RECHECK_SECS: u64 = 30;
-
 /// Default fetcher pause when `get_redo_record()` returns empty, seconds
 /// (redoer-compatible name/default).
 pub const DEFAULT_REDO_SLEEP_SECS: u64 = 60;
 
-/// Combined RabbitMQ load + redo Senzing driver.
-#[derive(Parser, Debug, Clone)]
-#[command(
-    name = "sz_rabbit_combined_consumer",
-    version,
-    about = "Combined Senzing driver: add_record from RabbitMQ and process_redo_record, \
-             split by one redo%% knob (0 = pure loader, 100 = pure redoer)",
-    long_about = None
-)]
-pub struct Args {
-    /// RabbitMQ server URL (required when redo% < 100).
-    #[arg(short = 'u', long = "url", env = "SENZING_AMQP_URL")]
-    pub url: Option<String>,
-
-    /// Source queue name (required when redo% < 100).
-    #[arg(short = 'q', long = "queue", env = "SENZING_RABBITMQ_QUEUE")]
-    pub queue: Option<String>,
-
-    /// Load records from a single JSONL file instead of RabbitMQ (one JSON
-    /// record per line). Mutually exclusive with `--url`/`--queue`. redo% applies
-    /// as in queue mode; at redo% > 0 the process exits once the file is loaded
-    /// AND the redo queue is drained (redo% = 0: exits at end of file).
+/// Flags and environment variables shared verbatim by every backend binary
+/// (file mode, redo share, worker pool, long-record, transform, info/trace).
+/// Each binary flattens this into its own clap `Args` next to its
+/// transport-specific flags; [`Config::from_common`] resolves it.
+#[derive(clap::Args, Debug, Clone)]
+pub struct CommonArgs {
+    /// Load records from a single JSONL file instead of the message queue (one
+    /// JSON record per line); the queue-source flags are then ignored. redo%
+    /// applies as in queue mode; at redo% > 0 the process exits once the file
+    /// is loaded AND the redo queue is drained (redo% = 0: exits at end of file).
     #[arg(short = 'f', long = "file", env = "SENZING_INPUT_FILE")]
     pub input_file: Option<String>,
 
@@ -81,22 +66,6 @@ pub struct Args {
         default_value_t = DEFAULT_THREADS
     )]
     pub threads_per_process: usize,
-
-    /// AMQP basic_qos prefetch. Defaults to threads + 2: the +2 overshoot keeps
-    /// a standing load_ch buffer that masks the ack round-trip, so the workers'
-    /// non-blocking dispatch never stalls per-record (design §1.2/§2.3).
-    #[arg(long = "prefetch", env = "SENZING_PREFETCH")]
-    pub prefetch: Option<u16>,
-
-    /// Cadence of the diagnostic MQ depth probe (passive queue_declare) and
-    /// mode-transition log hysteresis. NOT a correctness poll — the consumer
-    /// subscription is push-based and detects MQ refill instantly.
-    #[arg(
-        long = "mq-recheck-secs",
-        env = "SENZING_MQ_RECHECK_SECONDS",
-        default_value_t = DEFAULT_MQ_RECHECK_SECS
-    )]
-    pub mq_recheck_secs: u64,
 
     /// Seconds the redo fetcher pauses when no redo records are available.
     #[arg(
@@ -165,9 +134,10 @@ pub fn resolve_reject_file(input_file: Option<&str>, explicit: Option<String>) -
 #[derive(Debug, Clone)]
 pub struct Config {
     pub engine_config: String,
-    /// `Some` iff redo% < 100 AND not file mode (validated).
+    /// RabbitMQ only: `Some` iff redo% < 100 AND not file mode (validated by
+    /// the RabbitMQ binary). Always `None` from [`Config::from_common`].
     pub url: Option<String>,
-    /// `Some` iff redo% < 100 AND not file mode (validated).
+    /// RabbitMQ only: see `url`.
     pub queue: Option<String>,
     /// `Some` selects file-input mode (load from a JSONL file; redo% applies).
     pub input_file: Option<String>,
@@ -178,7 +148,9 @@ pub struct Config {
     pub reject_file: Option<String>,
     pub redo_percent: u8,
     pub threads: usize,
+    /// RabbitMQ only (`basic_qos`); inert 0 from [`Config::from_common`].
     pub prefetch: u16,
+    /// RabbitMQ only (MQ depth probe); inert 0 from [`Config::from_common`].
     pub mq_recheck_secs: u64,
     pub redo_sleep_secs: u64,
     pub long_record_secs: u64,
@@ -189,9 +161,8 @@ pub struct Config {
 }
 
 /// Reads and validates `SENZING_ENGINE_CONFIGURATION_JSON` from the environment.
-/// Shared by every backend binary (the RabbitMQ [`Config::resolve`] path and the
-/// SQS binary's own arg handling) so the required-env + valid-JSON checks stay in
-/// one place. Returns a loud, user-facing error string on failure.
+/// Shared by every backend binary so the required-env + valid-JSON checks stay
+/// in one place. Returns a loud, user-facing error string on failure.
 pub fn engine_config_from_env() -> Result<String, String> {
     let engine_config = std::env::var("SENZING_ENGINE_CONFIGURATION_JSON")
         .ok()
@@ -214,70 +185,58 @@ pub fn engine_config_from_env() -> Result<String, String> {
     Ok(engine_config)
 }
 
-impl Config {
-    /// Resolves the configuration from parsed [`Args`] plus the environment.
-    ///
-    /// Returns an error message string for any missing/invalid value so the
-    /// caller can print it and exit non-zero (loud failure).
-    pub fn resolve(args: Args) -> Result<Self, String> {
-        let engine_config = engine_config_from_env()?;
+/// Resolves `--threads-per-process`: `0` falls back to the CPU count (sibling
+/// drivers' compat behavior), anything else is used as-is. The single thread
+/// fallback for every backend.
+pub fn resolve_threads(threads_per_process: usize) -> usize {
+    match threads_per_process {
+        0 => num_cpus::get(),
+        n => n,
+    }
+}
 
-        if args.redo_percent > 100 {
+impl Config {
+    /// Resolves the transport-independent configuration from [`CommonArgs`]
+    /// and the (already validated) engine configuration JSON.
+    ///
+    /// Validates redo% range and the redo/load thread split, and loads the
+    /// optional transform plugin (fail-fast). Transport fields (`url`, `queue`,
+    /// `prefetch`, `mq_recheck_secs`) are left inert; a backend that uses them
+    /// sets and validates them itself. Everything here runs before `Sz_init`.
+    ///
+    /// Returns an error message string for any invalid value so the caller can
+    /// print it and exit non-zero (loud failure).
+    pub fn from_common(common: &CommonArgs, engine_config: String) -> Result<Self, String> {
+        if common.redo_percent > 100 {
             return Err(format!(
                 "SENZING_REDO_PERCENT must be within [0, 100], got {}",
-                args.redo_percent
+                common.redo_percent
             ));
         }
-
-        let threads = if args.threads_per_process == 0 {
-            num_cpus::get()
-        } else {
-            args.threads_per_process
-        };
-
-        let input_file = args.input_file.filter(|s| !s.is_empty());
-        let mut url = args.url.filter(|s| !s.is_empty());
-        let mut queue = args.queue.filter(|s| !s.is_empty());
-
-        if input_file.is_some() {
-            // File mode: load from a file (redo% applies); AMQP topology does not apply.
-            if url.is_some() || queue.is_some() {
-                eprintln!("warning: --file is set; ignoring --url/--queue (file input mode)");
-                url = None;
-                queue = None;
-            }
-            if threads == 0 {
-                return Err("file mode requires at least 1 worker thread".to_string());
-            }
-            validate_split_threads(threads, args.redo_percent)?;
-        } else {
-            validate_topology(threads, args.redo_percent, url.as_deref(), queue.as_deref())?;
-        }
+        let threads = resolve_threads(common.threads_per_process);
+        validate_split_threads(threads, common.redo_percent)?;
 
         let transform = crate::transform::TransformHandle::load(
-            args.record_transform_plugin.as_deref(),
-            args.record_transform_config.as_deref(),
+            common.record_transform_plugin.as_deref(),
+            common.record_transform_config.as_deref(),
         )?;
 
-        let prefetch = args
-            .prefetch
-            .unwrap_or_else(|| u16::try_from(threads.saturating_add(2)).unwrap_or(u16::MAX));
-
+        let input_file = common.input_file.clone().filter(|s| !s.is_empty());
         Ok(Self {
             engine_config,
-            url,
-            queue,
-            reject_file: resolve_reject_file(input_file.as_deref(), args.reject_file),
+            url: None,
+            queue: None,
+            reject_file: resolve_reject_file(input_file.as_deref(), common.reject_file.clone()),
             input_file,
-            skip_lines: args.skip_lines,
-            redo_percent: args.redo_percent,
+            skip_lines: common.skip_lines,
+            redo_percent: common.redo_percent,
             threads,
-            prefetch,
-            mq_recheck_secs: args.mq_recheck_secs,
-            redo_sleep_secs: args.redo_sleep_secs,
-            long_record_secs: args.long_record,
-            info: args.info,
-            debug_trace: args.debug_trace,
+            prefetch: 0,
+            mq_recheck_secs: 0,
+            redo_sleep_secs: common.redo_sleep_secs,
+            long_record_secs: common.long_record,
+            info: common.info,
+            debug_trace: common.debug_trace,
             transform,
         })
     }
@@ -288,38 +247,9 @@ impl Config {
     }
 }
 
-/// Validates the (threads, redo%, AMQP) topology (design §5).
-///
-/// * redo% < 100 requires a RabbitMQ URL and queue.
-/// * 0 < redo% < 100 requires at least 2 workers: a single worker cannot host
-///   both a load-preferring and a redo-preferring class, and the |B| clamp
-///   `clamp(round(N·redo%/100), 1, N−1)` is ill-defined at N = 1.
-pub fn validate_topology(
-    threads: usize,
-    redo_percent: u8,
-    url: Option<&str>,
-    queue: Option<&str>,
-) -> Result<(), String> {
-    if redo_percent < 100 {
-        if url.is_none_or(str::is_empty) {
-            return Err("No RabbitMQ URL provided (use --url or SENZING_AMQP_URL); \
-                 required when redo% < 100"
-                .to_string());
-        }
-        if queue.is_none_or(str::is_empty) {
-            return Err(
-                "No queue provided (use --queue or SENZING_RABBITMQ_QUEUE); \
-                 required when redo% < 100"
-                    .to_string(),
-            );
-        }
-    }
-    validate_split_threads(threads, redo_percent)
-}
-
 /// 0 < redo% < 100 requires at least 2 workers: one worker cannot host both
 /// preference classes and the |B| clamp is ill-defined at N = 1. Shared by the
-/// queue topology check, file mode and the SQS binary.
+/// RabbitMQ topology check and [`Config::from_common`] (every backend).
 pub fn validate_split_threads(threads: usize, redo_percent: u8) -> Result<(), String> {
     if redo_percent > 0 && redo_percent < 100 && threads < 2 {
         return Err(format!(
@@ -335,7 +265,7 @@ pub fn validate_split_threads(threads: usize, redo_percent: u8) -> Result<(), St
 /// `|B| = clamp(round(N × redo% / 100), 1, N−1)` for interior redo%; 0 at
 /// redo% = 0 (the redo channel never exists); N at redo% = 100 (the load
 /// channel never exists). Interior values assume `threads >= 2` (enforced by
-/// [`validate_topology`]).
+/// [`validate_split_threads`]).
 pub fn redo_preferring_count(threads: usize, redo_percent: u8) -> usize {
     match redo_percent {
         0 => 0,
@@ -349,32 +279,99 @@ pub fn redo_preferring_count(threads: usize, redo_percent: u8) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Minimal binary-shaped parser so the shared flags are exercised exactly
+    /// as each backend flattens them.
+    #[derive(Parser, Debug)]
+    struct Cli {
+        #[command(flatten)]
+        common: CommonArgs,
+    }
+
+    fn common(extra: &[&str]) -> CommonArgs {
+        let mut argv = vec!["bin"];
+        argv.extend_from_slice(extra);
+        Cli::parse_from(argv).common
+    }
+
     #[test]
     fn long_record_zero_is_rejected_at_parse() {
-        use clap::Parser;
-        let err = super::Args::try_parse_from(["bin", "--long-record", "0"]).unwrap_err();
+        let err = Cli::try_parse_from(["bin", "--long-record", "0"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
-        let ok = super::Args::try_parse_from(["bin", "--long-record", "1"]).expect("1 is valid");
-        assert_eq!(ok.long_record, 1);
+        let ok = Cli::try_parse_from(["bin", "--long-record", "1"]).expect("1 is valid");
+        assert_eq!(ok.common.long_record, 1);
+    }
+
+    #[test]
+    fn from_common_applies_shared_defaults() {
+        let c = Config::from_common(&common(&[]), "{}".into()).expect("defaults are valid");
+        assert_eq!(c.engine_config, "{}");
+        assert_eq!(c.redo_percent, DEFAULT_REDO_PERCENT);
+        assert_eq!(c.threads, DEFAULT_THREADS);
+        assert_eq!(c.redo_sleep_secs, DEFAULT_REDO_SLEEP_SECS);
+        assert_eq!(c.long_record_secs, DEFAULT_LONG_RECORD_SECS);
+        assert_eq!(c.skip_lines, 0);
+        assert_eq!((c.input_file, c.reject_file), (None, None));
+        assert_eq!(
+            (c.url, c.queue),
+            (None, None),
+            "transport fields stay inert"
+        );
+        assert_eq!((c.prefetch, c.mq_recheck_secs), (0, 0));
+        assert!(!c.info && !c.debug_trace);
+    }
+
+    #[test]
+    fn from_common_file_mode_derives_reject_file() {
+        let c = Config::from_common(&common(&["--file", "/data/in.jsonl"]), "{}".into()).unwrap();
+        assert_eq!(c.input_file.as_deref(), Some("/data/in.jsonl"));
+        assert_eq!(
+            c.reject_file.as_deref(),
+            Some("/data/in.jsonl.rejected.jsonl")
+        );
+        let c = Config::from_common(&common(&["--file", ""]), "{}".into()).unwrap();
+        assert_eq!(c.input_file, None, "empty --file is not file mode");
+    }
+
+    #[test]
+    fn from_common_rejects_redo_percent_over_100() {
+        let err = Config::from_common(&common(&["--redo-percent", "101"]), "{}".into())
+            .expect_err("redo% > 100 must fail");
+        assert!(err.contains("[0, 100]"), "{err}");
+    }
+
+    #[test]
+    fn from_common_rejects_single_thread_interior_split() {
+        let args = common(&["--threads-per-process", "1", "--redo-percent", "50"]);
+        assert!(Config::from_common(&args, "{}".into()).is_err());
+        let args = common(&["--threads-per-process", "1", "--redo-percent", "100"]);
+        assert!(Config::from_common(&args, "{}".into()).is_ok());
+    }
+
+    #[test]
+    fn from_common_zero_threads_uses_cpu_count() {
+        let c = Config::from_common(&common(&["--threads-per-process", "0"]), "{}".into())
+            .expect("auto thread count is valid");
+        assert_eq!(c.threads, num_cpus::get());
+        assert_eq!(resolve_threads(7), 7);
     }
 
     #[test]
     fn reject_file_is_none_outside_file_mode() {
-        assert_eq!(
-            super::resolve_reject_file(None, Some("x.jsonl".into())),
-            None
-        );
-        assert_eq!(super::resolve_reject_file(None, None), None);
+        assert_eq!(resolve_reject_file(None, Some("x.jsonl".into())), None);
+        assert_eq!(resolve_reject_file(None, None), None);
     }
 
     #[test]
     fn reject_file_defaults_to_input_plus_suffix() {
         assert_eq!(
-            super::resolve_reject_file(Some("/data/in.jsonl"), None),
+            resolve_reject_file(Some("/data/in.jsonl"), None),
             Some("/data/in.jsonl.rejected.jsonl".to_string())
         );
         assert_eq!(
-            super::resolve_reject_file(Some("/data/in.jsonl"), Some(String::new())),
+            resolve_reject_file(Some("/data/in.jsonl"), Some(String::new())),
             Some("/data/in.jsonl.rejected.jsonl".to_string())
         );
     }
@@ -382,12 +379,10 @@ mod tests {
     #[test]
     fn reject_file_explicit_wins() {
         assert_eq!(
-            super::resolve_reject_file(Some("/data/in.jsonl"), Some("/out/bad.jsonl".into())),
+            resolve_reject_file(Some("/data/in.jsonl"), Some("/out/bad.jsonl".into())),
             Some("/out/bad.jsonl".to_string())
         );
     }
-
-    use super::*;
 
     #[test]
     fn redo_pref_count_endpoints() {
@@ -408,22 +403,11 @@ mod tests {
     }
 
     #[test]
-    fn topology_requires_amqp_below_100() {
-        assert!(validate_topology(12, 0, None, None).is_err());
-        assert!(validate_topology(12, 50, None, Some("q")).is_err());
-        assert!(validate_topology(12, 50, Some("amqp://x"), None).is_err());
-        assert!(validate_topology(12, 50, Some(""), Some("q")).is_err());
-        assert!(validate_topology(12, 50, Some("amqp://x"), Some("q")).is_ok());
-        // Pure redoer runs with the AMQP settings entirely unset (design §4).
-        assert!(validate_topology(12, 100, None, None).is_ok());
-    }
-
-    #[test]
-    fn topology_requires_two_threads_for_interior_percent() {
-        assert!(validate_topology(1, 50, Some("amqp://x"), Some("q")).is_err());
-        assert!(validate_topology(2, 50, Some("amqp://x"), Some("q")).is_ok());
+    fn split_threads_requires_two_for_interior_percent() {
+        assert!(validate_split_threads(1, 50).is_err());
+        assert!(validate_split_threads(2, 50).is_ok());
         // N = 1 is valid at both endpoints.
-        assert!(validate_topology(1, 0, Some("amqp://x"), Some("q")).is_ok());
-        assert!(validate_topology(1, 100, None, None).is_ok());
+        assert!(validate_split_threads(1, 0).is_ok());
+        assert!(validate_split_threads(1, 100).is_ok());
     }
 }

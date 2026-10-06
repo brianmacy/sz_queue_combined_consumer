@@ -214,7 +214,7 @@ async fn run_inner(config: Config, env: Arc<SzEnvironmentCore>) -> Result<RunOut
     let mut consumer = channel
         .basic_consume(
             queue.as_str().into(),
-            sz_combined_consumer_core::INSTANCE_NAME.into(),
+            crate::INSTANCE_NAME.into(),
             BasicConsumeOptions::default(),
             FieldTable::default(),
         )
