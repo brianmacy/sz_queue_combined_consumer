@@ -1,8 +1,8 @@
 # Changelog
 
-All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
+All sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); all sections headed `0.3.0 — …` shipped in tag `v0.3.0` (2026-09-23). Each keeps the date it landed on `main`.
 
-## Unreleased
+## 0.4.0 — core Transport loop alignment + ActiveMQ Artemis consumer (2026-10-06)
 
 One section for everything since `v0.3.0`, describing the behavior as it
 ships. All three binaries now run queue mode on one shared core loop
