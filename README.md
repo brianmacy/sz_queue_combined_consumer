@@ -123,8 +123,12 @@ driver uses this one convention for both binaries.)
 * **Dead-letter queue.** SQS has no reject verb, and an explicit `DeleteMessage`
   never triggers the redrive policy. So a rejected record (engine bad input,
   `SENZ0010` retry timeout, `SENZ0082`, unparseable body) is **`SendMessage`d
-  to the DLQ verbatim, then deleted** from the source — `sz_sqs_consumer-v4`
-  parity, `Sending to deadletter: DS : ID` on stdout. The DLQ is resolved once
+  to the DLQ verbatim, then deleted** from the source (`sz_sqs_consumer-v4`
+  parity). The DLQ copy carries a String message attribute **`SzReason`**: the
+  reject reason (engine error text, or `malformed record: <parse error>`),
+  sanitized to SQS's allowed characters and capped at 1 KiB (less if the body
+  leaves less room under 256 KiB). Read it with
+  `ReceiveMessage --message-attribute-names All`. The DLQ is resolved once
   at startup: `--dead-letter-queue-url` if set, else discovered from the source
   queue's `RedrivePolicy`. **No DLQ = refuse to start** unless `--allow-no-dlq`.
   If the DLQ send fails the source message is left alone (visibility expiry
@@ -191,13 +195,28 @@ sz_rabbit_combined_consumer --file records.jsonl \
 * **Poison MQ record** (bad JSON / missing DATA_SOURCE/RECORD_ID / non-UTF-8 /
   engine BadInput / SENZ0082 / long-record give-up — the last RabbitMQ only;
   SQS extends visibility instead) → dead-letter (RabbitMQ: `basic_reject`, no
-  requeue; SQS: `SendMessage` to the DLQ, then delete) + loud warn, keep
-  running.
+  requeue — AMQP cannot carry the reason; SQS: `SendMessage` to the DLQ with
+  `SzReason`, then delete), keep running. Identical on both transports:
+  * every dead-lettered record prints ONE stdout marker
+    `REJECTING: DATA_SOURCE : RECORD_ID -> <reason>` (an unparseable body has
+    no DS/ID: `REJECTING:  :  -> malformed record: <parse error>`); an engine
+    reject's worker also warns `REJECTING due to bad data or timeout [worker N]:
+    DS : ID -> <engine error>`;
+  * an unparseable body additionally logs one warn
+    `DEAD-LETTERING malformed record: <error> [<body, first 2048 chars>…truncated]`;
+  * every dead-lettered record (unparseable ones included) counts as
+    `rejected` in the final total line (below), never as an add.
 * **Poison redo record** (BadInput / retry timeout / SENZ0082) → warn (with the
   engine error text) + drop (no queue to reject to; counted as
   `redos_dropped`). SENZ0082 on a redo record is dropped rather than fatal on
   purpose: a DQM-rejected value can never succeed, and a fatal would wedge the
   redo queue on that one record.
+* **Final total line** (every mode, on stdout at exit):
+  `Processed total of N adds, M redo records (R rejected, D redo dropped, E errors)`.
+  `N` is successful adds ONLY on every transport and file mode (the
+  `Processed N adds, … records per second` throughput line uses the same `N`);
+  `R` counts dead-lettered / reject-file records. Scrapers should keep reading
+  the first number after `Processed total of `.
 * **File mode** has no queue: rejects go verbatim to the JSONL reject file
   (`--reject-file`, see above). **SQS** sends them to the dead-letter queue
   (see [SQS specifics](#sqs-specifics)).

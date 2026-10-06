@@ -182,15 +182,34 @@ impl StatusTicker {
     }
 }
 
-/// Prints the final `Processed total of ...` line the e2e tests scrape. `adds`
-/// is the backend's own add total (the backends count it differently).
+/// Prints the final `Processed total of ...` line every mode emits (e2e tests
+/// and tooling scrape the prefix and the first number). `adds` counts
+/// successful adds ONLY; dead-lettered records are reported as `rejected`.
 pub fn print_final_totals(adds: u64) {
     println!(
-        "Processed total of {adds} adds, {} redo records ({} redo dropped, {} errors)",
-        REDOS_PROCESSED.load(Ordering::Relaxed),
-        REDOS_DROPPED.load(Ordering::Relaxed),
-        ERRORS.load(Ordering::Relaxed),
+        "{}",
+        final_totals_line(
+            adds,
+            REDOS_PROCESSED.load(Ordering::Relaxed),
+            ADDS_REJECTED.load(Ordering::Relaxed),
+            REDOS_DROPPED.load(Ordering::Relaxed),
+            ERRORS.load(Ordering::Relaxed),
+        )
     );
+}
+
+/// The `Processed total of ...` line for the given counters.
+fn final_totals_line(
+    adds: u64,
+    redos: usize,
+    rejected: usize,
+    redos_dropped: usize,
+    errors: usize,
+) -> String {
+    format!(
+        "Processed total of {adds} adds, {redos} redo records ({rejected} rejected, \
+         {redos_dropped} redo dropped, {errors} errors)"
+    )
 }
 
 /// Global run flag: flipped to `false` on shutdown (signal or fatal error).
@@ -330,6 +349,14 @@ mod tests {
         assert!(t.prev_adds <= ADDS_PROCESSED.load(Ordering::Relaxed));
         assert!(t.prev_redos <= REDOS_PROCESSED.load(Ordering::Relaxed));
         assert_eq!((t.redo_percent, t.load_pref, t.redo_pref), (20, 10, 2));
+    }
+
+    #[test]
+    fn final_totals_line_keeps_prefix_and_add_count_first() {
+        assert_eq!(
+            final_totals_line(1, 4, 2, 0, 3),
+            "Processed total of 1 adds, 4 redo records (2 rejected, 0 redo dropped, 3 errors)"
+        );
     }
 
     #[test]

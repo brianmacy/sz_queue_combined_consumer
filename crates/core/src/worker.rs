@@ -101,8 +101,10 @@ pub type RedoInFlight = HashMap<usize, (Instant, String)>;
 pub enum Action {
     /// Engine accepted the record (optionally carrying the WithInfo response).
     Ack(Option<String>),
-    /// Bad data / timeout / SENZ0082 -> dead-letter (reject, no requeue).
-    RejectNoRequeue,
+    /// Bad data / timeout / SENZ0082 -> dead-letter (reject, no requeue),
+    /// carrying the reason (engine error text) for the reject marker and the
+    /// dead-letter metadata.
+    RejectNoRequeue(String),
     /// A non-recoverable engine error -> trigger graceful shutdown.
     Fatal(String),
 }
@@ -384,11 +386,11 @@ fn process_load(ctx: &WorkerCtx, engine: &dyn SzEngine, load: &LoadSide, item: L
         Err(_) => {
             // Non-UTF-8 body is bad input -> dead-letter.
             warn!("worker {}: non-UTF-8 message body", ctx.worker_id);
-            Action::RejectNoRequeue
+            Action::RejectNoRequeue("non-UTF-8 message body".to_string())
         }
         Ok(body_str) => match apply_transform(ctx, body_str, &info) {
-            None => Action::RejectNoRequeue,
-            Some((body_str, eff)) => add_record_action(ctx, engine, &body_str, &eff),
+            Err(reason) => Action::RejectNoRequeue(reason),
+            Ok((body_str, eff)) => add_record_action(ctx, engine, &body_str, &eff),
         },
     };
     LOAD_BUSY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -417,36 +419,31 @@ fn process_load(ctx: &WorkerCtx, engine: &dyn SzEngine, load: &LoadSide, item: L
 
 /// Applies the optional record transform. Returns the (possibly rewritten)
 /// body plus the DATA_SOURCE/RECORD_ID to load it under (re-parsed when the
-/// plugin replaced the record, since it may change either), or `None` when the
-/// record must be dead-lettered (the reason is logged here).
+/// plugin replaced the record, since it may change either), or the reject
+/// reason when the record must be dead-lettered (also logged here).
 fn apply_transform<'a>(
     ctx: &WorkerCtx,
     body: &'a str,
     info: &RecordInfo,
-) -> Option<(std::borrow::Cow<'a, str>, RecordInfo)> {
+) -> Result<(std::borrow::Cow<'a, str>, RecordInfo), String> {
     let Some(t) = &ctx.transform.0 else {
-        return Some((std::borrow::Cow::Borrowed(body), info.clone()));
+        return Ok((std::borrow::Cow::Borrowed(body), info.clone()));
     };
-    match t.transform(body) {
-        Err(e) => {
-            warn!(
-                "REJECTING: record transform failed [worker {}]: {} : {} -> {e}",
-                ctx.worker_id, info.data_source, info.record_id
-            );
-            None
+    let reason = match t.transform(body) {
+        Ok(std::borrow::Cow::Borrowed(b)) => {
+            return Ok((std::borrow::Cow::Borrowed(b), info.clone()));
         }
-        Ok(std::borrow::Cow::Borrowed(b)) => Some((std::borrow::Cow::Borrowed(b), info.clone())),
         Ok(std::borrow::Cow::Owned(o)) => match crate::record::parse_record(o.as_bytes()) {
-            Ok(eff) => Some((std::borrow::Cow::Owned(o), eff)),
-            Err(e) => {
-                warn!(
-                    "REJECTING: transformed record is invalid [worker {}]: {} : {} -> {e}",
-                    ctx.worker_id, info.data_source, info.record_id
-                );
-                None
-            }
+            Ok(eff) => return Ok((std::borrow::Cow::Owned(o), eff)),
+            Err(e) => format!("transformed record is invalid: {e}"),
         },
-    }
+        Err(e) => format!("record transform failed: {e}"),
+    };
+    warn!(
+        "REJECTING [worker {}]: {} : {} -> {reason}",
+        ctx.worker_id, info.data_source, info.record_id
+    );
+    Err(reason)
 }
 
 /// `add_record` with the stale-config retry, mapped to a delivery [`Action`].
@@ -473,7 +470,7 @@ fn add_record_action(
                     "REJECTING due to bad data or timeout [worker {}]: {} : {} -> {e}",
                     ctx.worker_id, info.data_source, info.record_id
                 );
-                Action::RejectNoRequeue
+                Action::RejectNoRequeue(e.to_string())
             }
             ErrorClass::Fatal => Action::Fatal(e.to_string()),
         },

@@ -2,6 +2,65 @@
 
 All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); each keeps the date it landed on `main`.
 
+## Unreleased — unified totals, poison handling, reject marker; SQS `SzReason` (2026-10-06)
+
+### BREAKING (log / stdout format — update scrapers and alerts)
+
+* **Final total line gains a `rejected` count and `N` is adds only on every
+  transport.** Now `Processed total of N adds, M redo records (R rejected, D
+  redo dropped, E errors)` in queue, file and pure-redoer modes (was `(D redo
+  dropped, E errors)`). **RabbitMQ: `N` no longer includes dead-lettered
+  records** (it did; SQS and file mode already counted adds only), and the
+  `Processed N adds, … records per second` throughput line follows the same
+  `N`. *Migration:* the prefix and first number are unchanged, so
+  `starts_with("Processed total of ")` + first-token parsers keep working; a
+  RabbitMQ "processed" figure that relied on rejects being included must add
+  `R`. Regexes anchored on `(D redo dropped` must allow the new leading
+  `R rejected, ` field.
+* **`R` counts every dead-letter.** RabbitMQ unparseable (poison) messages
+  and in-worker-at-shutdown dead-letters are now counted (previously
+  uncounted); a long-record give-up is counted once, when it is dead-lettered.
+* **One reject marker on stdout, both transports:**
+  `REJECTING: DATA_SOURCE : RECORD_ID -> <reason>`. *Replaces* RabbitMQ's
+  `REJECTING due to bad data or timeout: DS : ID`, `REJECTING: DS : ID`
+  (long-record give-up) and the `REJECTING in-flight-in-worker on shutdown
+  (…): DS : ID` warn (now the marker with reason `in-flight-in-worker on
+  shutdown (…)`), and SQS's `Sending to deadletter: DS : ID`. An unparseable
+  body has no DS/ID: `REJECTING:  :  -> malformed record: <parse error>`.
+  *Migration:* grep/alert on `^REJECTING: ` (and parse ` -> ` for the
+  reason). The worker warn `REJECTING due to bad data or timeout [worker N]:
+  DS : ID -> <engine error>` is unchanged. Transform-plugin rejects now warn
+  `REJECTING [worker N]: DS : ID -> record transform failed: …` / `…
+  transformed record is invalid: …` (was `REJECTING: record transform failed
+  [worker N]: …`, which collided with the new marker).
+* **Poison handling is one core path:** one warn `DEAD-LETTERING malformed
+  record: <error> [<first 2048 chars>…truncated]` (truncation suffix was
+  ` (truncated)`), counted as rejected, then dead-lettered (SQS: forwarded
+  verbatim to the DLQ; RabbitMQ: `basic_reject`, no requeue).
+
+### Added (SQS)
+
+* Every DLQ copy carries a String message attribute **`SzReason`** with the
+  reject reason (engine error text, e.g. `Unknown data source: SENZ2207|…`,
+  or `malformed record: <parse error>`), sanitized to SQS's allowed
+  characters and capped at 1 KiB (less when the body leaves less room under
+  256 KiB). Receive it with `MessageAttributeNames=All`. RabbitMQ's
+  `basic_reject` cannot carry a reason (unchanged; the reason is on the stdout
+  marker).
+
+### Internal
+
+* `Policy::count_rejects_in_total` removed. `DeadLetterReason::{Malformed,
+  Rejected}` carry the reason text and `DeadLetterReason` implements
+  `Display` (the marker / `SzReason` text); `Action::RejectNoRequeue` carries
+  the reason. The final line is printed by `stats::print_final_totals` in
+  every mode.
+* New real e2e: `e2e_rabbit_rejects_are_counted_and_dead_lettered` (1 valid +
+  1 unparseable + 1 engine reject → `Processed total of 1 adds, … (2
+  rejected, …`, markers, both bad bodies in the DLQ); the SQS DLQ e2e now
+  asserts the marker, `(2 rejected, ` and `SzReason` on each DLQ copy. Data in
+  `tests/fixtures/rejects.yaml`.
+
 ## Unreleased — SQS ported onto the core queue loop (2026-10-06)
 
 ### Fixed (SQS)
@@ -29,14 +88,14 @@ All sections headed `0.3.0 — …` ship together in tag `v0.3.0` (2026-09-23); 
   (was every `LONG_RECORD / 2`) and logs `MQ drained (depth 0)` /
   `MQ active (depth N)` transitions.
 * Deletes are batched by a background task (still 10 per call, 1 s flush,
-  flushed at shutdown). Rejects also print the shared
-  `REJECTING due to bad data or timeout: DS : ID` line; a poison message logs
-  `DEAD-LETTERING malformed record` (was `REJECTING unparseable SQS message`).
+  flushed at shutdown). A poison message logs `DEAD-LETTERING malformed
+  record` (was `REJECTING unparseable SQS message`). Reject markers: see the
+  unified `REJECTING:` marker above (supersedes `Sending to deadletter`).
 * Unchanged: long records extend visibility and are never dead-lettered; the
-  final total counts adds only; `Sending to deadletter`, `Extended visibility`
-  and `Still processing` lines.
+  final total counts adds only; `Extended visibility` and `Still processing`
+  lines.
 * Internal: `SqsTransport` on core `queue_loop::run`; `Policy` gained
-  `count_rejects_in_total` / `stuck_records_label`, `Transport` gained
+  `stuck_records_label`, `Transport` gained
   `stop_intake`; `queue_run::install_signals` removed (unused).
 
 ## Unreleased — core queue loop; RabbitMQ ported onto it (2026-10-06)

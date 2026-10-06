@@ -1541,3 +1541,119 @@ fn e2e_rabbit_stuck_worker_cannot_outlive_shutdown_deadline() {
          after SIGTERM, record dead-lettered"
     );
 }
+
+// ==========================================================================
+// REJECT e2e — total line, poison handling, reject marker. Real broker, real
+// engine, real driver binary; test data in tests/fixtures/rejects.yaml.
+// ==========================================================================
+
+/// `tests/fixtures/rejects.yaml`.
+#[derive(serde::Deserialize)]
+struct RejectsFixture {
+    queue: String,
+    dead_letter_queue: String,
+    valid: String,
+    unparseable: String,
+    engine_reject: String,
+    drain_within_secs: u64,
+    markers: RejectMarkers,
+}
+
+#[derive(serde::Deserialize)]
+struct RejectMarkers {
+    final_total: String,
+    rejected: String,
+    engine_reject: String,
+    poison_warn: String,
+    poison_reject: String,
+}
+
+fn rejects_fixture() -> RejectsFixture {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rejects.yaml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    serde_norway::from_str(&text).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+}
+
+/// Takes (acks) every ready message of `queue` and returns the bodies.
+async fn drain_bodies(url: &str, queue: &str) -> anyhow::Result<Vec<String>> {
+    use lapin::options::BasicGetOptions;
+    use lapin::{Connection, ConnectionProperties};
+
+    let conn = Connection::connect(url, ConnectionProperties::default()).await?;
+    let channel = conn.create_channel().await?;
+    let mut bodies = Vec::new();
+    while let Some(msg) = channel
+        .basic_get(queue.into(), BasicGetOptions { no_ack: true })
+        .await?
+    {
+        bodies.push(String::from_utf8_lossy(&msg.delivery.data).into_owned());
+    }
+    conn.close(0, "drain done".into()).await.ok();
+    Ok(bodies)
+}
+
+/// One valid, one unparseable and one engine-rejected record: the final line
+/// counts 1 add and 2 rejected, both bad messages land in the DLQ verbatim,
+/// and each carries the unified `REJECTING:` marker on stdout.
+#[test]
+fn e2e_rabbit_rejects_are_counted_and_dead_lettered() {
+    let (Some(_engine), Some(url)) = (engine_config(), amqp_url()) else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_rejects_are_counted_and_dead_lettered: engine config and/or \
+             SENZING_AMQP_URL not set"
+        ));
+        return;
+    };
+    let fx = rejects_fixture();
+    let records = vec![
+        fx.valid.clone(),
+        fx.unparseable.clone(),
+        fx.engine_reject.clone(),
+    ];
+    rt().block_on(publish_dead_lettered(
+        &url,
+        &fx.queue,
+        &fx.dead_letter_queue,
+        &records,
+    ))
+    .expect("declare dead-lettered queue + publish");
+
+    let (mut child, out_path) = spawn_driver(0, 2, Some(&fx.queue), "rejects");
+    let drained = wait_queue_empty(&url, &fx.queue, Duration::from_secs(fx.drain_within_secs));
+    // Let in-flight deliveries settle before signalling.
+    std::thread::sleep(Duration::from_secs(3));
+    sigterm(child.id());
+    let status = wait_bounded(&mut child, Duration::from_secs(30));
+    let stdout = read_and_remove(&out_path);
+    let mut dead_lettered = rt()
+        .block_on(drain_bodies(&url, &fx.dead_letter_queue))
+        .expect("drain DLQ");
+
+    assert!(drained, "queue did not drain\n{stdout}");
+    let status = status.expect("driver did not exit within bound after SIGTERM");
+    assert!(status.success(), "driver exited {status:?}\n{stdout}");
+    let total = stdout
+        .lines()
+        .find(|l| l.starts_with(&fx.markers.final_total))
+        .unwrap_or_else(|| panic!("expected {:?}\n{stdout}", fx.markers.final_total));
+    assert!(
+        total.contains(&fx.markers.rejected),
+        "expected {:?} in {total:?}\n{stdout}",
+        fx.markers.rejected
+    );
+    for marker in [
+        &fx.markers.engine_reject,
+        &fx.markers.poison_warn,
+        &fx.markers.poison_reject,
+    ] {
+        assert!(
+            stdout.contains(marker.as_str()),
+            "missing {marker:?}\n{stdout}"
+        );
+    }
+    let mut want = vec![fx.unparseable.clone(), fx.engine_reject.clone()];
+    dead_lettered.sort();
+    want.sort();
+    assert_eq!(dead_lettered, want, "DLQ content mismatch\n{stdout}");
+    eprintln!("e2e_rabbit_rejects_are_counted_and_dead_lettered: {total}");
+}

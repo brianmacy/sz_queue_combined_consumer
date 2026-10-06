@@ -170,9 +170,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
         0.0
     };
     println!("Stats: {redos} redo records processed, {rate:.1}/sec, runtime: {elapsed:.0}s");
-    println!(
-        "Processed total of 0 adds, {redos} redo records ({dropped} redo dropped, {errors} errors)"
-    );
+    crate::stats::print_final_totals(0);
     if let Ok(engine_stats) = monitor_engine.get_stats() {
         println!("Engine stats: {engine_stats}");
     }

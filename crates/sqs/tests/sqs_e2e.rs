@@ -9,8 +9,10 @@
 //!
 //! What is proven here that unit tests cannot:
 //! * a rejected record (engine bad input) and an unparseable message BOTH land
-//!   in the dead-letter queue VERBATIM, discovered from the source queue's
-//!   RedrivePolicy, and the source queue is left empty (no silent delete);
+//!   in the dead-letter queue VERBATIM with an `SzReason` attribute,
+//!   discovered from the source queue's RedrivePolicy, are counted as
+//!   rejected (not adds) and marked `REJECTING:` on stdout, and the source
+//!   queue is left empty (no silent delete; data in `tests/fixtures/rejects.yaml`);
 //! * a source queue with no RedrivePolicy and no `--dead-letter-queue-url`
 //!   refuses to start (non-zero exit) unless `--allow-no-dlq` is given;
 //! * shutdown (data in `tests/fixtures/shutdown.yaml`): a worker stuck in a
@@ -241,36 +243,106 @@ fn read_to_string(p: &std::path::Path) -> String {
     s
 }
 
+/// `tests/fixtures/rejects.yaml`.
+#[derive(serde::Deserialize)]
+struct RejectsFixture {
+    queue: String,
+    valid_count: usize,
+    valid_template: String,
+    unparseable: String,
+    engine_reject: String,
+    dlq_within_secs: u64,
+    settle_within_secs: u64,
+    markers: RejectMarkers,
+}
+
+#[derive(serde::Deserialize)]
+struct RejectMarkers {
+    reason_attribute: String,
+    poison_reason: String,
+    final_total: String,
+    rejected: String,
+    engine_reject: String,
+    poison_warn: String,
+    poison_reject: String,
+}
+
+fn load_fixture<T: serde::de::DeserializeOwned>(name: &str) -> T {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+    serde_norway::from_str(&text).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+}
+
+/// Drains up to `want` messages from `url` (polling at most `within`), each
+/// with the String value of its `attribute` message attribute, if any.
+async fn drain_with_attribute(
+    client: &Client,
+    url: &str,
+    attribute: &str,
+    want: usize,
+    within: Duration,
+) -> Vec<(String, Option<String>)> {
+    let deadline = Instant::now() + within;
+    let mut got = Vec::new();
+    while got.len() < want && Instant::now() < deadline {
+        let resp = client
+            .receive_message()
+            .queue_url(url)
+            .max_number_of_messages(10)
+            .wait_time_seconds(1)
+            .message_attribute_names("All")
+            .send()
+            .await
+            .expect("receive");
+        for m in resp.messages() {
+            let value = m
+                .message_attributes()
+                .and_then(|a| a.get(attribute))
+                .and_then(|v| v.string_value())
+                .map(str::to_string);
+            got.push((m.body().unwrap_or_default().to_string(), value));
+            if let Some(h) = m.receipt_handle() {
+                let _ = client
+                    .delete_message()
+                    .queue_url(url)
+                    .receipt_handle(h)
+                    .send()
+                    .await;
+            }
+        }
+    }
+    got
+}
+
+/// Valid records plus one engine-rejected and one unparseable message: the
+/// two bad ones land in the RedrivePolicy-discovered DLQ verbatim with an
+/// `SzReason` attribute, the final line counts only the adds and reports 2
+/// rejected, and each reject carries the unified `REJECTING:` marker.
 #[tokio::test]
 async fn e2e_sqs_rejects_land_in_discovered_dlq_verbatim() {
     let Some(()) = gate() else { return };
+    let fx: RejectsFixture = load_fixture("rejects.yaml");
     let client = client().await;
-    let name = format!("sz-e2e-{}", std::process::id());
+    let name = format!("{}-{}", fx.queue, std::process::id());
     let (src, dlq) = make_queue_pair(&client, &name, true).await;
 
-    const N_VALID: usize = 12;
-    let valid: Vec<String> = (0..N_VALID)
-        .map(|i| {
-            format!(
-                r#"{{"DATA_SOURCE":"TEST","RECORD_ID":"SQS_E2E_{i}","NAME_FULL":"Sqs Tester {i}","EMAIL_ADDRESS":"sqs{i}@example.com"}}"#
-            )
-        })
+    let mut all: Vec<String> = (0..fx.valid_count)
+        .map(|i| fx.valid_template.replace("{i}", &i.to_string()))
         .collect();
-    let bad_engine =
-        r#"{"DATA_SOURCE":"E2E_NO_SUCH_DSRC","RECORD_ID":"SQS_BAD_DSRC","NAME_FULL":"X Y"}"#
-            .to_string();
-    let bad_parse = r#"{"RECORD_ID":"SQS_BAD_PARSE","NAME_FULL":"No Data Source"}"#.to_string();
-    let mut all = valid.clone();
-    all.push(bad_engine.clone());
-    all.push(bad_parse.clone());
+    all.push(fx.engine_reject.clone());
+    all.push(fx.unparseable.clone());
     send_all(&client, &src, &all).await;
 
-    let out_path = std::env::temp_dir().join(format!("{name}.out"));
+    let out_path = out_path("rejects");
     let mut child = spawn_driver(&src, &[], &out_path);
 
     // The DLQ must receive exactly the two rejects; then the source must drain.
-    let rejects = drain(&client, &dlq, 2, Duration::from_secs(90)).await;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let within = Duration::from_secs(fx.dlq_within_secs);
+    let mut rejects =
+        drain_with_attribute(&client, &dlq, &fx.markers.reason_attribute, 2, within).await;
+    let deadline = Instant::now() + Duration::from_secs(fx.settle_within_secs);
     while approx_depth(&client, &src).await > 0 && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
@@ -278,10 +350,7 @@ async fn e2e_sqs_rejects_land_in_discovered_dlq_verbatim() {
 
     sigterm(&child);
     let status = wait_bounded(&mut child, Duration::from_secs(30));
-    let stdout = read_to_string(&out_path);
-    let stderr = read_to_string(&out_path.with_extension("err"));
-    let _ = std::fs::remove_file(&out_path);
-    let _ = std::fs::remove_file(out_path.with_extension("err"));
+    let (stdout, stderr) = take_output(&out_path);
     delete_queues(&client, &[&src, &dlq]).await;
 
     let status = status.expect("driver did not exit after SIGTERM");
@@ -293,25 +362,53 @@ async fn e2e_sqs_rejects_land_in_discovered_dlq_verbatim() {
         stdout.contains(&format!("DeadLetter: {dlq}")),
         "DLQ must be discovered from the RedrivePolicy and announced\n{stdout}"
     );
-    let mut got = rejects.clone();
-    let mut want = vec![bad_engine, bad_parse];
-    got.sort();
-    want.sort();
-    assert_eq!(got, want, "DLQ content mismatch\n{stdout}\n{stderr}");
     assert_eq!(src_left, 0, "source queue must be fully settled\n{stdout}");
-    assert!(
-        stdout.contains("Sending to deadletter: E2E_NO_SUCH_DSRC : SQS_BAD_DSRC"),
-        "v4-parity reject line missing\n{stdout}"
+    for marker in [&fx.markers.poison_warn, &fx.markers.poison_reject] {
+        assert!(
+            stdout.contains(marker.as_str()),
+            "missing {marker:?}\n{stdout}"
+        );
+    }
+    let engine_reason = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix(fx.markers.engine_reject.as_str()))
+        .unwrap_or_else(|| panic!("missing {:?}\n{stdout}", fx.markers.engine_reject));
+
+    rejects.sort();
+    let (bodies, reasons): (Vec<String>, Vec<Option<String>>) = rejects.into_iter().unzip();
+    let mut want = vec![fx.engine_reject.clone(), fx.unparseable.clone()];
+    want.sort();
+    assert_eq!(bodies, want, "DLQ content mismatch\n{stdout}\n{stderr}");
+    // Sorted bodies: the engine reject ('{"DATA_SOURCE":"E2E...') before the
+    // unparseable one ('{"DATA_SOURCE":"TEST...').
+    assert_eq!(
+        reasons[0].as_deref(),
+        Some(engine_reason),
+        "engine reject's SzReason must be the marker's reason\n{stdout}"
     );
+    assert!(
+        reasons[1]
+            .as_deref()
+            .is_some_and(|r| r.starts_with(&fx.markers.poison_reason)),
+        "poison SzReason {:?} must start with {:?}",
+        reasons[1],
+        fx.markers.poison_reason
+    );
+
+    let total_prefix = fx
+        .markers
+        .final_total
+        .replace("{N}", &fx.valid_count.to_string());
     let total = stdout
         .lines()
-        .find(|l| l.starts_with("Processed total of "))
-        .unwrap_or_else(|| panic!("no total line\n{stdout}"));
+        .find(|l| l.starts_with(&total_prefix))
+        .unwrap_or_else(|| panic!("expected {total_prefix:?}\n{stdout}"));
     assert!(
-        total.starts_with(&format!("Processed total of {N_VALID} adds")),
-        "expected {N_VALID} adds: {total}\n{stdout}"
+        total.contains(&fx.markers.rejected),
+        "expected {:?} in {total:?}\n{stdout}",
+        fx.markers.rejected
     );
-    eprintln!("e2e_sqs_rejects_land_in_discovered_dlq_verbatim: {N_VALID} adds, 2 dead-lettered");
+    eprintln!("e2e_sqs_rejects_land_in_discovered_dlq_verbatim: {total}; SzReason {reasons:?}");
 }
 
 #[tokio::test]
@@ -430,10 +527,7 @@ struct DepthCase {
 }
 
 fn fixture() -> Fixture {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/shutdown.yaml");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-    serde_norway::from_str(&text).unwrap_or_else(|e| panic!("parse {path:?}: {e}"))
+    load_fixture("shutdown.yaml")
 }
 
 /// Example record-transform plugin cdylib (built as a dev-dependency into the
