@@ -2,6 +2,21 @@
 
 All sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); all sections headed `0.3.0 — …` shipped in tag `v0.3.0` (2026-09-23). Each keeps the date it landed on `main`.
 
+## Unreleased — forced exit can no longer be blocked by a wedged native thread (2026-10-06)
+
+### Fixed
+
+* **The forced-exit paths now terminate with `libc::_exit(2)` instead of
+  `std::process::exit`** (`leak_and_exit`, and `teardown_and_exit` when
+  `Sz_destroy()` overruns its grace or its thread cannot spawn; stdout/stderr
+  are flushed first). `exit(3)` runs atexit handlers / static destructors, which
+  can block on a lock held by a Senzing/ODBC thread stuck mid-engine-call — the
+  very condition these paths exist to escape. In production (2026-07-27, DB
+  restart) 17 of 20 consumers logged `forcing process exit` and never exited,
+  so `RestartPolicy=on-failure` never fired and the fleet silently ran at 57%
+  capacity for 80 minutes. A clean, completed teardown still uses
+  `std::process::exit`.
+
 ## 0.4.0 — core Transport loop alignment + ActiveMQ Artemis consumer (2026-10-06)
 
 One section for everything since `v0.3.0`, describing the behavior as it
