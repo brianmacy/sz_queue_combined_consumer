@@ -102,8 +102,12 @@ jobs:
       image: senzing/senzingsdk-runtime:4.3.3
       options: --user root
     services:
+      # postgres + rabbitmq come from the ECR Public mirror of the Docker Official
+      # Images (identical digests; no Docker Hub pull rate limit on shared runners).
+      # senzing / elasticmq / artemis stay on Docker Hub: not mirrored (or, for
+      # senzing, the ECR image has different digests).
       postgres:
-        image: postgres:16
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_USER: senzing
           POSTGRES_PASSWORD: senzing
@@ -114,7 +118,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       rabbitmq:
-        image: rabbitmq:3-management
+        image: public.ecr.aws/docker/library/rabbitmq:3-management
         options: >-
           --health-cmd "rabbitmq-diagnostics -q ping"
           --health-interval 10s
