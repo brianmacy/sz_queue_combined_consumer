@@ -477,8 +477,8 @@ docker run -d --name sz-e2e-artemis -p 5673:5672 -p 8161:8161 \
 export SENZING_ROOT="$(brew --prefix)/opt/senzing/er"
 export DYLD_LIBRARY_PATH="$SENZING_ROOT/lib"
 export SENZING_LIB_PATH="$SENZING_ROOT/lib"
-export SENZING_ENGINE_CONFIGURATION_JSON='{"PIPELINE":{"CONFIGPATH":"'"$SENZING_ROOT"'/etc","RESOURCEPATH":"'"$SENZING_ROOT"'/resources","SUPPORTPATH":"'"$(brew --prefix)"'/opt/senzing/data"},"SQL":{"CONNECTION":"postgresql://senzing:senzing@localhost:55432:G2"}}'
-export IT_PG_DSN=postgresql://senzing:senzing@localhost:55432/G2
+export SENZING_ENGINE_CONFIGURATION_JSON='{"PIPELINE":{"CONFIGPATH":"'"$SENZING_ROOT"'/etc","RESOURCEPATH":"'"$SENZING_ROOT"'/resources","SUPPORTPATH":"'"$(brew --prefix)"'/opt/senzing/data"},"SQL":{"CONNECTION":"postgresql://senzing:senzing@127.0.0.1:55432:G2"}}'
+export IT_PG_DSN=postgresql://senzing:senzing@127.0.0.1:55432/G2
 export SENZING_AMQP_URL='amqp://guest:guest@localhost:5672/%2F' SENZING_RABBITMQ_QUEUE=senzing-rabbitmq-queue
 export AWS_ENDPOINT_URL=http://localhost:9324 AWS_ACCESS_KEY_ID=elasticmq AWS_SECRET_ACCESS_KEY=elasticmq AWS_REGION=elasticmq
 export SENZING_ACTIVEMQ_URL=amqp://artemis:artemis@localhost:5673
