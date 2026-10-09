@@ -1,8 +1,8 @@
 # Changelog
 
-All sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); all sections headed `0.3.0 — …` shipped in tag `v0.3.0` (2026-09-23). Each keeps the date it landed on `main`.
+Sections headed `0.4.1 — …` ship in tag `v0.4.1` (2026-10-09); all sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); all sections headed `0.3.0 — …` shipped in tag `v0.3.0` (2026-09-23). Each keeps the date it landed on `main`.
 
-## Unreleased — forced exit can no longer be blocked by a wedged native thread (2026-10-06)
+## 0.4.1 — process exit can no longer hang; nohup honored (2026-10-09)
 
 ### Fixed
 
@@ -18,8 +18,11 @@ All sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); 
   an RST/FIN fails fast. In production (2026-07-27, DB restart) 17 of 20
   consumers logged `forcing process exit` and never exited, so
   `RestartPolicy=on-failure` never fired and the fleet silently ran at 57%
-  capacity for 80 minutes. A clean, completed teardown still uses
-  `std::process::exit`.
+  capacity for 80 minutes.
+* **The normal exit path is bounded too.** After a completed teardown the driver
+  still exits with `std::process::exit` (so atexit handlers and destructors run),
+  but a watchdog forces `_exit` with the same code if that exit has not finished
+  within `EXIT_GRACE` (2 s), so no exit path can hang on exit-time native code.
 * **`nohup` is honored: an inherited ignored SIGHUP stays ignored** (#33).
   `nohup driver &` did not survive logout: queue mode always installed a tokio
   SIGHUP handler (`queue_loop::ShutdownSignals`) and file / pure-redoer mode's
@@ -32,11 +35,21 @@ All sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); 
   e2e tests (RabbitMQ, SQS, ActiveMQ queue mode; file mode via a FIFO) start the
   driver with SIGHUP ignored and require it to keep consuming after SIGHUP.
 * **Operating notes.** A hung consumer looks healthy to Docker (`Up`, flat
-  `RestartCount`); alert on the broker-side consumer count. Keep the Docker stop
-  timeout above the 10 s worker-join grace. Client-side TCP keepalive /
+  `RestartCount`); alert on the broker-side consumer count. **Set the container
+  stop timeout to 30 s** (`docker run --stop-timeout 30`, compose
+  `stop_grace_period: 30s`): the worst-case SIGTERM path is the 10 s worker-join
+  grace + transport close (≤ 5 s SQS/ActiveMQ) + 5 s native teardown + 2 s exit
+  watchdog, and Docker's default 10 s SIGKILLs before the forced-exit paths run. Client-side TCP keepalive /
   `tcp_user_timeout` for the database connection may bound how long an
   unresponsive connection blocks the engine (not verified that Senzing's
   connection string passes them through).
+
+### Changed
+
+* **`tokio-util` is pinned to `=0.7.19`** (`crates/activemq/Cargo.toml`).
+  0.7.20 breaks the build of `fe2o3-amqp` 0.18.2, the latest release; the pin
+  keeps `cargo update` and Dependabot from pulling it in.
+* Dependencies refreshed (`cargo update`).
 
 ## 0.4.0 — core Transport loop alignment + ActiveMQ Artemis consumer (2026-10-06)
 

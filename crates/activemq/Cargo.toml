@@ -18,6 +18,12 @@ tokio.workspace = true
 # AMQP 1.0 client. NO lapin / AWS SDK here — this bin compiles only its own
 # transport.
 fe2o3-amqp.workspace = true
+# Held at 0.7.19: tokio-util 0.7.20 adds `impl Encoder<&[u8]> for
+# LengthDelimitedCodec`, which makes fe2o3-amqp 0.18.2 (latest) fail to compile
+# (E0283 in transport/mod.rs). Not used directly; this constraint stops a
+# `cargo update` / Dependabot bump from breaking the build. Remove once
+# fe2o3-amqp ships a fix.
+tokio-util = "=0.7.19"
 url.workspace = true
 percent-encoding.workspace = true
 anyhow.workspace = true
