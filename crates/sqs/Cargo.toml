@@ -2,6 +2,7 @@
 name = "sz_sqs_combined_consumer"
 description = "Senzing combined load + redo driver, Amazon SQS backend (standard queues; one redo% knob). Shares the engine-processing core with the RabbitMQ driver."
 version.workspace = true
+publish = false  # not published to crates.io
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
