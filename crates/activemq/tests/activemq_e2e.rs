@@ -363,6 +363,22 @@ fn driver_bin() -> &'static str {
     env!("CARGO_BIN_EXE_sz_activemq_combined_consumer")
 }
 
+/// Sets SIGHUP to `disposition` in the child between fork and exec; `SIG_IGN`
+/// and `SIG_DFL` survive exec (this is exactly what `nohup` does).
+fn set_child_sighup(cmd: &mut Command, disposition: libc::sighandler_t) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure only calls signal(2), which is async-signal-safe and
+    // so allowed between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::signal(libc::SIGHUP, disposition) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// A spawned driver whose stdout/stderr go to temp files.
 struct Driver {
     child: std::process::Child,
@@ -372,21 +388,40 @@ struct Driver {
 impl Driver {
     /// Spawns the driver on `queue` (2 threads, redo% 0); `envs` win.
     fn spawn(queue: &str, args: &[&str], envs: &[(&str, String)]) -> Self {
+        Self::spawn_sighup(queue, args, envs, None)
+    }
+
+    /// [`Driver::spawn`] with the child's starting SIGHUP disposition set to
+    /// `sighup` (`SIG_IGN` as `nohup` sets it; `SIG_DFL` so the test runner's
+    /// cannot leak in).
+    fn spawn_sighup(
+        queue: &str,
+        args: &[&str],
+        envs: &[(&str, String)],
+        sighup: Option<libc::sighandler_t>,
+    ) -> Self {
         let out = std::env::temp_dir().join(format!("{}.out", unique(&format!("sz-amq-{queue}"))));
         let stdout = std::fs::File::create(&out).expect("stdout file");
         let stderr = std::fs::File::create(out.with_extension("err")).expect("stderr file");
-        let child = Command::new(driver_bin())
-            .args(args)
+        let mut cmd = Command::new(driver_bin());
+        cmd.args(args)
             .env("SENZING_ACTIVEMQ_QUEUE", queue)
             .env("SENZING_THREADS_PER_PROCESS", "2")
             .env("SENZING_REDO_PERCENT", "0")
             .env_remove("SENZING_INPUT_FILE")
             .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
             .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .expect("spawn activemq driver");
+            .stderr(Stdio::from(stderr));
+        if let Some(disposition) = sighup {
+            set_child_sighup(&mut cmd, disposition);
+        }
+        let child = cmd.spawn().expect("spawn activemq driver");
         Self { child, out }
+    }
+
+    /// Whether the driver is still running.
+    fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
     }
 
     fn signal(&self, sig: libc::c_int) {
@@ -803,6 +838,7 @@ async fn e2e_activemq_rejects_land_on_the_dead_letter_address() {
 struct ShutdownFixture {
     markers: Markers,
     sighup: SighupCase,
+    sighup_ignored: SighupIgnoredCase,
     deadline: DeadlineCase,
     link_loss: LinkLossCase,
     startup: StartupCase,
@@ -812,6 +848,7 @@ struct ShutdownFixture {
 struct Markers {
     final_total: String,
     sighup: String,
+    sighup_ignored: String,
     left_for_redelivery: String,
     link_lost: String,
     connect_failed: String,
@@ -822,6 +859,16 @@ struct SighupCase {
     queue: String,
     exit_within_secs: u64,
     records: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SighupIgnoredCase {
+    queue: String,
+    settle_secs: u64,
+    survive_secs: u64,
+    exit_within_secs: u64,
+    before: Vec<String>,
+    after: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -868,7 +915,7 @@ async fn e2e_activemq_sighup_is_graceful() {
     let mut broker = Broker::connect(&url).await;
     broker.send(&queue, &case.records, BodyKind::Data).await;
 
-    let driver = Driver::spawn(&queue, &[], &[]);
+    let driver = Driver::spawn_sighup(&queue, &[], &[], Some(libc::SIG_DFL));
     let drained = wait_queue_empty(&queue, Duration::from_secs(120)).await;
     driver.signal(libc::SIGHUP);
     let (status, stdout, stderr) = driver
@@ -883,6 +930,58 @@ async fn e2e_activemq_sighup_is_graceful() {
     assert_eq!(
         final_total(&stdout, &fx.markers.final_total),
         case.records.len(),
+        "{stdout}"
+    );
+}
+
+/// Under `nohup` (SIGHUP inherited as ignored) SIGHUP must not stop the driver
+/// (issue #33): it stays up and keeps consuming; SIGTERM then exits 0 with
+/// every record loaded.
+#[tokio::test]
+async fn e2e_activemq_sighup_ignored_under_nohup_keeps_running() {
+    let Some(url) = gate() else { return };
+    let fx = shutdown_fixture();
+    let case = &fx.sighup_ignored;
+    let queue = unique(&case.queue);
+    let mut broker = Broker::connect(&url).await;
+    broker.send(&queue, &case.before, BodyKind::Data).await;
+
+    let mut driver = Driver::spawn_sighup(&queue, &[], &[], Some(libc::SIG_IGN));
+    let drained_before = wait_queue_empty(&queue, Duration::from_secs(120)).await;
+    tokio::time::sleep(Duration::from_secs(case.settle_secs)).await;
+    driver.signal(libc::SIGHUP);
+    tokio::time::sleep(Duration::from_secs(case.survive_secs)).await;
+    let survived = driver.running();
+    // Only a surviving driver can consume the second batch.
+    let drained_after = survived && {
+        broker.send(&queue, &case.after, BodyKind::Data).await;
+        wait_queue_empty(&queue, Duration::from_secs(120)).await
+    };
+    if survived {
+        tokio::time::sleep(Duration::from_secs(case.settle_secs)).await;
+        driver.signal(libc::SIGTERM);
+    }
+    let (status, stdout, stderr) = driver
+        .finish(Duration::from_secs(case.exit_within_secs))
+        .await;
+    broker.close().await;
+
+    assert!(drained_before, "queue did not drain\n{stdout}\n{stderr}");
+    assert!(
+        survived,
+        "ignored SIGHUP stopped the driver\n{stdout}\n{stderr}"
+    );
+    assert!(
+        drained_after,
+        "driver stopped consuming after SIGHUP\n{stdout}"
+    );
+    let status = status.expect("driver did not exit after SIGTERM");
+    assert!(status.success(), "exit {status:?}\n{stdout}\n{stderr}");
+    assert!(stdout.contains(&fx.markers.sighup_ignored), "{stdout}");
+    assert!(!stdout.contains(&fx.markers.sighup), "{stdout}");
+    assert_eq!(
+        final_total(&stdout, &fx.markers.final_total),
+        case.before.len() + case.after.len(),
         "{stdout}"
     );
 }

@@ -20,6 +20,17 @@ All sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); 
   `RestartPolicy=on-failure` never fired and the fleet silently ran at 57%
   capacity for 80 minutes. A clean, completed teardown still uses
   `std::process::exit`.
+* **`nohup` is honored: an inherited ignored SIGHUP stays ignored** (#33).
+  `nohup driver &` did not survive logout: queue mode always installed a tokio
+  SIGHUP handler (`queue_loop::ShutdownSignals`) and file / pure-redoer mode's
+  `ctrlc` `termination` feature also claims SIGHUP, either replacing the
+  inherited `SIG_IGN`, so the logout SIGHUP became a graceful shutdown. The
+  disposition is now read once at startup (`runtime::sighup_inherited_ignored`,
+  before any handler); when it was `SIG_IGN`, queue mode installs no SIGHUP
+  handler and the `ctrlc` path puts `SIG_IGN` back, with one startup info line.
+  Otherwise SIGHUP is still a graceful shutdown; SIGINT/SIGTERM unchanged. New
+  e2e tests (RabbitMQ, SQS, ActiveMQ queue mode; file mode via a FIFO) start the
+  driver with SIGHUP ignored and require it to keep consuming after SIGHUP.
 * **Operating notes.** A hung consumer looks healthy to Docker (`Up`, flat
   `RestartCount`); alert on the broker-side consumer count. Keep the Docker stop
   timeout above the 10 s worker-join grace. Client-side TCP keepalive /

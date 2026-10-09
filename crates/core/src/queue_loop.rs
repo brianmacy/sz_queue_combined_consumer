@@ -30,6 +30,7 @@ use crate::config::Config;
 use crate::pool::{EnginePool, spawn_engine_pool};
 use crate::queue_run::{RunOutcome, monitor_interval};
 use crate::record::{ParseError, RecordInfo, parse_record};
+use crate::runtime::sighup_inherited_ignored;
 use crate::stats::{
     self, ADDS_PROCESSED, ADDS_REJECTED, RUNNING, StatsThread, StatusTicker, ThroughputTicker,
 };
@@ -130,10 +131,12 @@ struct InFlight {
 }
 
 /// The SIGINT / SIGTERM / SIGHUP streams; any one starts a graceful shutdown.
+/// SIGHUP is not handled at all (`None`) when it was inherited as ignored, e.g.
+/// under `nohup` (issue #33): installing a handler would replace the `SIG_IGN`.
 pub struct ShutdownSignals {
     sigint: Signal,
     sigterm: Signal,
-    sighup: Signal,
+    sighup: Option<Signal>,
 }
 
 impl ShutdownSignals {
@@ -145,7 +148,11 @@ impl ShutdownSignals {
         Ok(Self {
             sigint: install(SignalKind::interrupt(), "SIGINT")?,
             sigterm: install(SignalKind::terminate(), "SIGTERM")?,
-            sighup: install(SignalKind::hangup(), "SIGHUP")?,
+            sighup: if sighup_inherited_ignored() {
+                None
+            } else {
+                Some(install(SignalKind::hangup(), "SIGHUP")?)
+            },
         })
     }
 
@@ -155,8 +162,18 @@ impl ShutdownSignals {
             biased;
             _ = self.sigint.recv() => "SIGINT",
             _ = self.sigterm.recv() => "SIGTERM",
-            _ = self.sighup.recv() => "SIGHUP",
+            _ = recv_if_installed(&mut self.sighup) => "SIGHUP",
         }
+    }
+}
+
+/// Waits for `sig`; never completes when it was not installed. Cancel-safe.
+async fn recv_if_installed(sig: &mut Option<Signal>) {
+    match sig {
+        Some(s) => {
+            s.recv().await;
+        }
+        None => std::future::pending().await,
     }
 }
 

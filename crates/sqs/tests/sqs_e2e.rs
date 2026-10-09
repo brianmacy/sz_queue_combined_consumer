@@ -180,6 +180,35 @@ fn spawn_driver(
     spawn_driver_env(queue_url, extra, &[], stdout_path)
 }
 
+/// [`spawn_driver`] with the child's starting SIGHUP disposition set to
+/// `sighup` (`SIG_IGN` as `nohup` sets it; `SIG_DFL` so the test runner's
+/// cannot leak in).
+fn spawn_driver_sighup(
+    queue_url: &str,
+    stdout_path: &std::path::Path,
+    sighup: libc::sighandler_t,
+) -> std::process::Child {
+    let mut cmd = driver_command(queue_url, &[], &[], stdout_path);
+    set_child_sighup(&mut cmd, sighup);
+    cmd.spawn().expect("spawn sqs driver")
+}
+
+/// Sets SIGHUP to `disposition` in the child between fork and exec; `SIG_IGN`
+/// and `SIG_DFL` survive exec (this is exactly what `nohup` does).
+fn set_child_sighup(cmd: &mut Command, disposition: libc::sighandler_t) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure only calls signal(2), which is async-signal-safe and
+    // so allowed between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::signal(libc::SIGHUP, disposition) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// [`spawn_driver`] with extra environment variables (set last, so they win).
 fn spawn_driver_env(
     queue_url: &str,
@@ -187,10 +216,22 @@ fn spawn_driver_env(
     envs: &[(&str, String)],
     stdout_path: &std::path::Path,
 ) -> std::process::Child {
+    driver_command(queue_url, extra, envs, stdout_path)
+        .spawn()
+        .expect("spawn sqs driver")
+}
+
+/// The driver command [`spawn_driver_env`] runs.
+fn driver_command(
+    queue_url: &str,
+    extra: &[&str],
+    envs: &[(&str, String)],
+    stdout_path: &std::path::Path,
+) -> Command {
     let out = std::fs::File::create(stdout_path).expect("stdout file");
     let err = std::fs::File::create(stdout_path.with_extension("err")).expect("stderr file");
-    Command::new(driver_bin())
-        .args(extra)
+    let mut cmd = Command::new(driver_bin());
+    cmd.args(extra)
         .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
         .env("SENZING_SQS_QUEUE_URL", queue_url)
         .env("SENZING_THREADS_PER_PROCESS", "2")
@@ -198,9 +239,8 @@ fn spawn_driver_env(
         .env("SENZING_SQS_WAIT_TIME", "1")
         .env_remove("SENZING_INPUT_FILE")
         .stdout(Stdio::from(out))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .expect("spawn sqs driver")
+        .stderr(Stdio::from(err));
+    cmd
 }
 
 fn sigterm(child: &std::process::Child) {
@@ -476,6 +516,7 @@ async fn e2e_sqs_refuses_to_start_without_dlq_unless_allowed() {
 struct Fixture {
     markers: Markers,
     sighup: SighupCase,
+    sighup_ignored: SighupIgnoredCase,
     deadline: DeadlineCase,
     receive_error: ReceiveErrorCase,
     depth: DepthCase,
@@ -485,6 +526,7 @@ struct Fixture {
 struct Markers {
     final_total: String,
     sighup: String,
+    sighup_ignored: String,
     left_for_redelivery: String,
     shutdown_error: String,
     depth_drained: String,
@@ -496,6 +538,16 @@ struct SighupCase {
     queue: String,
     exit_within_secs: u64,
     records: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SighupIgnoredCase {
+    queue: String,
+    settle_secs: u64,
+    survive_secs: u64,
+    exit_within_secs: u64,
+    before: Vec<String>,
+    after: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -708,12 +760,8 @@ async fn e2e_sqs_sighup_is_graceful() {
     send_all(&client, &src, &case.records).await;
 
     let out = out_path("sighup");
-    let mut child = spawn_driver(&src, &[], &out);
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while approx_depth(&client, &src).await > 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-    let drained = approx_depth(&client, &src).await == 0;
+    let mut child = spawn_driver_sighup(&src, &out, libc::SIG_DFL);
+    let drained = wait_drained(&client, &src).await;
     send_signal(&child, libc::SIGHUP);
     let status = wait_bounded(&mut child, Duration::from_secs(case.exit_within_secs));
     let (stdout, stderr) = take_output(&out);
@@ -732,6 +780,66 @@ async fn e2e_sqs_sighup_is_graceful() {
     let adds = final_total(&stdout, &fx.markers.final_total);
     assert_eq!(adds, case.records.len(), "all records loaded\n{stdout}");
     eprintln!("e2e_sqs_sighup_is_graceful: {adds} loaded, exit 0 on SIGHUP");
+}
+
+/// Under `nohup` (SIGHUP inherited as ignored) SIGHUP must not stop the driver
+/// (issue #33): it stays up and keeps consuming; SIGTERM then exits 0 with
+/// every record loaded.
+#[tokio::test]
+async fn e2e_sqs_sighup_ignored_under_nohup_keeps_running() {
+    let Some(()) = gate() else { return };
+    let fx = fixture();
+    let case = &fx.sighup_ignored;
+    let client = client().await;
+    let name = format!("{}-{}", case.queue, std::process::id());
+    let (src, dlq) = make_queue_pair(&client, &name, true).await;
+    send_all(&client, &src, &case.before).await;
+
+    let out = out_path("sighup-ignored");
+    let mut child = spawn_driver_sighup(&src, &out, libc::SIG_IGN);
+    let drained_before = wait_drained(&client, &src).await;
+    tokio::time::sleep(Duration::from_secs(case.settle_secs)).await;
+    send_signal(&child, libc::SIGHUP);
+    tokio::time::sleep(Duration::from_secs(case.survive_secs)).await;
+    let survived = matches!(child.try_wait(), Ok(None));
+    // Only a surviving driver can consume the second batch.
+    let drained_after = survived && {
+        send_all(&client, &src, &case.after).await;
+        wait_drained(&client, &src).await
+    };
+    if survived {
+        tokio::time::sleep(Duration::from_secs(case.settle_secs)).await;
+        sigterm(&child);
+    }
+    let status = wait_bounded(&mut child, Duration::from_secs(case.exit_within_secs));
+    let (stdout, stderr) = take_output(&out);
+    delete_queues(&client, &[&src, &dlq]).await;
+
+    assert!(drained_before, "queue did not drain\n{stdout}\n{stderr}");
+    assert!(
+        survived,
+        "ignored SIGHUP stopped the driver\n{stdout}\n{stderr}"
+    );
+    assert!(
+        drained_after,
+        "driver stopped consuming after SIGHUP\n{stdout}"
+    );
+    let status = status.expect("driver did not exit within bound after SIGTERM");
+    assert!(status.success(), "exit {status:?}\n{stdout}\n{stderr}");
+    assert!(stdout.contains(&fx.markers.sighup_ignored), "{stdout}");
+    assert!(!stdout.contains(&fx.markers.sighup), "{stdout}");
+    let adds = final_total(&stdout, &fx.markers.final_total);
+    assert_eq!(adds, case.before.len() + case.after.len(), "{stdout}");
+    eprintln!("e2e_sqs_sighup_ignored_under_nohup_keeps_running: {adds} loaded across SIGHUP");
+}
+
+/// Polls (up to 120 s) until `src` holds no message, visible or in flight.
+async fn wait_drained(client: &Client, src: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while approx_depth(client, src).await > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    approx_depth(client, src).await == 0
 }
 
 /// A port nothing listens on (bound, then released).

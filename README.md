@@ -298,7 +298,7 @@ sz_rabbit_combined_consumer --file records.jsonl \
 * **Fatal errors** (Database, NotInitialized, License, …; SQS also 30
   consecutive `ReceiveMessage` failures; ActiveMQ also a lost broker link) →
   orderly teardown, non-zero exit.
-  Graceful shutdown (SIGINT, SIGTERM, or — queue mode — SIGHUP) drains
+  Graceful shutdown (SIGINT, SIGTERM, or SIGHUP) drains
   in-flight work within a 10 s grace; whatever is still unsettled then is
   **released for redelivery on every transport, never dead-lettered or counted
   as rejected** — queued-but-unstarted deliveries and those still inside a
@@ -306,6 +306,10 @@ sz_rabbit_combined_consumer --file records.jsonl \
   SQS: left un-deleted, redelivered after the visibility timeout; ActiveMQ:
   `released`, immediately redeliverable). Each one
   still inside a worker is printed as `Still processing (… min): DS : ID`.
+  **`nohup` is honored:** if SIGHUP is already ignored when the process starts
+  (as `nohup` sets it), it stays ignored in every mode (queue, file, pure
+  redoer) and a startup line says so, so `nohup … &` survives logout; stop it
+  with SIGTERM/SIGINT. SIGINT/SIGTERM behavior is unchanged.
   Redelivery is safe: `add_record` with an existing key replaces the record
   (idempotent) and the engine handles same-key contention itself; the
   in-worker call may still complete before the process exits (and a container
