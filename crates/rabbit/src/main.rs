@@ -35,7 +35,7 @@ pub(crate) const INSTANCE_NAME: &str = "sz_rabbit_combined_consumer";
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "sz_rabbit_combined_consumer",
-    version,
+    version = sz_combined_consumer_core::VERSION,
     about = "Combined Senzing driver: add_record from RabbitMQ and process_redo_record, \
              split by one redo%% knob (0 = pure loader, 100 = pure redoer)",
     long_about = None

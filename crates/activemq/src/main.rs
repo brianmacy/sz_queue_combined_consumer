@@ -38,7 +38,7 @@ const FQQN_SEPARATOR: &str = "::";
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "sz_activemq_combined_consumer",
-    version,
+    version = sz_combined_consumer_core::VERSION,
     about = "Combined Senzing driver (Apache ActiveMQ Artemis, AMQP 1.0): add_record from an \
              Artemis queue and process_redo_record, split by one redo%% knob (0 = pure loader, \
              100 = pure redoer)",
