@@ -40,3 +40,11 @@ pub mod transform;
 pub mod worker;
 
 pub use config::{CommonArgs, Config};
+
+/// Version every binary reports with `--version`. Release builds set
+/// `RELEASE_VERSION` from the git tag (`v0.4.2` -> `0.4.2`) in
+/// `.github/workflows/release.yml`; other builds use the workspace version.
+pub const VERSION: &str = match option_env!("RELEASE_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};

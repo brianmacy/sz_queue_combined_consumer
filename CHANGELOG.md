@@ -4,6 +4,11 @@ Sections headed `0.4.1 — …` ship in tag `v0.4.1` (2026-10-09); all sections 
 
 ## Unreleased
 
+* **`--version` comes from the release tag.** Release builds set `RELEASE_VERSION`
+  from the git tag (`core::VERSION`), and the release workflow fails if any
+  binary's `--version` does not match the tag. Other builds report the workspace
+  `Cargo.toml` version.
+
 ### CI / release
 
 * **Prebuilt Linux release binaries.** New `.github/workflows/release.yml`

@@ -44,7 +44,7 @@ const MAX_VISIBILITY_TIMEOUT_SECS: i32 = 43_200;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "sz_sqs_combined_consumer",
-    version,
+    version = sz_combined_consumer_core::VERSION,
     about = "Combined Senzing driver (Amazon SQS): add_record from an SQS queue and \
              process_redo_record, split by one redo%% knob (0 = pure loader, 100 = pure redoer)",
     long_about = None

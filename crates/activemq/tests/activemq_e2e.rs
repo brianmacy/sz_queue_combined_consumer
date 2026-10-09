@@ -1193,7 +1193,7 @@ fn e2e_activemq_help_and_version() {
         .output()
         .expect("--version");
     assert!(version.status.success());
-    assert!(String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")));
+    assert!(String::from_utf8_lossy(&version.stdout).contains(sz_combined_consumer_core::VERSION));
 }
 
 // ==========================================================================

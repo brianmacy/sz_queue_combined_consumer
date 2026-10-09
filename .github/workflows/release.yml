@@ -108,6 +108,8 @@ jobs:
         run: |
           PKGS=""
           for b in $BINS; do PKGS="$PKGS -p $b"; done
+          # --version reports the release tag (v0.4.2 -> 0.4.2); see core VERSION.
+          export RELEASE_VERSION="${TAG#v}"
           # shellcheck disable=SC2086
           cargo build --release --locked $PKGS
 
@@ -124,8 +126,14 @@ jobs:
             if [ -n "$bad" ]; then echo "::error::$b has unexpected NEEDED: $bad"; exit 1; fi
           done
 
-      - name: Smoke test (--version inside the Senzing runtime)
-        run: for b in $BINS; do "target/release/$b" --version; done
+      - name: Smoke test (--version inside the Senzing runtime matches the tag)
+        run: |
+          set -eu
+          for b in $BINS; do
+            got="$("target/release/$b" --version)"
+            echo "$got"
+            if [ "$got" != "$b ${TAG#v}" ]; then echo "::error::$b --version is '$got', want '$b ${TAG#v}'"; exit 1; fi
+          done
 
       - name: Package
         run: |
