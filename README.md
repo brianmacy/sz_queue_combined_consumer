@@ -373,6 +373,47 @@ compare/scoring buffers with `MADV_DONTNEED` on release, tracked in
   tolerate an interposed allocator. Swapping the process allocator is not a
   viable deployment-level mitigation.
 
+## Download / release binaries
+
+Each [GitHub Release](https://github.com/brianmacy/sz_queue_combined_consumer/releases) carries prebuilt Linux binaries, built by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) inside the
+`senzing/senzingsdk-runtime:4.3.3` image for that arch:
+
+| Asset | Contents |
+|---|---|
+| `sz_queue_combined_consumer-<tag>-linux-x86_64.tar.gz` | `sz_rabbit_combined_consumer`, `sz_sqs_combined_consumer`, `sz_activemq_combined_consumer`, `README.md`, `LICENSE`, `CHANGELOG.md` |
+| `sz_queue_combined_consumer-<tag>-linux-aarch64.tar.gz` | same, for arm64 |
+| `SHA256SUMS` | SHA-256 of both archives |
+
+```console
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf sz_queue_combined_consumer-v0.4.1-linux-x86_64.tar.gz
+LD_LIBRARY_PATH=/opt/senzing/er/lib \
+  ./sz_queue_combined_consumer-v0.4.1-linux-x86_64/sz_rabbit_combined_consumer --version
+```
+
+**Runtime requirements.** The binaries are not fully static, and cannot be:
+the Senzing engine (`libSz.so`) is a glibc shared library, linked as a dynamic
+dependency (no static or musl build exists). Everything else is compiled in:
+TLS is rustls (no OpenSSL), and the release build fails if a binary needs any
+library other than `libSz.so`, `libc`, `libm`, `libgcc_s` and the glibc loader.
+You need:
+
+- The **Senzing SDK runtime 4.x** installed (`/opt/senzing/er`), with
+  `LD_LIBRARY_PATH=/opt/senzing/er/lib` (the binaries carry no RPATH). libSz's
+  own dependencies (libstdc++, OpenSSL 3, zlib, zstd) and the DB-plugin
+  dependencies for your database (libpq or the MS ODBC driver) are needed as
+  for any Senzing application; the Senzing packages pull them in.
+- **glibc >= the build image's** (Debian 13, glibc 2.41) — i.e. the same distro
+  baseline as the Senzing 4.3.x runtime packages. Running inside
+  `senzing/senzingsdk-runtime` always works.
+
+The record-transform example plugin (`crates/transform-example`) is not
+shipped: it is a reference implementation for writing your own plugin, not a
+useful transform, and a plugin must be built against the same
+`sz-record-transform` ABI version as the driver anyway — build it with
+`cargo build --release -p sz-record-transform-example`.
+
 ## Build
 
 ```console

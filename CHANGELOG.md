@@ -2,6 +2,24 @@
 
 Sections headed `0.4.1 — …` ship in tag `v0.4.1` (2026-10-09); all sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); all sections headed `0.3.0 — …` shipped in tag `v0.3.0` (2026-09-23). Each keeps the date it landed on `main`.
 
+## Unreleased
+
+### CI / release
+
+* **Prebuilt Linux release binaries.** New `.github/workflows/release.yml`
+  (on a `v*` tag push, or `workflow_dispatch` with an existing `tag` to release
+  retroactively) builds `sz_rabbit_combined_consumer`,
+  `sz_sqs_combined_consumer` and `sz_activemq_combined_consumer` for linux
+  x86_64 (`ubuntu-24.04`) and aarch64 (native `ubuntu-24.04-arm`) inside
+  `senzing/senzingsdk-runtime:4.3.3`, and attaches
+  `sz_queue_combined_consumer-<tag>-linux-<arch>.tar.gz` (three bins + README,
+  LICENSE, CHANGELOG) plus `SHA256SUMS` to the GitHub Release, whose notes come
+  from this file's section(s) for that version. Re-running for an existing
+  release overwrites its assets. The binaries link only `libSz.so` + glibc +
+  `libgcc_s` (enforced by a `readelf` check; TLS is rustls); `libSz` is a glibc
+  shared library, so a static/musl build is not possible. See README
+  "Download / release binaries".
+
 ## 0.4.1 — process exit can no longer hang; nohup honored (2026-10-09)
 
 ### Fixed
