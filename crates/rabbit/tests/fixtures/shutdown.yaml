@@ -5,6 +5,11 @@
 # Lines the driver prints that the tests assert on.
 markers:
   final_total: "Processed total of "
+  sighup: "SIGHUP received, shutting down gracefully"
+  # Startup line when SIGHUP was inherited as ignored (nohup).
+  sighup_ignored: "SIGHUP is ignored (inherited"
+  # File mode's (ctrlc) graceful-shutdown line.
+  file_shutdown: "Graceful shutdown requested"
   # The in-worker record named as released for redelivery at shutdown.
   released_in_worker: "): TEST : E2E_DEADLINE_0"
   released_prefix: "Still processing ("
@@ -21,6 +26,23 @@ sighup:
     - '{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_SIGHUP_0","NAME_FULL":"Sighup Tester 0","ADDR_FULL":"0 Hangup St"}'
     - '{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_SIGHUP_1","NAME_FULL":"Sighup Tester 1","ADDR_FULL":"1 Hangup St"}'
     - '{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_SIGHUP_2","NAME_FULL":"Sighup Tester 2","ADDR_FULL":"2 Hangup St"}'
+
+# Under nohup (SIGHUP inherited as ignored) SIGHUP must NOT stop the driver
+# (issue #33), in queue mode and in file mode: records published/written after
+# the SIGHUP still load, then SIGTERM (queue) or EOF (file) ends it with exit 0.
+# Reuses the sighup case's record ids (re-adding is an update, not a new row).
+sighup_ignored:
+  queue: sz-combined-sighup-ignored-queue
+  # Seconds to let delivered/written records finish before signalling.
+  settle_secs: 3
+  # Seconds the driver must stay up after SIGHUP.
+  survive_secs: 5
+  # Seconds allowed for the driver to exit after SIGTERM / EOF.
+  exit_within_secs: 30
+  before:
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_SIGHUP_0","NAME_FULL":"Sighup Tester 0","ADDR_FULL":"0 Hangup St"}'
+  after:
+    - '{"DATA_SOURCE":"TEST","RECORD_ID":"E2E_SIGHUP_1","NAME_FULL":"Sighup Tester 1","ADDR_FULL":"1 Hangup St"}'
 
 # One record blocks a worker (example transform plugin SLEEP_MS) far longer
 # than the 10 s shutdown grace; SIGTERM must still end the process promptly

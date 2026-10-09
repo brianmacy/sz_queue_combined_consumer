@@ -8,9 +8,9 @@
 
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use sz_rust_sdk::prelude::*;
@@ -41,11 +41,42 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
 /// Installs the tracing subscriber (SENZING_LOG_LEVEL default, RUST_LOG override)
 /// and anchors the process start time for throughput lines. Call once at startup.
 pub fn init_logging() {
+    // First thing, before ANY handler exists: capture the inherited SIGHUP
+    // disposition (issue #33).
+    let sighup_ignored = sighup_inherited_ignored();
     let log_level = std::env::var("SENZING_LOG_LEVEL").unwrap_or_else(|_| "info".to_string());
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(map_log_level(&log_level)));
     fmt().with_env_filter(env_filter).with_target(false).init();
     let _ = stats::start_time();
+    if sighup_ignored {
+        tracing::info!(
+            "SIGHUP is ignored (inherited, e.g. from nohup); leaving it ignored — it will \
+             not stop this process"
+        );
+    }
+}
+
+/// SIGHUP's disposition at process start: `true` when it was `SIG_IGN` (as
+/// `nohup` sets). Cached on first read, which MUST precede every handler install
+/// (`init_logging` reads it first thing): afterwards the live disposition is our
+/// own handler, not the inherited one.
+static SIGHUP_IGNORED_AT_START: OnceLock<bool> = OnceLock::new();
+
+/// Whether SIGHUP was inherited as ignored. When it was, no mode treats SIGHUP
+/// as a shutdown signal; it stays ignored (issue #33). SIGINT/SIGTERM unaffected.
+pub fn sighup_inherited_ignored() -> bool {
+    *SIGHUP_IGNORED_AT_START.get_or_init(read_sighup_ignored)
+}
+
+/// Reads (does not change) the current SIGHUP disposition.
+fn read_sighup_ignored() -> bool {
+    // SAFETY: `sigaction` is plain-old-data; all-zero is a valid value.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a null `act` makes sigaction(2) only report the current
+    // disposition into `old`, which is a valid, writable struct.
+    let rc = unsafe { libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut old) };
+    rc == 0 && old.sa_sigaction == libc::SIG_IGN
 }
 
 /// Maps the Python-style SENZING_LOG_LEVEL names onto tracing levels.
@@ -77,13 +108,29 @@ pub fn init_environment(
 }
 
 /// Installs the graceful-shutdown signal handler (SIGINT/SIGTERM/SIGHUP via the
-/// ctrlc `termination` feature) that flips `RUNNING` to false.
+/// ctrlc `termination` feature) that flips `RUNNING` to false. An inherited
+/// ignored SIGHUP is put back to `SIG_IGN` (ctrlc has no per-signal opt-out, and
+/// dropping `termination` would lose SIGTERM).
 pub fn install_shutdown_handler() {
     if let Err(e) = ctrlc::set_handler(|| {
         tracing::warn!("Graceful shutdown requested");
         RUNNING.store(false, Ordering::Relaxed);
     }) {
         tracing::warn!("Could not install signal handler: {e}");
+    }
+    if sighup_inherited_ignored() {
+        restore_sighup_ignored();
+    }
+}
+
+/// Sets SIGHUP back to `SIG_IGN` after ctrlc replaced it.
+fn restore_sighup_ignored() {
+    // SAFETY: installs the SIG_IGN disposition; no Rust code becomes a handler.
+    if unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) } == libc::SIG_ERR {
+        tracing::warn!(
+            "could not restore ignored SIGHUP: {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 

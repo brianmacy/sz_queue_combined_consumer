@@ -387,6 +387,28 @@ fn sighup(pid: u32) {
     send_signal(pid, libc::SIGHUP, "SIGHUP");
 }
 
+/// Sets SIGHUP to `disposition` in the child between fork and exec; `SIG_IGN`
+/// and `SIG_DFL` survive exec (this is exactly what `nohup` does).
+fn set_child_sighup(cmd: &mut Command, disposition: libc::sighandler_t) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure only calls signal(2), which is async-signal-safe and
+    // so allowed between fork and exec.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::signal(libc::SIGHUP, disposition) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Sleeps `secs`, then reports whether `child` is still running.
+fn still_running_after(child: &mut std::process::Child, secs: u64) -> bool {
+    std::thread::sleep(Duration::from_secs(secs));
+    matches!(child.try_wait(), Ok(None))
+}
+
 fn send_signal(pid: u32, sig: libc::c_int, name: &str) {
     // SAFETY: kill(2) with a valid pid and signal number; no memory involved.
     let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
@@ -953,6 +975,18 @@ fn spawn_driver(
     queue: Option<&str>,
     tag: &str,
 ) -> (std::process::Child, std::path::PathBuf) {
+    spawn_driver_sighup(redo_percent, threads, queue, tag, None)
+}
+
+/// [`spawn_driver`] with the child's starting SIGHUP disposition set to `sighup`
+/// (`SIG_IGN` as `nohup` sets it; `SIG_DFL` so the test runner's cannot leak in).
+fn spawn_driver_sighup(
+    redo_percent: u8,
+    threads: usize,
+    queue: Option<&str>,
+    tag: &str,
+    sighup: Option<libc::sighandler_t>,
+) -> (std::process::Child, std::path::PathBuf) {
     let out_path = std::env::temp_dir().join(format!("sz_ts_{tag}_{}.out", std::process::id()));
     let out_file = std::fs::File::create(&out_path).expect("create child stdout file");
     let mut cmd = Command::new(driver_bin());
@@ -968,6 +1002,9 @@ fn spawn_driver(
         None => {
             cmd.env_remove("SENZING_RABBITMQ_QUEUE");
         }
+    }
+    if let Some(disposition) = sighup {
+        set_child_sighup(&mut cmd, disposition);
     }
     let child = cmd
         .spawn()
@@ -1334,12 +1371,16 @@ fn e2e_file_mode_shares_redo_and_exits_when_drained() {
 struct ShutdownFixture {
     markers: Markers,
     sighup: SighupCase,
+    sighup_ignored: SighupIgnoredCase,
     deadline: DeadlineCase,
 }
 
 #[derive(serde::Deserialize)]
 struct Markers {
     final_total: String,
+    sighup: String,
+    sighup_ignored: String,
+    file_shutdown: String,
     released_in_worker: String,
     released_prefix: String,
     no_rejects: String,
@@ -1351,6 +1392,16 @@ struct SighupCase {
     queue: String,
     exit_within_secs: u64,
     records: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SighupIgnoredCase {
+    queue: String,
+    settle_secs: u64,
+    survive_secs: u64,
+    exit_within_secs: u64,
+    before: Vec<String>,
+    after: Vec<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1424,7 +1475,8 @@ fn e2e_rabbit_sighup_is_graceful() {
     rt().block_on(publish_records(&url, &case.queue, &case.records))
         .expect("publish SIGHUP records");
 
-    let (mut child, out_path) = spawn_driver(0, 2, Some(&case.queue), "sighup");
+    let (mut child, out_path) =
+        spawn_driver_sighup(0, 2, Some(&case.queue), "sighup", Some(libc::SIG_DFL));
     let drained = wait_queue_empty(&url, &case.queue, Duration::from_secs(120));
     // Let in-flight deliveries finish + ack before signalling.
     std::thread::sleep(Duration::from_secs(3));
@@ -1439,12 +1491,142 @@ fn e2e_rabbit_sighup_is_graceful() {
         "driver exited non-zero after SIGHUP: {status:?}\n{stdout}"
     );
     assert!(
-        stdout.contains("SIGHUP received, shutting down gracefully"),
+        stdout.contains(&fx.markers.sighup),
         "SIGHUP not handled gracefully\n{stdout}"
     );
     let adds = final_total(&stdout, &fx.markers.final_total);
     assert_eq!(adds, case.records.len(), "all records loaded\n{stdout}");
     eprintln!("e2e_rabbit_sighup_is_graceful: {adds} loaded, exit 0 on SIGHUP");
+}
+
+/// Under `nohup` (SIGHUP inherited as ignored) SIGHUP must not stop the driver
+/// (issue #33): it stays up and keeps consuming; SIGTERM then exits 0 with every
+/// record loaded.
+#[test]
+fn e2e_rabbit_sighup_ignored_under_nohup_keeps_running() {
+    let (Some(_engine), Some(url)) = (engine_config(), amqp_url()) else {
+        skip(format_args!(
+            "SKIP e2e_rabbit_sighup_ignored_under_nohup_keeps_running: engine config and/or \
+             SENZING_AMQP_URL not set"
+        ));
+        return;
+    };
+    let fx = shutdown_fixture();
+    let case = &fx.sighup_ignored;
+    rt().block_on(publish_records(&url, &case.queue, &case.before))
+        .expect("publish records before SIGHUP");
+
+    let (mut child, out_path) = spawn_driver_sighup(
+        0,
+        2,
+        Some(&case.queue),
+        "sighup_ignored",
+        Some(libc::SIG_IGN),
+    );
+    let drained_before = wait_queue_empty(&url, &case.queue, Duration::from_secs(120));
+    std::thread::sleep(Duration::from_secs(case.settle_secs));
+    sighup(child.id());
+    let survived = still_running_after(&mut child, case.survive_secs);
+    // Only a surviving driver can consume the second batch.
+    let drained_after = survived && {
+        rt().block_on(publish_records(&url, &case.queue, &case.after))
+            .expect("publish records after SIGHUP");
+        wait_queue_empty(&url, &case.queue, Duration::from_secs(120))
+    };
+    std::thread::sleep(Duration::from_secs(case.settle_secs));
+    if survived {
+        sigterm(child.id());
+    }
+    let status = wait_bounded(&mut child, Duration::from_secs(case.exit_within_secs));
+    let stdout = read_and_remove(&out_path);
+
+    assert!(drained_before, "queue did not drain\n{stdout}");
+    assert!(survived, "ignored SIGHUP stopped the driver\n{stdout}");
+    assert!(
+        drained_after,
+        "driver stopped consuming after SIGHUP\n{stdout}"
+    );
+    let status = status.expect("driver did not exit within bound after SIGTERM");
+    assert!(status.success(), "exit {status:?} after SIGTERM\n{stdout}");
+    assert!(stdout.contains(&fx.markers.sighup_ignored), "{stdout}");
+    assert!(!stdout.contains(&fx.markers.sighup), "{stdout}");
+    let adds = final_total(&stdout, &fx.markers.final_total);
+    assert_eq!(adds, case.before.len() + case.after.len(), "{stdout}");
+    eprintln!("e2e_rabbit_sighup_ignored_under_nohup_keeps_running: {adds} loaded across SIGHUP");
+}
+
+/// File mode under `nohup`: the ctrlc handler must leave an inherited-ignored
+/// SIGHUP ignored (issue #33). The input is a FIFO so the driver is mid-load,
+/// blocked on input, when SIGHUP arrives; it must then load the rest and exit 0
+/// at EOF with no shutdown requested.
+#[test]
+fn e2e_file_mode_sighup_ignored_under_nohup_keeps_loading() {
+    let Some(_engine) = engine_config() else {
+        skip(format_args!(
+            "SKIP e2e_file_mode_sighup_ignored_under_nohup_keeps_loading: engine config not set"
+        ));
+        return;
+    };
+    let fx = shutdown_fixture();
+    let case = &fx.sighup_ignored;
+    let pid = std::process::id();
+    let fifo = std::env::temp_dir().join(format!("sz_e2e_hup_{pid}.fifo"));
+    let _ = std::fs::remove_file(&fifo);
+    let c_path = std::ffi::CString::new(fifo.to_str().expect("utf-8 path")).expect("no NUL");
+    // SAFETY: mkfifo(3) with a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+    // O_RDWR never blocks on a FIFO, and holding a writer lets the driver's
+    // read-only open succeed; dropping it is the driver's EOF.
+    let mut writer = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .expect("open FIFO");
+
+    let out_path = std::env::temp_dir().join(format!("sz_e2e_hup_{pid}.out"));
+    let mut cmd = Command::new(driver_bin());
+    cmd.env("SENZING_THREADS_PER_PROCESS", "2")
+        .env("SENZING_REDO_PERCENT", "0")
+        .env("SENZING_INPUT_FILE", fifo.to_str().expect("utf-8 path"))
+        .env_remove("SENZING_RABBITMQ_QUEUE")
+        .env_remove("SENZING_AMQP_URL")
+        .stdout(Stdio::from(
+            std::fs::File::create(&out_path).expect("create child stdout file"),
+        ))
+        .stderr(Stdio::null());
+    set_child_sighup(&mut cmd, libc::SIG_IGN);
+    let mut child = cmd.spawn().expect("spawn file-mode driver");
+
+    write_lines(&mut writer, &case.before);
+    std::thread::sleep(Duration::from_secs(case.settle_secs));
+    sighup(child.id());
+    let survived = still_running_after(&mut child, case.survive_secs);
+    write_lines(&mut writer, &case.after);
+    drop(writer);
+    let status = wait_bounded(&mut child, Duration::from_secs(case.exit_within_secs));
+    let stdout = read_and_remove(&out_path);
+    let _ = std::fs::remove_file(&fifo);
+
+    assert!(survived, "ignored SIGHUP stopped the driver\n{stdout}");
+    let status = status.expect("file-mode driver did not exit at EOF");
+    assert!(status.success(), "exit {status:?}\n{stdout}");
+    assert!(
+        !stdout.contains(&fx.markers.file_shutdown),
+        "ignored SIGHUP requested a shutdown\n{stdout}"
+    );
+    let adds = final_total(&stdout, &fx.markers.final_total);
+    assert_eq!(adds, case.before.len() + case.after.len(), "{stdout}");
+    assert!(stdout.contains(&fx.markers.sighup_ignored), "{stdout}");
+    eprintln!("e2e_file_mode_sighup_ignored_under_nohup_keeps_loading: {adds} loaded");
+}
+
+/// Writes `lines` (newline-terminated) to the FIFO.
+fn write_lines(writer: &mut std::fs::File, lines: &[String]) {
+    use std::io::Write;
+    for line in lines {
+        writeln!(writer, "{line}").expect("write FIFO");
+    }
+    writer.flush().expect("flush FIFO");
 }
 
 /// Deletes then re-creates `queue` dead-lettering (default exchange) into
