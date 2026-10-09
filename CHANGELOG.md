@@ -9,13 +9,23 @@ All sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); 
 * **The forced-exit paths now terminate with `libc::_exit(2)` instead of
   `std::process::exit`** (`leak_and_exit`, and `teardown_and_exit` when
   `Sz_destroy()` overruns its grace or its thread cannot spawn; stdout/stderr
-  are flushed first). `exit(3)` runs atexit handlers / static destructors, which
-  can block on a lock held by a Senzing/ODBC thread stuck mid-engine-call — the
-  very condition these paths exist to escape. In production (2026-07-27, DB
-  restart) 17 of 20 consumers logged `forcing process exit` and never exited,
-  so `RestartPolicy=on-failure` never fired and the fleet silently ran at 57%
+  are flushed first). **Root cause (reproduced on Linux, Senzing 4.3.3):**
+  `exit(3)` runs libSz's thread-local destructor, which makes its own database
+  call (`PQexec` → `poll`); libpq has no timeout, so when the database
+  connection is unresponsive at exit the destructor never returns and `exit(3)`
+  hangs — in the very condition these paths exist to escape. No lock held by a
+  wedged worker is involved. It is intermittent because a connection that gets
+  an RST/FIN fails fast. In production (2026-07-27, DB restart) 17 of 20
+  consumers logged `forcing process exit` and never exited, so
+  `RestartPolicy=on-failure` never fired and the fleet silently ran at 57%
   capacity for 80 minutes. A clean, completed teardown still uses
   `std::process::exit`.
+* **Operating notes.** A hung consumer looks healthy to Docker (`Up`, flat
+  `RestartCount`); alert on the broker-side consumer count. Keep the Docker stop
+  timeout above the 10 s worker-join grace. Client-side TCP keepalive /
+  `tcp_user_timeout` for the database connection may bound how long an
+  unresponsive connection blocks the engine (not verified that Senzing's
+  connection string passes them through).
 
 ## 0.4.0 — core Transport loop alignment + ActiveMQ Artemis consumer (2026-10-06)
 

@@ -31,6 +31,13 @@ use crate::{file_loader, pure_redoer};
 /// under the sibling drivers' 10s worker-join grace and the 30s e2e test grace.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a NORMAL exit (`std::process::exit`, run after a completed
+/// `Sz_destroy()`) may take before a watchdog forces `_exit`. A clean exit finishes in
+/// milliseconds; this only bounds exit-time destructors that block (libSz's
+/// thread-local destructor makes a database call with no timeout). Keep small: it adds
+/// to the worker-join and teardown graces on the shutdown path.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+
 /// Installs the tracing subscriber (SENZING_LOG_LEVEL default, RUST_LOG override)
 /// and anchors the process start time for throughput lines. Call once at startup.
 pub fn init_logging() {
@@ -118,8 +125,9 @@ pub fn teardown_and_exit(code: u8) -> ! {
         Ok(_) => match done_rx.recv_timeout(TEARDOWN_GRACE) {
             Ok(()) => {
                 tracing::info!("Senzing environment destroyed; exiting cleanly");
-                // Nothing is wedged by definition on this branch, so a normal exit
-                // (atexit handlers, static destructors) is safe and preferred.
+                // Sz_destroy() completed and no worker is inside an engine call on
+                // this branch, so a normal exit (atexit handlers, thread-local and
+                // static destructors) is safe and preferred.
                 flush_and_exit(code)
             }
             Err(_) => {
@@ -146,20 +154,39 @@ pub fn leak_and_exit(code: u8) -> ! {
 }
 
 /// Normal exit: flush stdout, then `std::process::exit` (runs libc atexit handlers
-/// and static destructors). Only for paths where no native thread can be stuck.
+/// and destructors) — bounded by a watchdog. Wait for a clean exit for
+/// [`EXIT_GRACE`], then force `_exit` with the same code. Only for paths where
+/// no native thread is stuck in the engine.
 fn flush_and_exit(code: u8) -> ! {
     // Flush stdout so the final "Processed total ..." line the e2e tests scrape is
     // never lost to process::exit skipping Rust's buffered-writer drop.
     let _ = std::io::stdout().flush();
+    // If spawning fails we fall through to the plain exit: the watchdog is a
+    // safety net, not a precondition.
+    let _ = std::thread::Builder::new()
+        .name("sz-exit-watchdog".to_string())
+        .spawn(move || {
+            std::thread::sleep(EXIT_GRACE);
+            tracing::warn!(
+                "normal process exit did not finish within {EXIT_GRACE:?}; forcing _exit"
+            );
+            flush_and_force_exit(code)
+        });
     std::process::exit(code as i32);
 }
 
-/// Exit that CANNOT be blocked by a wedged native thread.
+/// Exit that CANNOT be blocked by native-library teardown code.
 ///
 /// ⚠ `std::process::exit` calls libc `exit(3)`, which runs atexit handlers and
-/// static destructors. When a Senzing/ODBC thread is stuck mid-engine-call, one of
-/// those handlers can block on a lock that thread holds — so `exit(3)` itself hangs,
-/// in exactly the situation the caller invoked a "forced exit" to escape.
+/// thread-local / static destructors. Reproduced on Linux (Senzing 4.3.3, glibc
+/// 2.41, workers wedged by a paused database): `exit` → `__call_tls_dtors` →
+/// libSz's thread-local destructor on the exiting thread → its own database call
+/// (`PQexec` → `PQgetResult` → `poll`). libpq has no timeout, so when the database
+/// connection is unresponsive the destructor never returns, and `exit(3)` hangs in
+/// exactly the situation these forced-exit paths exist to escape. No lock held by a
+/// wedged worker is involved. Exiting with workers still inside the engine is also
+/// a use-after-free path (the destructor ran SQL with corrupted text after the
+/// database came back).
 ///
 /// Observed in production 2026-07-27: 17 of 20 consumers on one host logged
 /// "skipping Senzing environment destroy … forcing process exit" during a database
@@ -168,11 +195,16 @@ fn flush_and_exit(code: u8) -> ! {
 /// stayed flat, their logs went silent, and the last-emitted stats blob kept
 /// reporting a healthy `adds_rate`. The fleet ran at 57% capacity for 80 minutes and
 /// every container-level health check reported it healthy — the only observable was
-/// the host's AMQP consumer count (3 instead of 20).
+/// the host's AMQP consumer count (3 instead of 20). It is intermittent because a
+/// database connection that receives an RST/FIN fails fast and `exit` completes; it
+/// hangs only when the connection is unresponsive at exit. (Why production's
+/// connections stayed unresponsive for 80 minutes is not established.)
 ///
-/// `_exit(2)` terminates immediately without running atexit handlers or flushing
-/// libc buffers, so it cannot be blocked. We flush our own stdout/stderr first
-/// (stdout carries the final "Processed total ..." line the e2e tests scrape).
+/// `_exit(2)` terminates immediately without running atexit handlers or
+/// destructors, so it cannot be blocked by them. We flush our own stdout/stderr
+/// first (stdout carries the final "Processed total ..." line the e2e tests
+/// scrape); those flushes cannot block here because the WARN line preceding a
+/// forced exit has already been written through the same writers.
 fn flush_and_force_exit(code: u8) -> ! {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -232,21 +264,29 @@ mod tests {
     /// Far longer than a real `_exit` takes; a hang is "never", not "slow".
     const DEADLINE: Duration = Duration::from_secs(20);
 
-    /// Stands in for a libc atexit handler / static destructor blocked on a lock
-    /// held by a wedged Senzing/ODBC thread: it never returns.
+    /// Stands in for exit-time native teardown that never returns (in production:
+    /// libSz's thread-local destructor waiting forever on an unresponsive database
+    /// connection): an atexit handler that never returns.
     extern "C" fn wedged_atexit_handler() {
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
     }
 
+    /// `CHILD_ENV` values selecting which exit helper the child takes.
+    const ROLE_FORCED: &str = "forced";
+    const ROLE_NORMAL: &str = "normal";
+
     /// Child role: register the never-returning atexit handler, leave the marker
-    /// unflushed, then take the forced-exit path.
-    fn run_child() -> ! {
+    /// unflushed, then take the exit path selected by `role`.
+    fn run_child(role: &str) -> ! {
         // SAFETY: registers a plain `extern "C" fn()` with libc; no captured state.
         assert_eq!(unsafe { libc::atexit(wedged_atexit_handler) }, 0);
         print!("{MARKER}");
-        super::leak_and_exit(EXIT_CODE)
+        match role {
+            ROLE_NORMAL => super::flush_and_exit(EXIT_CODE),
+            _ => super::leak_and_exit(EXIT_CODE),
+        }
     }
 
     /// Waits up to `DEADLINE` for the child; kills it and returns `None` on a hang.
@@ -263,22 +303,12 @@ mod tests {
         None
     }
 
-    /// The forced-exit path must terminate even when an atexit handler would block
-    /// forever (`std::process::exit` runs it and hangs; `_exit(2)` skips it), with
-    /// the caller's exit code and stdout flushed.
-    #[test]
-    fn leak_and_exit_is_not_blocked_by_a_wedged_atexit_handler() {
-        if std::env::var_os(CHILD_ENV).is_some() {
-            run_child();
-        }
+    /// Re-runs this test binary as a child on `test_name` with `role`, and asserts it
+    /// exits with `EXIT_CODE` and the unflushed marker on stdout within `DEADLINE`.
+    fn assert_child_exits_despite_wedged_atexit(test_name: &str, role: &str) {
         let mut child = Command::new(std::env::current_exe().expect("current_exe"))
-            .args([
-                "--exact",
-                "runtime::tests::leak_and_exit_is_not_blocked_by_a_wedged_atexit_handler",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD_ENV, "1")
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD_ENV, role)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -292,7 +322,7 @@ mod tests {
             .read_to_string(&mut stdout)
             .expect("read child stdout");
         let status = status.unwrap_or_else(|| {
-            panic!("forced exit hung >{DEADLINE:?} on a wedged atexit handler; stdout: {stdout}")
+            panic!("exit hung >{DEADLINE:?} on a wedged atexit handler; stdout: {stdout}")
         });
         assert_eq!(
             status.code(),
@@ -302,6 +332,33 @@ mod tests {
         assert!(
             stdout.contains(MARKER),
             "stdout not flushed before exit: {stdout}"
+        );
+    }
+
+    /// The forced-exit path must terminate even when an atexit handler would block
+    /// forever (`std::process::exit` runs it and hangs; `_exit(2)` skips it), with
+    /// the caller's exit code and stdout flushed.
+    #[test]
+    fn leak_and_exit_is_not_blocked_by_a_wedged_atexit_handler() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            run_child(ROLE_FORCED);
+        }
+        assert_child_exits_despite_wedged_atexit(
+            "runtime::tests::leak_and_exit_is_not_blocked_by_a_wedged_atexit_handler",
+            ROLE_FORCED,
+        );
+    }
+
+    /// The NORMAL exit path (after a completed teardown) waits for a clean exit, then
+    /// the watchdog forces `_exit` if an exit-time destructor blocks.
+    #[test]
+    fn normal_exit_is_bounded_by_the_watchdog() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            run_child(ROLE_NORMAL);
+        }
+        assert_child_exits_despite_wedged_atexit(
+            "runtime::tests::normal_exit_is_bounded_by_the_watchdog",
+            ROLE_NORMAL,
         );
     }
 }
