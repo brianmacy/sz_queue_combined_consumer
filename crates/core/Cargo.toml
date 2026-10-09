@@ -2,6 +2,7 @@
 name = "sz-combined-consumer-core"
 description = "Broker-agnostic Senzing load + redo engine-processing core (worker pool, redo mixing, stats, live config reload, file loader) shared by the RabbitMQ and SQS driver binaries"
 version.workspace = true
+publish = false  # not published to crates.io
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true

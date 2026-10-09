@@ -2,6 +2,7 @@
 name = "sz_activemq_combined_consumer"
 description = "Senzing combined load + redo driver, Apache ActiveMQ Artemis backend (AMQP 1.0 anycast queues; one redo% knob). Shares the engine-processing core with the RabbitMQ and SQS drivers."
 version.workspace = true
+publish = false  # not published to crates.io
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true

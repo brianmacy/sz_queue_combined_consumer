@@ -2,6 +2,7 @@
 name = "sz_rabbit_combined_consumer"
 description = "Senzing combined load + redo driver, RabbitMQ backend (one redo% knob; subsumes sz_rabbit_consumer and sz_simple_redoer)"
 version.workspace = true
+publish = false  # not published to crates.io
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
