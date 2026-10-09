@@ -17,7 +17,8 @@
 # binary name in the final COPY, and the ENTRYPOINT differ.
 
 ARG SENZING_RUNTIME_IMAGE=senzing/senzingsdk-runtime:4.3.3
-ARG RUST_IMAGE=rust:1.94.1
+# Official images via the ECR Public mirror (same digests as Docker Hub, no pull rate limit).
+ARG RUST_IMAGE=public.ecr.aws/docker/library/rust:1.94.1
 
 # Global build args (declared before the first FROM so the backend-libs stage
 # and every per-stage ARG below inherit the same defaults). Must be 1 or 0.
@@ -166,7 +167,7 @@ RUN set -eu; \
 # libs here; the Microsoft driver (msodbcsql18) + krb5/etc closure still come from
 # the backend-libs stage. glibc is forward-compatible (bookworm 2.36 libs run on
 # the cc-debian13 / glibc 2.41 runtime).
-FROM debian:12-slim AS odbcdm
+FROM public.ecr.aws/docker/library/debian:12-slim AS odbcdm
 RUN apt-get update && apt-get install -y --no-install-recommends unixodbc && \
     mkdir -p /dm && \
     cp -L /usr/lib/x86_64-linux-gnu/libodbc.so.2     /dm/ && \
