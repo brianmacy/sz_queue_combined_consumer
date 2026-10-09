@@ -2985,7 +2985,7 @@ dependencies = [
 
 [[package]]
 name = "sz-combined-consumer-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3003,11 +3003,11 @@ dependencies = [
 
 [[package]]
 name = "sz-record-transform"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "sz-record-transform-example"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde_json",
  "sz-record-transform",
@@ -3038,7 +3038,7 @@ dependencies = [
 
 [[package]]
 name = "sz_activemq_combined_consumer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3053,13 +3053,14 @@ dependencies = [
  "sz-record-transform-example",
  "sz-rust-sdk",
  "tokio",
+ "tokio-util",
  "tracing",
  "url",
 ]
 
 [[package]]
 name = "sz_rabbit_combined_consumer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3078,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "sz_sqs_combined_consumer"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "aws-config",

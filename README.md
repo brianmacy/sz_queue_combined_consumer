@@ -330,7 +330,9 @@ sz_rabbit_combined_consumer --file records.jsonl \
   delete only redelivers that message after its visibility timeout), the
   ActiveMQ link/session/connection close is bounded at 5 s, and the RabbitMQ
   connection close is unbounded. Size the container stop timeout for grace +
-  close (+ the 5 s native-teardown bound).
+  close + the 5 s native-teardown bound + the 2 s exit watchdog: use **30 s**
+  (`docker run --stop-timeout 30`, compose `stop_grace_period: 30s`). Docker's
+  default 10 s SIGKILLs exactly when the worker-join grace ends.
 * **A signal can wait on a busy pool when `--prefetch` > 2 × threads.** The
   loop hands each delivery to a worker channel of `threads` slots; with every
   worker busy and that channel full, the hand-off waits for a worker to finish
