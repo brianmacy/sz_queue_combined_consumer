@@ -1,0 +1,36 @@
+[package]
+name = "sz_activemq_publisher"
+description = "Bulk JSONL publisher for Apache ActiveMQ Artemis (AMQP 1.0): streams plain/gzip/bzip2 record files (or Spark part-* directories) onto the ANYCAST queue sz_activemq_combined_consumer reads, with bounded in-flight, broker-settlement tracking and reconnect on link loss. No Senzing dependency."
+version.workspace = true
+publish = false  # not published to crates.io
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sz_activemq_publisher"
+path = "src/main.rs"
+
+[dependencies]
+sz-activemq-amqp.workspace = true
+fe2o3-amqp.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+flate2.workspace = true
+bzip2.workspace = true
+
+[dev-dependencies]
+# tests/publisher_e2e.rs drives a real Artemis broker: the crate's own AMQP
+# client drains the queue (decoding with the consumer's body_bytes), Jolokia
+# (curl) sets address settings and reads counts, and an in-test TCP proxy
+# (tokio net + io-util) simulates a broker link loss.
+tokio = { workspace = true, features = ["net", "io-util"] }
+# YAML test fixtures (tests/fixtures/): data in YAML, not hardcoded.
+serde = { version = "1", features = ["derive"] }
+serde_norway = "0.9"
+serde_json.workspace = true
+url.workspace = true

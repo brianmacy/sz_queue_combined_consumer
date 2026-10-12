@@ -1,0 +1,115 @@
+# Test data for tests/publisher_e2e.rs (no Senzing engine needed: the
+# publisher is verified by draining the queue over AMQP with the consumer's
+# own body decoder). Queue names get the test pid appended. Record template:
+# "{tag}" = a per-test prefix, "{i}" = 0..count-1.
+record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","NAME_FULL":"Publisher Tester {i}"}'
+
+# A Spark-style output directory: one plain, one gzip and one bzip2 part file
+# (plus a .crc and _SUCCESS that must be ignored), a blank line every
+# `blank_every` records. Published with --parallel 2.
+directory:
+  queue: sz-amq-pub-dir
+  records_per_part: 250
+  blank_every: 40
+  parallel: 2
+  exit_within_secs: 120
+  drained_within_secs: 60
+
+# An address with addressFullMessagePolicy=BLOCK and a tiny maxSizeBytes:
+# Artemis withholds producer credit once the address is full (after its
+# first credit grant of ~1000), so the publisher must block, log, and finish
+# only once the queue is drained — with zero duplicates and no reconnect.
+blocked:
+  queue: sz-amq-pub-blocked
+  count: 2500
+  max_size_bytes: 20000
+  page_size_bytes: 10000
+  blocked_log_interval_secs: 1
+  blocked_marker: "blocked on broker credit"
+  # How long the publisher must stay blocked (alive, queue below `count`)
+  # before the test starts draining.
+  hold_blocked_secs: 4
+  blocked_within_secs: 60
+  exit_within_secs: 120
+
+# Link loss mid-run via a TCP proxy: the publisher reconnects and every
+# record still reaches the queue (at-least-once: duplicates allowed, gaps not).
+link_loss:
+  queue: sz-amq-pub-linkloss
+  count: 2500
+  max_size_bytes: 20000
+  page_size_bytes: 10000
+  blocked_marker: "blocked on broker credit"
+  reconnect_marker: "broker link lost"
+  blocked_within_secs: 60
+  exit_within_secs: 120
+
+# The broker connection goes silent mid-run (a proxy blackholes it, both
+# sockets open). The publisher must detect it via the connection idle timeout
+# (sz_activemq_amqp::IDLE_TIMEOUT, 60 s), reconnect, resend and finish:
+# at-least-once, never a hang. max_pending well below Artemis' credit low-mark
+# (300 of 1000) so the freeze always catches the publisher waiting on
+# settlements, never on credit (a credit wait was already detected).
+frozen:
+  queue: sz-amq-pub-frozen
+  count: 50000
+  max_pending: 50
+  started_marker: "publishing "
+  freeze_after_ms: 300
+  reconnect_marker: "broker link lost"
+  # IDLE_TIMEOUT (60 s) + slack.
+  reconnect_within_secs: 100
+  exit_within_secs: 120
+
+# Large records interleaved with small ones, up to the shape of real-world
+# data (largest record 150.1 MB). The broker must run with its AMQP acceptor
+# maxFrameSize=268435456 (see CI / README) so every record is ONE transfer
+# frame: fe2o3-amqp 0.18.2 misnumbers multi-frame transfers ("Expected
+# delivery-id N, got N+k" from Artemis). Record i carries a PAD of
+# pad_bytes[i % len] bytes. Every record must arrive exactly once with ZERO
+# reconnects, and the drain exercises the consumer-side receiver on deliveries
+# that Artemis splits into many frames toward the client.
+large:
+  queue: sz-amq-pub-large
+  record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","PAD":"{pad}"}'
+  count: 8
+  pad_bytes: [1000, 300000, 1000, 50000000, 1000, 150000000, 1000, 2500000]
+  max_pending: 500
+  exit_within_secs: 300
+  # Artemis streams a 150 MB message to the receiver in frames of the
+  # receiver's 256 KiB max: allow that long between deliveries.
+  drain_idle_secs: 60
+  drained_within_secs: 300
+
+# One record one byte too large for a single frame of the broker's
+# advertised max-frame-size (268435456 minus the publisher's 1024-byte
+# reserve, plus 1), among small ones: it must be FAILED unsent (logged with
+# file:line and size, exit 2) and every other record published.
+oversize:
+  queue: sz-amq-pub-oversize
+  record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","PAD":"{pad}"}'
+  small_count: 5
+  # Line (1-based) of the oversize record.
+  oversize_line: 3
+  oversize_bytes: 268434433
+  failed_marker: "needs more than one AMQP frame"
+  exit_within_secs: 120
+  drained_within_secs: 60
+
+# A listener that accepts TCP and never answers the AMQP header (a wedged
+# broker event loop). Each connect attempt is bounded by
+# CONNECT_ATTEMPT_TIMEOUT (30 s, publish.rs); the publisher must exit 1 after
+# the first timed-out attempt past --reconnect-timeout.
+silent_broker:
+  reconnect_timeout_secs: 2
+  exit_within_secs: 60
+
+# Startup failures exit 1 fast.
+failures:
+  bad_password: not-the-password
+  # Above any broker's advertised max-frame-size: the publisher must refuse.
+  impossible_min_max_frame_size: 4294967295
+  # Nothing listens here: connect retries until --reconnect-timeout.
+  unreachable_url: amqp://127.0.0.1:1
+  reconnect_timeout_secs: 2
+  exit_within_secs: 30

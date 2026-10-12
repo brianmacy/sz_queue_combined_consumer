@@ -24,6 +24,8 @@ client (compile-time backend selection — no runtime switch, no feature flags):
 | `sz_rabbit_combined_consumer` | bin | RabbitMQ | `lapin` |
 | `sz_sqs_combined_consumer` | bin | Amazon SQS (standard queues) | `aws-sdk-sqs` |
 | `sz_activemq_combined_consumer` | bin | Apache ActiveMQ Artemis (AMQP 1.0, anycast queues) | `fe2o3-amqp` (rustls) |
+| `sz_activemq_publisher` | bin | Artemis **publisher**: JSONL files -> the queue the ActiveMQ consumer reads (no Senzing) | `fe2o3-amqp` (rustls), `flate2`, `bzip2` |
+| `sz-activemq-amqp` | lib | — (Artemis URL/credentials, connection, anycast terminus, record body encode/decode; shared by the ActiveMQ consumer + publisher) | `fe2o3-amqp` |
 | `sz-record-transform` | lib | — (record-transform plugin C ABI + Rust export macro) | none |
 | `sz-record-transform-example` | cdylib | — (example plugin; used by tests) | none |
 
@@ -227,6 +229,83 @@ driver uses this one convention for all three binaries.)
 * **ActiveMQ Classic.** Classic (5.x) also implements AMQP 1.0, but only
   Artemis is tested (e2e against `apache/artemis:2.57.0`).
 
+### Loading the queue: `sz_activemq_publisher`
+
+Bulk publisher for the queue above (it links no Senzing library, so it runs on
+any host that can read the input and reach the broker). It shares the
+consumer's URL / credential / queue handling (`SENZING_ACTIVEMQ_URL`,
+`_USER`, `_PASSWORD`, `_QUEUE`, same override rules) and its wire encoding:
+each record is one AMQP `Data` section holding the line's bytes verbatim, sent
+with the `queue` target capability (ANYCAST), header `durable=true` by default.
+
+```console
+# A Spark output directory (its part-* files) plus a single file, 4 files at a time
+sz_activemq_publisher -u amqp://artemis:artemis@broker:5672 -q senzing-input \
+    -p 4 /public_data/spark_out/ /data/extra.jsonl.bz2
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `INPUT...` | required | files (plain / gzip / bzip2, detected from content) or directories (their `part-*` files, sorted; `.crc` / `_SUCCESS` ignored). Blank lines are skipped. |
+| `-u, --url` | `SENZING_ACTIVEMQ_URL` | `amqp://` only (see *Single-frame transfers*), credentials may be embedded |
+| `--user`, `--password` | `SENZING_ACTIVEMQ_USER` / `_PASSWORD` | SASL PLAIN; override URL userinfo |
+| `-q, --queue` | `SENZING_ACTIVEMQ_QUEUE` | queue or FQQN `address::queue` |
+| `-m, --max-pending` | 500 | records sent but not yet settled, per file |
+| `-p, --parallel` | 1 | files published concurrently (one connection each) |
+| `--report-interval` | 100000 | progress line every N settled records (0 = off) |
+| `--retry-delay` | 3 | seconds before retrying a non-accepted record / failed connect |
+| `--max-attempts` | 10 | `rejected`/`released` outcomes per record before it is FAILED (0 = unlimited) |
+| `--reconnect-timeout` | 300 | give up (exit 1) after the broker is unreachable this long (0 = forever) |
+| `--blocked-log-interval` | 30 | seconds between `blocked on broker credit` lines |
+| `--transient` | off | `durable=false` (lost on broker restart) |
+| `--min-max-frame-size` | 268435456 | refuse to start (exit 1) if the broker advertises a smaller AMQP max-frame-size (0 = no floor) |
+
+* **Single-frame transfers (broker setting REQUIRED).** fe2o3-amqp 0.18.2
+  numbers deliveries with the per-frame transfer-id, so a record split over
+  k frames skips k-1 delivery-ids; Artemis then closes the connection
+  (`Expected delivery-id N, got N+k-1`) and its AMQP thread can spin in
+  proton-j, starving other connections. The publisher therefore reads the
+  broker's advertised max-frame-size at connect and sends a record only if it
+  fits ONE frame; a larger record is **FAILED unsent** (`... needs more than
+  one AMQP frame ...`, exit 2). Raise the Artemis AMQP acceptor's
+  `maxFrameSize` above the largest record (Artemis default 131072; a real corpus's
+  largest record is 150.1 MB), e.g. in `broker.properties`:
+  `acceptorConfigurations.amqp.params.maxFrameSize=268435456` (or append
+  `;maxFrameSize=268435456` to the `amqp` acceptor URL in `broker.xml`, or
+  `-Dbrokerconfig.acceptorConfigurations.amqp.params.maxFrameSize=268435456`
+  in `JAVA_ARGS_APPEND`). Only `amqp://` is supported: the max-frame-size is
+  read off the plaintext Open frame.
+* **Memory-bounded.** Files are streamed (never loaded whole); per file at most
+  ~3 x `--max-pending` records are in memory (read-ahead channel, in flight,
+  retries), times `--parallel`.
+* **Settlement.** A record counts as `settled` only when Artemis returns
+  `accepted`. `rejected` / `released` / `modified` are retried after
+  `--retry-delay`; after `--max-attempts` the record is **FAILED**: logged as
+  `FAILED record <file> line <n> (...)`, counted, and the run exits **2**.
+  A message that can never be sent (over the link's max message size) fails
+  the same way immediately.
+* **Full address (BLOCK).** Under `address-full-policy=BLOCK` Artemis
+  withholds link credit; the publisher **waits indefinitely** (no send or
+  settlement timeout, so no reconnect and no republish/duplicates) and logs
+  `blocked on broker credit for Ns` every `--blocked-log-interval`. A dead
+  broker is still detected by the 60 s connection idle timeout (Artemis
+  heartbeats while merely blocking). Artemis grants producer credit in batches
+  (`amqpCredits`, default 1000), so up to that many messages can land past
+  `max-size-bytes` before the block bites. **Also BLOCK:** Artemis's
+  `max-disk-usage` (default 90% of the journal's filesystem) blocks every
+  address with `Disk Full!` in the broker log — the publisher then shows the
+  same `blocked on broker credit` line.
+* **Link loss.** A send or settlement error reconnects (retrying for up to
+  `--reconnect-timeout`) and re-sends every unsettled record:
+  **at-least-once**, so a record the broker accepted just before the loss can
+  be queued twice (counted as `resent`; `add_record` is idempotent per
+  `DATA_SOURCE` + `RECORD_ID`). Bad credentials / a bad URL fail immediately.
+* **Exit codes.** 0 every record settled; 1 fatal (arguments, unreadable or
+  corrupt input, broker unreachable, bad credentials — remaining files are
+  aborted); 2 finished with FAILED records. Each file prints
+  `file <path>: read=… settled=… rejected=… released=… resent=… reconnects=… failed=…`
+  and the run ends with `Publish summary: files=…/… …`.
+
 ## Record transform plugins
 
 `--record-transform-plugin <lib.so>` loads a shared library (any language) that
@@ -381,7 +460,7 @@ Each [GitHub Release](https://github.com/brianmacy/sz_queue_combined_consumer/re
 
 | Asset | Contents |
 |---|---|
-| `sz_queue_combined_consumer-<tag>-linux-x86_64.tar.gz` | `sz_rabbit_combined_consumer`, `sz_sqs_combined_consumer`, `sz_activemq_combined_consumer`, `README.md`, `LICENSE`, `CHANGELOG.md` |
+| `sz_queue_combined_consumer-<tag>-linux-x86_64.tar.gz` | `sz_rabbit_combined_consumer`, `sz_sqs_combined_consumer`, `sz_activemq_combined_consumer`, `sz_activemq_publisher`, `README.md`, `LICENSE`, `CHANGELOG.md` |
 | `sz_queue_combined_consumer-<tag>-linux-aarch64.tar.gz` | same, for arm64 |
 | `SHA256SUMS` | SHA-256 of both archives |
 
@@ -422,6 +501,7 @@ cargo build --release --workspace                       # everything
 cargo build --release -p sz_rabbit_combined_consumer    # RabbitMQ bin only (no AWS SDK)
 cargo build --release -p sz_sqs_combined_consumer       # SQS bin only (no lapin)
 cargo build --release -p sz_activemq_combined_consumer  # ActiveMQ Artemis bin only (no lapin, no AWS SDK)
+cargo build --release -p sz_activemq_publisher          # Artemis publisher (no Senzing, no libSz needed)
 cargo test  --workspace --lib --bins                    # unit tests (no infra)
 
 # Docker: BIN selects the backend binary; WITH_POSTGRES/WITH_MSSQL the DB closure.
@@ -429,6 +509,8 @@ docker build --build-arg BIN=sz_rabbit_combined_consumer -t brian/sz_rabbit_comb
 docker build --build-arg BIN=sz_sqs_combined_consumer    -t brian/sz_sqs_combined_consumer .
 docker build --build-arg BIN=sz_activemq_combined_consumer -t brian/sz_activemq_combined_consumer .
 docker build --build-arg BIN=sz_rabbit_combined_consumer --build-arg WITH_MSSQL=0 -t brian/sz_rabbit_combined_consumer:pg .
+# The image is a Senzing-runtime image for ONE driver bin; sz_activemq_publisher
+# is not imaged (it needs no Senzing) — ship the release binary instead.
 ```
 
 ## Run
@@ -496,10 +578,11 @@ sz_rabbit_combined_consumer --file /data/records.jsonl.rejected.jsonl \
 | unit (all crates) | `cargo test --workspace --lib --bins` | libSz only |
 | RabbitMQ e2e | `cargo test -p sz_rabbit_combined_consumer --test integration_test -- --nocapture --test-threads=1` | RabbitMQ + engine + `truth-sets` submodule |
 | SQS e2e | `cargo test -p sz_sqs_combined_consumer --test sqs_e2e -- --nocapture --test-threads=1` | ElasticMQ + engine |
-| ActiveMQ e2e | `cargo test -p sz_activemq_combined_consumer --test activemq_e2e -- --nocapture --test-threads=1` | Artemis (AMQP + Jolokia) + engine |
+| ActiveMQ publisher e2e | `cargo test -p sz_activemq_publisher --test publisher_e2e -- --nocapture --test-threads=1` | Artemis (AMQP + Jolokia); no engine |
+| ActiveMQ e2e | `cargo test -p sz_activemq_combined_consumer --test activemq_e2e -- --nocapture --test-threads=1` | Artemis (AMQP + Jolokia) + engine; run after the publisher suite (its round-trip test runs `target/debug/sz_activemq_publisher`) |
 
 `.github/workflows/ci.yml` runs fmt + clippy, the release build + unit tests,
-the three e2e suites in one `integration` job (Postgres, RabbitMQ, ElasticMQ
+the e2e suites in one `integration` job (Postgres, RabbitMQ, ElasticMQ
 and Artemis service containers) and the Docker matrix (every `BIN`; the
 postgres / mssql DB-closure variants on the RabbitMQ and SQS images).
 `--test-threads=1` is required: the engine is a process-global singleton.
@@ -519,6 +602,9 @@ docker run -d --name sz-e2e-artemis -p 5673:5672 -p 8161:8161 \
   -e ARTEMIS_USER=artemis -e ARTEMIS_PASSWORD=artemis -e ANONYMOUS_LOGIN=false \
   -e EXTRA_ARGS="--http-host 0.0.0.0 --relax-jolokia --no-autotune" \
   apache/artemis:2.57.0
+# On a host whose disk is >90% full, Artemis blocks ALL producers ("Disk
+# Full!"); for a throwaway test broker add
+#   -e JAVA_ARGS_APPEND="-Dbrokerconfig.maxDiskUsage=-1"
 
 # macOS (Homebrew Senzing); on Linux use /opt/senzing/er and LD_LIBRARY_PATH.
 export SENZING_ROOT="$(brew --prefix)/opt/senzing/er"

@@ -149,6 +149,11 @@ jobs:
           ARTEMIS_PASSWORD: artemis
           ANONYMOUS_LOGIN: "false"
           EXTRA_ARGS: --http-host 0.0.0.0 --relax-jolokia --no-autotune
+          # AMQP acceptor maxFrameSize 256 MiB (Artemis default 128 KiB): the
+          # publisher sends every record as ONE transfer frame (fe2o3-amqp
+          # 0.18.2 misnumbers multi-frame transfers) and refuses a broker
+          # advertising less. brokerconfig.* = broker.properties keys.
+          JAVA_ARGS_APPEND: -Dbrokerconfig.acceptorConfigurations.amqp.params.maxFrameSize=268435456
         options: >-
           --health-cmd "bash -c '</dev/tcp/localhost/5672 && </dev/tcp/localhost/8161'"
           --health-interval 10s
@@ -278,6 +283,11 @@ jobs:
 
       - name: Run SQS e2e tests (ElasticMQ)
         run: cargo test -p sz_sqs_combined_consumer --test sqs_e2e -- --nocapture --test-threads=1
+
+      # Before the consumer suite: this also builds target/debug/
+      # sz_activemq_publisher, which e2e_activemq_publisher_round_trip runs.
+      - name: Run ActiveMQ publisher e2e tests (Artemis)
+        run: cargo test -p sz_activemq_publisher --test publisher_e2e -- --nocapture --test-threads=1
 
       - name: Run ActiveMQ e2e tests (Artemis)
         run: cargo test -p sz_activemq_combined_consumer --test activemq_e2e -- --nocapture --test-threads=1
