@@ -4,6 +4,14 @@ Sections headed `0.4.1 — …` ship in tag `v0.4.1` (2026-10-09); all sections 
 
 ## Unreleased
 
+* **ActiveMQ: retry an unreachable broker at startup.** New `--reconnect-timeout`
+  / `SENZING_ACTIVEMQ_RECONNECT_TIMEOUT` (default 300 s, `0` = forever): the
+  startup connect retries transient errors every 5 s (30 s per attempt) instead
+  of exiting on the first `ECONNREFUSED`; SASL / URL / scheme errors still fail
+  immediately. A lost link mid-run stays fatal (exit 255). Fixes a broker restart
+  turning every driver into a restart loop (measured ~7 restarts each); after the
+  fix one broker restart cost exactly one restart per driver (62/62).
+
 * **`--version` comes from the release tag.** Release builds set `RELEASE_VERSION`
   from the git tag (`core::VERSION`), and the release workflow fails if any
   binary's `--version` does not match the tag. Other builds report the workspace

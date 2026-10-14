@@ -1185,6 +1185,7 @@ fn e2e_activemq_help_and_version() {
         "SENZING_ACTIVEMQ_URL",
         "SENZING_ACTIVEMQ_QUEUE",
         "SENZING_PREFETCH",
+        "SENZING_ACTIVEMQ_RECONNECT_TIMEOUT",
     ] {
         assert!(text.contains(flag), "--help lacks {flag}\n{text}");
     }
