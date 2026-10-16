@@ -62,10 +62,9 @@ frozen:
   exit_within_secs: 120
 
 # Large records interleaved with small ones, up to the shape of real-world
-# data (largest record 150.1 MB). The broker must run with its AMQP acceptor
-# maxFrameSize=268435456 (see CI / README) so every record is ONE transfer
-# frame: fe2o3-amqp 0.18.2 misnumbers multi-frame transfers ("Expected
-# delivery-id N, got N+k" from Artemis). Record i carries a PAD of
+# data (largest record 150.1 MB), sent through a small client frame (below) so
+# they are multi-frame transfers: upstream fe2o3-amqp misnumbered those
+# ("Expected delivery-id N, got N+k" from Artemis); the fork fixes it. Record i carries a PAD of
 # pad_bytes[i % len] bytes. Every record must arrive exactly once with ZERO
 # reconnects, and the drain exercises the consumer-side receiver on deliveries
 # that Artemis splits into many frames toward the client.
@@ -75,24 +74,30 @@ large:
   count: 8
   pad_bytes: [1000, 300000, 1000, 50000000, 1000, 150000000, 1000, 2500000]
   max_pending: 500
+  # The publisher advertises this max-frame-size, so the negotiated frame is
+  # at most 64 KiB whatever the broker allows: every record over it goes out
+  # as SEVERAL transfer frames. Upstream fe2o3-amqp then skips delivery-ids
+  # and Artemis closes the link; the vendored fix numbers them per delivery.
+  client_max_frame_size: 65536
   exit_within_secs: 300
   # Artemis streams a 150 MB message to the receiver in frames of the
   # receiver's 256 KiB max: allow that long between deliveries.
   drain_idle_secs: 60
   drained_within_secs: 300
 
-# One record one byte too large for a single frame of the broker's
-# advertised max-frame-size (268435456 minus the publisher's 1024-byte
-# reserve, plus 1), among small ones: it must be FAILED unsent (logged with
-# file:line and size, exit 2) and every other record published.
+# One record over --side-max-bytes among small ones. Without --side-file it
+# must be FAILED unsent (logged with file:line and size, exit 2) and every
+# other record published; with --side-file it is written there and logged
+# "sided <file> line <n> bytes <b>" (exit 0), and nothing else changes.
 oversize:
   queue: sz-amq-pub-oversize
   record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","PAD":"{pad}"}'
   small_count: 5
   # Line (1-based) of the oversize record.
   oversize_line: 3
-  oversize_bytes: 268434433
-  failed_marker: "needs more than one AMQP frame"
+  side_max_bytes: 1000000
+  oversize_bytes: 1500000
+  failed_marker: "exceeds --side-max-bytes"
   exit_within_secs: 120
   drained_within_secs: 60
 
@@ -113,3 +118,15 @@ failures:
   unreachable_url: amqp://127.0.0.1:1
   reconnect_timeout_secs: 2
   exit_within_secs: 30
+
+# --resume: the first `skip` non-blank records of the file are already
+# published (the count a previous run's `fileprogress` printed): only the
+# rest reach the queue, the summary reports skipped=<skip>, and the final
+# fileprogress line is the file's total.
+resume:
+  queue: sz-amq-pub-resume
+  count: 10
+  skip: 4
+  blank_every: 3
+  exit_within_secs: 120
+  drained_within_secs: 60

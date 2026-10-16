@@ -247,7 +247,7 @@ sz_activemq_publisher -u amqp://artemis:artemis@broker:5672 -q senzing-input \
 | Flag | Default | Meaning |
 |---|---|---|
 | `INPUT...` | required | files (plain / gzip / bzip2, detected from content) or directories (their `part-*` files, sorted; `.crc` / `_SUCCESS` ignored). Blank lines are skipped. |
-| `-u, --url` | `SENZING_ACTIVEMQ_URL` | `amqp://` only (see *Single-frame transfers*), credentials may be embedded |
+| `-u, --url` | `SENZING_ACTIVEMQ_URL` | `amqp://` only (the broker's max-frame-size is read off the plaintext Open frame), credentials may be embedded |
 | `--user`, `--password` | `SENZING_ACTIVEMQ_USER` / `_PASSWORD` | SASL PLAIN; override URL userinfo |
 | `-q, --queue` | `SENZING_ACTIVEMQ_QUEUE` | queue or FQQN `address::queue` |
 | `-m, --max-pending` | 500 | records sent but not yet settled, per file |
@@ -258,23 +258,26 @@ sz_activemq_publisher -u amqp://artemis:artemis@broker:5672 -q senzing-input \
 | `--reconnect-timeout` | 300 | give up (exit 1) after the broker is unreachable this long (0 = forever) |
 | `--blocked-log-interval` | 30 | seconds between `blocked on broker credit` lines |
 | `--transient` | off | `durable=false` (lost on broker restart) |
-| `--min-max-frame-size` | 268435456 | refuse to start (exit 1) if the broker advertises a smaller AMQP max-frame-size (0 = no floor) |
+| `--min-max-frame-size` | 0 | refuse to start (exit 1) if the broker advertises a smaller AMQP max-frame-size (0 = no floor) |
+| `--max-frame-size` | fe2o3 default | AMQP max-frame-size this client advertises (the negotiated frame is the smaller of the two) |
+| `--side-max-bytes` | 209715200 (`SIDE_MAX_BYTES`) | records larger than this are not published (see `--side-file`) |
+| `--side-file` | none (`SIDE_FILE`) | append oversized records here, logged `sided <file> line <n> bytes <b>`; without it they are FAILED |
+| `--resume` | none (`RESUME`) | `<file name> <records already published>` per line (this publisher's `fileprogress` lines): those leading records are skipped |
+| `--progress-every` | 100000 | `fileprogress <file> <n>` every N records per file: the first n non-blank records are settled, FAILED or sided |
 
-* **Single-frame transfers (broker setting REQUIRED).** fe2o3-amqp 0.18.2
-  numbers deliveries with the per-frame transfer-id, so a record split over
-  k frames skips k-1 delivery-ids; Artemis then closes the connection
-  (`Expected delivery-id N, got N+k-1`) and its AMQP thread can spin in
-  proton-j, starving other connections. The publisher therefore reads the
-  broker's advertised max-frame-size at connect and sends a record only if it
-  fits ONE frame; a larger record is **FAILED unsent** (`... needs more than
-  one AMQP frame ...`, exit 2). Raise the Artemis AMQP acceptor's
-  `maxFrameSize` above the largest record (Artemis default 131072; a real corpus's
-  largest record is 150.1 MB), e.g. in `broker.properties`:
-  `acceptorConfigurations.amqp.params.maxFrameSize=268435456` (or append
-  `;maxFrameSize=268435456` to the `amqp` acceptor URL in `broker.xml`, or
-  `-Dbrokerconfig.acceptorConfigurations.amqp.params.maxFrameSize=268435456`
-  in `JAVA_ARGS_APPEND`). Only `amqp://` is supported: the max-frame-size is
-  read off the plaintext Open frame.
+* **Multi-frame transfers (no broker setting needed).** A record larger than the
+  negotiated max-frame-size (Artemis default 131072) goes out as several transfer
+  frames. Upstream fe2o3-amqp (0.18.2/0.18.3) numbered deliveries with the
+  per-frame transfer-id, so a record split over k frames skipped k-1
+  delivery-ids and Artemis closed the connection (`Expected delivery-id N, got
+  N+k-1`), its AMQP thread then spinning in proton-j. The workspace depends on
+  the fork `brianmacy/fe2o3-amqp` (branch `fix/per-delivery-delivery-id`,
+  `[patch.crates-io]` in `Cargo.toml`) which allocates delivery-ids per
+  delivery; the e2e suite proves 150 MB records through a 64 KiB frame.
+* **Oversized records and resume.** Records over `--side-max-bytes` are diverted
+  to `--side-file` (loaded later in the consumer's file mode) or FAILED without
+  one. `fileprogress <file> <n>` lines are a safe resume point (the oldest
+  pending record bounds n); feed them back with `--resume`.
 * **Memory-bounded.** Files are streamed (never loaded whole); per file at most
   ~3 x `--max-pending` records are in memory (read-ahead channel, in flight,
   retries), times `--parallel`.

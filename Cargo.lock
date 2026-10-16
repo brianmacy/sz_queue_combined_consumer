@@ -1234,7 +1234,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1265,9 +1265,8 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fe2o3-amqp"
-version = "0.18.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff7b603be595828b418b4f69a111d19adb55ec4dd7e8b0e8b9e63295150af945"
+version = "0.18.3"
+source = "git+https://github.com/brianmacy/fe2o3-amqp.git?rev=73de8988ae2420bc2d600beacd44b57d33844399#73de8988ae2420bc2d600beacd44b57d33844399"
 dependencies = [
  "bytes",
  "fe2o3-amqp-types",
@@ -1277,7 +1276,7 @@ dependencies = [
  "pin-project-lite",
  "rustls",
  "serde",
- "serde_amqp",
+ "serde_amqp 0.18.0 (git+https://github.com/brianmacy/fe2o3-amqp.git?rev=73de8988ae2420bc2d600beacd44b57d33844399)",
  "serde_bytes",
  "slab",
  "thiserror",
@@ -1292,12 +1291,11 @@ dependencies = [
 [[package]]
 name = "fe2o3-amqp-types"
 version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "647fe7665ea8a44b95570287a5e8b1ed2f59bc5720afdc8c2b00c9fe6b27a6d6"
+source = "git+https://github.com/brianmacy/fe2o3-amqp.git?rev=73de8988ae2420bc2d600beacd44b57d33844399#73de8988ae2420bc2d600beacd44b57d33844399"
 dependencies = [
  "ordered-float",
  "serde",
- "serde_amqp",
+ "serde_amqp 0.18.0 (git+https://github.com/brianmacy/fe2o3-amqp.git?rev=73de8988ae2420bc2d600beacd44b57d33844399)",
  "serde_bytes",
  "serde_repr",
 ]
@@ -2625,7 +2623,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2751,6 +2749,19 @@ dependencies = [
  "indexmap",
  "ordered-float",
  "serde",
+ "serde_bytes",
+ "thiserror",
+]
+
+[[package]]
+name = "serde_amqp"
+version = "0.18.0"
+source = "git+https://github.com/brianmacy/fe2o3-amqp.git?rev=73de8988ae2420bc2d600beacd44b57d33844399#73de8988ae2420bc2d600beacd44b57d33844399"
+dependencies = [
+ "bytes",
+ "indexmap",
+ "ordered-float",
+ "serde",
  "serde_amqp_derive",
  "serde_bytes",
  "thiserror",
@@ -2759,8 +2770,7 @@ dependencies = [
 [[package]]
 name = "serde_amqp_derive"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ed6d00fd958e85ba2419add81456008b253de3fb60fda81b5c53c1687ab7f7c"
+source = "git+https://github.com/brianmacy/fe2o3-amqp.git?rev=73de8988ae2420bc2d600beacd44b57d33844399#73de8988ae2420bc2d600beacd44b57d33844399"
 dependencies = [
  "convert_case",
  "darling",
@@ -3114,7 +3124,7 @@ dependencies = [
  "flate2",
  "libc",
  "serde",
- "serde_amqp",
+ "serde_amqp 0.18.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json",
  "serde_norway",
  "sz-activemq-amqp",
@@ -3122,7 +3132,6 @@ dependencies = [
  "sz-record-transform-example",
  "sz-rust-sdk",
  "tokio",
- "tokio-util",
  "tracing",
  "url",
 ]
@@ -3330,9 +3339,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-util"
-version = "0.7.19"
+version = "0.7.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "494815d09bf52b5548659851081238f0ca39ff638363907596da739561c62c52"
+checksum = "e464cf451ba96ebfc6f9b6542f17ee8b8956e33f1e40d9690624e59d7a7f8a4b"
 dependencies = [
  "bytes",
  "futures-core",
@@ -3634,7 +3643,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -28,30 +28,37 @@
 //!   A record not accepted after `max_attempts` attempts is FAILED: logged
 //!   with its file and line, counted, and the run exits non-zero at the end.
 //! * A message that can never be sent (larger than the link's max message
-//!   size, unencodable, or needing more than ONE AMQP frame — see below)
-//!   fails immediately the same way.
+//!   size or unencodable) fails immediately the same way.
+//! * A record larger than `side_max_bytes` is not published: it is appended to
+//!   the side file and logged `sided <file> line <n> bytes <b>` (loaded later
+//!   by the consumer's file mode); with no side file it is FAILED.
 //!
-//! ## Single-frame transfers only
-//! fe2o3-amqp 0.18.2 numbers deliveries with the session's per-FRAME
-//! transfer-id (`session/mod.rs`, `on_outgoing_transfer_inner`), so a message
-//! split over k frames skips k-1 delivery-ids. Artemis (proton-j) answers with
-//! "Expected delivery-id N, got N+k-1", closes the connection, and its AMQP
-//! event-loop thread can then spin in `verifyNewDeliveryIdSequence`, starving
-//! every other connection on that thread. So a record is sent only when its
-//! transfer fits one frame of the broker's advertised `max-frame-size` (read
-//! off the wire at connect); larger records are FAILED without being sent.
-//! The broker must raise its AMQP acceptor `maxFrameSize` above the largest
-//! record (`--min-max-frame-size` refuses to start against one that has not).
+//! ## Multi-frame transfers
+//! A record larger than the negotiated `max-frame-size` goes out as several
+//! transfer frames. Upstream fe2o3-amqp 0.18.2/0.18.3 numbered deliveries with
+//! the per-FRAME transfer-id, so the next delivery-id skipped and Artemis
+//! closed the link ("Expected delivery-id N, got N+k-1") and could spin its
+//! AMQP event loop. The workspace uses a vendored fe2o3-amqp with a
+//! per-delivery counter (`vendor/VENDORED.md`), so multi-frame deliveries are
+//! numbered correctly and need no broker `maxFrameSize` change.
+//!
+//! ## Resume and progress
+//! `fileprogress <file> <n>` (stdout, every `progress_every` records) means the
+//! file's first `n` non-blank records are all settled, FAILED or sided — the
+//! oldest still-pending record bounds it, so a resume never skips an
+//! unacknowledged record. `resume` maps a file name to that `n`: those records
+//! are skipped unread (same format as the Artemis CORE publisher's RESUME).
 //! * Link loss (send/settlement error): reconnect (bounded by
 //!   `reconnect_timeout`) and resend every unsettled record — at-least-once,
 //!   so a record the broker accepted just before the loss can be queued
 //!   twice (add_record is idempotent per DATA_SOURCE + RECORD_ID).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -78,11 +85,6 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// the publisher, wait forever. A timed-out attempt is transient (retried
 /// until `--reconnect-timeout`).
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bytes reserved, beyond the record, for the transfer performative, the
-/// frame header and the message's header + data-section encoding (~80 bytes
-/// in fe2o3 0.18.2's encoding; a record within this margin of the frame
-/// limit is refused although it might just fit).
-const FRAME_OVERHEAD_BYTES: usize = 1024;
 /// Bytes of a failed record quoted in its error line.
 const FAILED_PREVIEW_BYTES: usize = 200;
 
@@ -102,8 +104,19 @@ pub struct PublishConfig {
     /// AMQP header `durable` (persistent) flag.
     pub durable: bool,
     /// Refuse to publish (exit 1) when the broker advertises a smaller AMQP
-    /// `max-frame-size`; `0` = no floor (oversize records still FAIL).
+    /// `max-frame-size`; `0` = no floor (multi-frame deliveries are fine).
     pub min_max_frame_size: u32,
+    /// `max-frame-size` this client advertises (`None` = fe2o3 default); the
+    /// negotiated frame is the smaller of the two peers'.
+    pub local_max_frame_size: Option<u32>,
+    /// Records larger than this are sided, not published.
+    pub side_max_bytes: usize,
+    /// Where sided records go (one per line); `None` = FAIL them.
+    pub side: Option<Arc<Mutex<std::io::BufWriter<std::fs::File>>>>,
+    /// File name -> leading non-blank records already published (skipped).
+    pub resume: Arc<HashMap<String, u64>>,
+    /// `fileprogress` cadence in records.
+    pub progress_every: u64,
 }
 
 /// Per-file (and, merged, overall) counters.
@@ -123,6 +136,10 @@ pub struct FileStats {
     pub reconnects: u64,
     /// Records given up on (never accepted).
     pub failed: u64,
+    /// Records over `side_max_bytes` written to the side file instead.
+    pub sided: u64,
+    /// Leading records skipped by `resume` (not counted in `read`).
+    pub skipped: u64,
 }
 
 impl FileStats {
@@ -134,18 +151,22 @@ impl FileStats {
         self.resent += o.resent;
         self.reconnects += o.reconnects;
         self.failed += o.failed;
+        self.sided += o.sided;
+        self.skipped += o.skipped;
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "read={} settled={} rejected={} released={} resent={} reconnects={} failed={}",
+            "read={} settled={} rejected={} released={} resent={} reconnects={} failed={} sided={} skipped={}",
             self.read,
             self.settled,
             self.rejected,
             self.released,
             self.resent,
             self.reconnects,
-            self.failed
+            self.failed,
+            self.sided,
+            self.skipped
         )
     }
 }
@@ -191,6 +212,8 @@ impl Progress {
 
 /// One record read from the input.
 struct Record {
+    /// 1-based ordinal among the file's non-blank records (resume unit).
+    seq: u64,
     line: u64,
     bytes: Vec<u8>,
     /// Non-accepted outcomes so far (link-loss resends do not count).
@@ -234,10 +257,33 @@ async fn await_logging<F: Future>(fut: F, every: Duration, what: impl Fn(Duratio
     }
 }
 
-/// Whether a record of `record_len` bytes goes out as ONE transfer frame
-/// under the broker's `max_frame` (with [`FRAME_OVERHEAD_BYTES`] reserved).
-fn fits_one_frame(record_len: usize, max_frame: u32) -> bool {
-    record_len.saturating_add(FRAME_OVERHEAD_BYTES) <= max_frame as usize
+/// Parses a resume file: one `<file name> <records already published>` per
+/// line (the `fileprogress` lines with that word stripped also parse). Later
+/// lines win; blank and `#` lines are ignored.
+pub fn parse_resume(text: &str) -> Result<HashMap<String, u64>> {
+    let mut map = HashMap::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let fields = match fields.as_slice() {
+            ["fileprogress", rest @ ..] => rest.to_vec(),
+            other => other.to_vec(),
+        };
+        let [name, n] = fields.as_slice() else {
+            bail!(
+                "resume line {}: expected '<file> <count>', got {raw:?}",
+                i + 1
+            );
+        };
+        let n: u64 = n
+            .parse()
+            .with_context(|| format!("resume line {}: bad count in {raw:?}", i + 1))?;
+        map.insert((*name).to_string(), n);
+    }
+    Ok(map)
 }
 
 /// Awaits a transfer's outcome, failing as soon as the session or connection
@@ -275,6 +321,10 @@ pub struct FilePublisher<'a> {
     container_id: String,
     progress: &'a Progress,
     stats: FileStats,
+    /// File name used in `fileprogress` / `sided` lines and the resume key.
+    name: String,
+    /// Next `fileprogress` threshold.
+    next_mark: u64,
 }
 
 impl<'a> FilePublisher<'a> {
@@ -290,6 +340,11 @@ impl<'a> FilePublisher<'a> {
             container_id: format!("{}-{}-{index}", cfg.instance, std::process::id()),
             progress,
             stats: FileStats::default(),
+            name: path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            next_mark: cfg.progress_every.max(1),
         }
     }
 
@@ -297,21 +352,37 @@ impl<'a> FilePublisher<'a> {
         let path: PathBuf = self.path.to_path_buf();
         // Open before connecting: an unreadable file fails without a link.
         let mut reader = LineReader::open(&path)?;
-        let (tx, mut rx) = mpsc::channel::<(u64, Vec<u8>)>(self.cfg.max_pending);
-        let reading = tokio::task::spawn_blocking(move || -> Result<()> {
-            while let Some(rec) = reader.next_record()? {
-                if tx.blocking_send(rec).is_err() {
-                    return Ok(()); // publisher gave up; its error is reported
+        let skip = self.cfg.resume.get(&self.name).copied().unwrap_or(0);
+        let (tx, mut rx) = mpsc::channel::<(u64, u64, Vec<u8>)>(self.cfg.max_pending);
+        let reading = tokio::task::spawn_blocking(move || -> Result<u64> {
+            let mut seq = 0u64;
+            while let Some((line, bytes)) = reader.next_record()? {
+                seq += 1;
+                if seq <= skip {
+                    continue; // already published (resume)
+                }
+                if tx.blocking_send((seq, line, bytes)).is_err() {
+                    return Ok(seq.min(skip)); // publisher gave up; its error is reported
                 }
             }
-            Ok(())
+            Ok(seq.min(skip))
         });
+        if skip > 0 {
+            info!("{}: resuming after {skip} record(s)", self.name);
+        }
+        let mut last_seq = skip;
 
         let mut link = self.connect().await?;
         info!(
-            "broker max-frame-size {} bytes: records over {} bytes are FAILED unsent",
+            "broker max-frame-size {} bytes (larger records go out as several frames); \
+             records over {} bytes are {}",
             link.max_frame,
-            (link.max_frame as usize).saturating_sub(FRAME_OVERHEAD_BYTES)
+            self.cfg.side_max_bytes,
+            if self.cfg.side.is_some() {
+                "sided"
+            } else {
+                "FAILED"
+            }
         );
         info!(
             "publishing {} to {} (queue {})",
@@ -342,9 +413,11 @@ impl<'a> FilePublisher<'a> {
                         }
                     };
                     match next {
-                        Some((line, bytes)) => {
+                        Some((seq, line, bytes)) => {
                             self.stats.read += 1;
+                            last_seq = seq;
                             Record {
+                                seq,
                                 line,
                                 bytes,
                                 attempts: 0,
@@ -356,16 +429,9 @@ impl<'a> FilePublisher<'a> {
                         }
                     }
                 };
-                if !fits_one_frame(record.bytes.len(), link.max_frame) {
-                    self.fail(
-                        &record,
-                        &format!(
-                            "{} bytes needs more than one AMQP frame (broker max-frame-size {}); \
-                             not sent: raise the broker acceptor maxFrameSize",
-                            record.bytes.len(),
-                            link.max_frame
-                        ),
-                    );
+                if record.bytes.len() > self.cfg.side_max_bytes {
+                    self.side_or_fail(&record)?;
+                    self.mark_progress(&inflight, &retry, last_seq);
                     continue;
                 }
                 let message = record_message(record.bytes.clone(), self.cfg.durable);
@@ -421,6 +487,7 @@ impl<'a> FilePublisher<'a> {
                             tokio::time::sleep(self.cfg.retry_delay).await;
                             retry.push_back(r);
                         }
+                        self.mark_progress(&inflight, &retry, last_seq);
                     }
                     Err(e) => link_lost = Some((record, e)),
                 }
@@ -451,19 +518,71 @@ impl<'a> FilePublisher<'a> {
         }
 
         Self::close(link).await;
-        reading
+        self.stats.skipped = reading
             .await
             .context("file reader task panicked")?
             .with_context(|| format!("reading {}", path.display()))?;
+        println!("fileprogress {} {last_seq}", self.name);
         let s = self.stats;
-        if s.settled + s.failed != s.read {
+        if s.settled + s.failed + s.sided != s.read {
             bail!(
-                "internal accounting error on {}: {} (settled + failed != read)",
+                "internal accounting error on {}: {} (settled + failed + sided != read)",
                 path.display(),
                 s.summary()
             );
         }
         Ok(s)
+    }
+
+    /// Writes an oversized record to the side file (FAILED when there is none).
+    fn side_or_fail(&mut self, record: &Record) -> Result<()> {
+        let Some(side) = &self.cfg.side else {
+            self.fail(
+                record,
+                &format!(
+                    "{} bytes exceeds --side-max-bytes {} and no --side-file is set",
+                    record.bytes.len(),
+                    self.cfg.side_max_bytes
+                ),
+            );
+            return Ok(());
+        };
+        {
+            let mut w = side.lock().expect("side-file lock poisoned");
+            w.write_all(&record.bytes)
+                .and_then(|()| w.write_all(b"\n"))
+                .and_then(|()| w.flush())
+                .context("writing the side file")?;
+        }
+        self.stats.sided += 1;
+        println!(
+            "sided {} line {} bytes {}",
+            self.name,
+            record.seq,
+            record.bytes.len()
+        );
+        Ok(())
+    }
+
+    /// Prints `fileprogress` when the completed prefix crosses the next mark:
+    /// every record before the oldest pending one is settled, FAILED or sided.
+    fn mark_progress(
+        &mut self,
+        inflight: &VecDeque<InFlight>,
+        retry: &VecDeque<Record>,
+        last_seq: u64,
+    ) {
+        let oldest = inflight
+            .iter()
+            .map(|f| f.record.seq)
+            .chain(retry.iter().map(|r| r.seq))
+            .min();
+        let done = oldest.map_or(last_seq, |seq| seq - 1);
+        if done >= self.next_mark {
+            println!("fileprogress {} {done}", self.name);
+            let every = self.cfg.progress_every.max(1);
+            self.next_mark = (done / every + 1) * every;
+        }
     }
 
     fn settled(&mut self) {
@@ -554,30 +673,29 @@ impl<'a> FilePublisher<'a> {
     }
 
     async fn try_connect(&self) -> Result<Link, ConnectError> {
-        let (mut connection, max_frame) =
-            open_connection_observed(&self.cfg.broker, self.container_id.clone())
-                .await
-                .map_err(|e| {
-                    let permanent = open_error_is_permanent(&e);
-                    let e = anyhow!(e).context(format!(
-                        "failed to connect to ActiveMQ at {}",
-                        self.cfg.broker.url
-                    ));
-                    if permanent {
-                        ConnectError::Permanent(e)
-                    } else {
-                        ConnectError::Transient(e)
-                    }
-                })?;
+        let (mut connection, max_frame) = open_connection_observed(
+            &self.cfg.broker,
+            self.container_id.clone(),
+            self.cfg.local_max_frame_size,
+        )
+        .await
+        .map_err(|e| {
+            let permanent = open_error_is_permanent(&e);
+            let e = anyhow!(e).context(format!(
+                "failed to connect to ActiveMQ at {}",
+                self.cfg.broker.url
+            ));
+            if permanent {
+                ConnectError::Permanent(e)
+            } else {
+                ConnectError::Transient(e)
+            }
+        })?;
         if max_frame < self.cfg.min_max_frame_size {
             let _ = connection.close().await;
             return Err(ConnectError::Permanent(anyhow!(
                 "broker {} advertises AMQP max-frame-size {max_frame} bytes, below \
-                 --min-max-frame-size {}: larger records would be split over several frames, \
-                 which fe2o3-amqp numbers wrongly (Artemis closes the connection). Raise the \
-                 broker's AMQP acceptor maxFrameSize (e.g. broker.properties \
-                 acceptorConfigurations.amqp.params.maxFrameSize=268435456) or lower \
-                 --min-max-frame-size",
+                 --min-max-frame-size {}",
                 self.cfg.broker.url,
                 self.cfg.min_max_frame_size
             )));
@@ -647,25 +765,36 @@ mod tests {
             resent: 5,
             reconnects: 6,
             failed: 7,
+            sided: 8,
+            skipped: 9,
         };
         let mut m = a;
         m.merge(&a);
         assert_eq!(
             m.summary(),
-            "read=2 settled=4 rejected=6 released=8 resent=10 reconnects=12 failed=14"
+            "read=2 settled=4 rejected=6 released=8 resent=10 reconnects=12 failed=14 sided=16 skipped=18"
         );
     }
 
     #[test]
-    fn frame_guard_reserves_the_overhead() {
-        let max = 131_072;
-        assert!(fits_one_frame(max as usize - FRAME_OVERHEAD_BYTES, max));
-        assert!(!fits_one_frame(
-            max as usize - FRAME_OVERHEAD_BYTES + 1,
-            max
-        ));
-        assert!(!fits_one_frame(usize::MAX, u32::MAX), "no overflow");
-        assert!(fits_one_frame(150_100_000, 268_435_456));
+    fn resume_parses_counts_and_fileprogress_lines_and_later_wins() {
+        let m = parse_resume(
+            "# comment\n\npart-00001.txt 100000\nfileprogress part-00002.txt 7\npart-00001.txt 200000\n",
+        )
+        .unwrap();
+        assert_eq!(m.get("part-00001.txt"), Some(&200_000));
+        assert_eq!(m.get("part-00002.txt"), Some(&7));
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn resume_rejects_malformed_lines() {
+        assert!(parse_resume("part-00001.txt\n").is_err(), "missing count");
+        assert!(
+            parse_resume("part-00001.txt ten\n").is_err(),
+            "non-numeric count"
+        );
+        assert!(parse_resume("a b c\n").is_err(), "extra field");
     }
 
     #[tokio::test]

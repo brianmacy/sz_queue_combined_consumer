@@ -161,6 +161,7 @@ const OPEN_SCAN_LIMIT: usize = 64 * 1024;
 pub async fn open_connection_observed(
     params: &BrokerParams,
     container_id: String,
+    local_max_frame_size: Option<u32>,
 ) -> Result<(ConnectionHandle<()>, u32), OpenError> {
     let url = &params.url;
     if url.scheme() != "amqp" {
@@ -177,6 +178,9 @@ pub async fn open_connection_observed(
         .hostname(host)
         .sasl_hostname(host)
         .idle_time_out(IDLE_TIMEOUT.as_millis() as u32);
+    if let Some(n) = local_max_frame_size {
+        builder = builder.max_frame_size(n);
+    }
     if let Some(c) = &params.credentials {
         builder = builder.sasl_profile(SaslProfile::Plain {
             username: c.user.clone(),

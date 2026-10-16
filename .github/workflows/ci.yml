@@ -149,11 +149,11 @@ jobs:
           ARTEMIS_PASSWORD: artemis
           ANONYMOUS_LOGIN: "false"
           EXTRA_ARGS: --http-host 0.0.0.0 --relax-jolokia --no-autotune
-          # AMQP acceptor maxFrameSize 256 MiB (Artemis default 128 KiB): the
-          # publisher sends every record as ONE transfer frame (fe2o3-amqp
-          # 0.18.2 misnumbers multi-frame transfers) and refuses a broker
-          # advertising less. brokerconfig.* = broker.properties keys.
-          JAVA_ARGS_APPEND: -Dbrokerconfig.acceptorConfigurations.amqp.params.maxFrameSize=268435456
+          # Stock AMQP max-frame-size (128 KiB) on purpose: large records go out
+          # as multi-frame transfers, the case the fe2o3-amqp fork fixes.
+          # maxDiskUsage=-1: a nearly-full runner disk must not make the broker
+          # block producers (AMQ222212) mid-suite. brokerconfig.* = broker.properties keys.
+          JAVA_ARGS_APPEND: -Dbrokerconfig.maxDiskUsage=-1
         options: >-
           --health-cmd "bash -c '</dev/tcp/localhost/5672 && </dev/tcp/localhost/8161'"
           --health-interval 10s

@@ -53,7 +53,7 @@ aws-sdk-sqs = { version = "1", default-features = false, features = ["behavior-v
 # `rustls` TLS stack (webpki roots) — no native-tls/OpenSSL. `url` parses the
 # broker URL (already in the tree via fe2o3-amqp); percent-encoding decodes
 # credentials embedded in it.
-fe2o3-amqp = { version = "0.18.2", default-features = false, features = ["rustls"] }
+fe2o3-amqp = { version = "0.18.3", default-features = false, features = ["rustls"] }
 url = "2"
 percent-encoding = "2"
 # Publisher input decompression (crates/activemq-publisher only): gzip via
@@ -76,3 +76,10 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# fe2o3-amqp with the per-delivery delivery-id fix: fork brianmacy/fe2o3-amqp, branch
+# fix/per-delivery-delivery-id (upstream main 0.18.3 + the fix; PR to minghuaw/fe2o3-amqp pending).
+# Upstream numbered deliveries with the per-FRAME transfer-id, so a record split over several
+# frames made the next delivery-id skip and Artemis closed the link. Drop this once upstream ships it.
+[patch.crates-io]
+fe2o3-amqp = { git = "https://github.com/brianmacy/fe2o3-amqp.git", rev = "73de8988ae2420bc2d600beacd44b57d33844399" }

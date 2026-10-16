@@ -56,4 +56,6 @@ unknown-git = "deny"
 allow-git = [
     "https://github.com/brianmacy/sz-rust-sdk",
     "https://github.com/brianmacy/sz-rust-sdk-ffi",
+    # fe2o3-amqp with the per-delivery delivery-id fix (Cargo.toml [patch.crates-io]).
+    "https://github.com/brianmacy/fe2o3-amqp",
 ]

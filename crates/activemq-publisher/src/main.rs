@@ -127,13 +127,40 @@ struct Args {
     parallel: usize,
 
     /// Refuse to start (exit 1) when the broker's advertised AMQP
-    /// max-frame-size is below this (bytes; 0 = no floor). Records needing
-    /// more than one frame are never sent (FAILED, exit 2): the AMQP client
-    /// misnumbers multi-frame transfers and Artemis drops the connection. The
-    /// default matches the documented broker setting (Artemis AMQP acceptor
-    /// maxFrameSize=268435456; Artemis' own default is 131072).
-    #[arg(long = "min-max-frame-size", default_value_t = 268_435_456)]
+    /// max-frame-size is below this (bytes; 0 = no floor, the default). A
+    /// record larger than a frame is sent as several frames (fe2o3-amqp fork
+    /// with per-delivery delivery-ids, see Cargo.toml [patch.crates-io]).
+    #[arg(long = "min-max-frame-size", default_value_t = 0)]
     min_max_frame_size: u32,
+
+    /// AMQP max-frame-size this client advertises (default: fe2o3's). The
+    /// negotiated frame is the smaller of the two peers'.
+    #[arg(long = "max-frame-size")]
+    max_frame_size: Option<u32>,
+
+    /// Records larger than this many bytes are NOT published: they go to
+    /// --side-file (or are FAILED without one).
+    #[arg(
+        long = "side-max-bytes",
+        env = "SIDE_MAX_BYTES",
+        default_value_t = 209_715_200
+    )]
+    side_max_bytes: usize,
+
+    /// Append oversized records here, one per line, for a later direct load
+    /// (consumer file mode); each is logged `sided <file> line <n> bytes <b>`.
+    #[arg(long = "side-file", env = "SIDE_FILE")]
+    side_file: Option<std::path::PathBuf>,
+
+    /// Resume file: `<file name> <records already published>` per line (the
+    /// `fileprogress` lines this publisher prints). Those leading records of
+    /// each named file are skipped.
+    #[arg(long = "resume", env = "RESUME")]
+    resume: Option<std::path::PathBuf>,
+
+    /// Print `fileprogress <file> <n>` every this many records per file.
+    #[arg(long = "progress-every", default_value_t = 100_000)]
+    progress_every: u64,
 
     /// Debug logging (overridden by RUST_LOG).
     #[arg(short = 'v', long = "verbose")]
@@ -158,11 +185,29 @@ fn build_config(args: &Args) -> Result<PublishConfig, String> {
         parse_broker_url(&args.url, args.user.as_deref(), args.password.as_deref())?;
     if url.scheme() != "amqp" {
         return Err(format!(
-            "the publisher supports amqp:// only (got {}://): it must read the broker's \
-             max-frame-size from the plaintext Open frame to keep every transfer single-frame",
+            "the publisher supports amqp:// only (got {}://): it reads the broker's \
+             max-frame-size from the plaintext Open frame",
             url.scheme()
         ));
     }
+    let side = match &args.side_file {
+        Some(p) => Some(Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .map_err(|e| format!("cannot open --side-file {}: {e}", p.display()))?,
+        )))),
+        None => None,
+    };
+    let resume = match &args.resume {
+        Some(p) => {
+            let text = std::fs::read_to_string(p)
+                .map_err(|e| format!("cannot read --resume {}: {e}", p.display()))?;
+            publish::parse_resume(&text).map_err(|e| format!("--resume {}: {e:#}", p.display()))?
+        }
+        None => Default::default(),
+    };
     Ok(PublishConfig {
         broker: BrokerParams {
             url,
@@ -178,6 +223,11 @@ fn build_config(args: &Args) -> Result<PublishConfig, String> {
         blocked_log_interval: Duration::from_secs(args.blocked_log_interval),
         durable: !args.transient,
         min_max_frame_size: args.min_max_frame_size,
+        local_max_frame_size: args.max_frame_size,
+        side_max_bytes: args.side_max_bytes,
+        side,
+        resume: Arc::new(resume),
+        progress_every: args.progress_every,
     })
 }
 
@@ -328,7 +378,12 @@ mod tests {
         );
         assert_eq!(c.broker.credentials.map(|c| c.user), Some("u".into()));
         assert_eq!(args(&[]).parallel, 1);
-        assert_eq!(c.min_max_frame_size, 268_435_456);
+        assert_eq!(
+            c.min_max_frame_size, 0,
+            "multi-frame deliveries are fine with the vendored fix"
+        );
+        assert_eq!(c.side_max_bytes, 209_715_200);
+        assert!(c.side.is_none() && c.resume.is_empty() && c.local_max_frame_size.is_none());
     }
 
     #[test]

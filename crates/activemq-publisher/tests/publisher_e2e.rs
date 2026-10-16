@@ -9,9 +9,8 @@
 //! `amqp://artemis:artemis@localhost:5673`) and `IT_ARTEMIS_JOLOKIA_URL`
 //! (management: address settings + queue counts). Without them each test
 //! prints `SKIP` and passes — or FAILS when `IT_REQUIRE_INFRA=1` (CI).
-//! The broker's AMQP acceptor must advertise maxFrameSize=268435456 (e.g.
-//! `JAVA_ARGS_APPEND=-Dbrokerconfig.acceptorConfigurations.amqp.params.maxFrameSize=268435456`
-//! on `apache/artemis`): the publisher refuses smaller ones by default.
+//! Runs against a stock `apache/artemis` (default AMQP max-frame-size 131072):
+//! records larger than a frame are sent as several frames.
 //!
 //! Proven here (data in `tests/fixtures/publisher.yaml`):
 //! * a Spark-style directory of plain / gzip / bzip2 part files publishes
@@ -76,6 +75,7 @@ struct Fixture {
     frozen: FrozenCase,
     large: LargeCase,
     oversize: OversizeCase,
+    resume: ResumeCase,
     silent_broker: SilentBrokerCase,
     failures: FailureCase,
 }
@@ -134,6 +134,7 @@ struct LargeCase {
     count: usize,
     pad_bytes: Vec<usize>,
     max_pending: usize,
+    client_max_frame_size: u32,
     exit_within_secs: u64,
     drain_idle_secs: u64,
     drained_within_secs: u64,
@@ -145,8 +146,19 @@ struct OversizeCase {
     record_template: String,
     small_count: usize,
     oversize_line: usize,
+    side_max_bytes: usize,
     oversize_bytes: usize,
     failed_marker: String,
+    exit_within_secs: u64,
+    drained_within_secs: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct ResumeCase {
+    queue: String,
+    count: usize,
+    skip: usize,
+    blank_every: usize,
     exit_within_secs: u64,
     drained_within_secs: u64,
 }
@@ -608,13 +620,12 @@ async fn e2e_publisher_directory_of_mixed_compression_parts() {
     );
 }
 
-/// Records from 1 KB to 150 MB (a real corpus's largest) interleaved: against
-/// a broker advertising maxFrameSize=268435456 every record goes out as ONE
-/// transfer frame, so delivery-ids stay contiguous — every record exactly
-/// once and the broker never closes the link. Regression for Artemis closing
-/// it with "Expected delivery-id N, got N+k": fe2o3-amqp 0.18.2 numbers
-/// deliveries with the per-FRAME transfer-id, so a multi-frame transfer
-/// skipped ids (and the broker's AMQP thread then spun in proton-j).
+/// Records from 1 KB to 150 MB (a real corpus's largest) interleaved, through a
+/// 64 KiB client max-frame-size, so every record over it is SEVERAL transfer
+/// frames: delivery-ids must stay contiguous — every record exactly once and
+/// the broker never closes the link. Regression for Artemis closing it with
+/// "Expected delivery-id N, got N+k": upstream fe2o3-amqp numbered deliveries
+/// with the per-FRAME transfer-id (fails on stock 0.18.3; passes on the fork).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_publisher_multi_frame_records_keep_delivery_ids_contiguous() {
     let Some(url) = gate() else { return };
@@ -634,9 +645,18 @@ async fn e2e_publisher_multi_frame_records_keep_delivery_ids_contiguous() {
     let file = dir.jsonl("part-00000-large.json", &lines, 0);
 
     let max_pending = case.max_pending.to_string();
+    let max_frame = case.client_max_frame_size.to_string();
     let file_arg = file.to_string_lossy().into_owned();
     let publisher = Publisher::spawn(
-        &["-q", &queue, "-m", &max_pending, &file_arg],
+        &[
+            "-q",
+            &queue,
+            "-m",
+            &max_pending,
+            "--max-frame-size",
+            &max_frame,
+            &file_arg,
+        ],
         &[("SENZING_ACTIVEMQ_URL", url.as_str())],
     );
     let (code, out) = publisher
@@ -917,7 +937,7 @@ async fn e2e_publisher_silent_connection_reconnects_never_hangs() {
 /// A record that would need a second transfer frame is FAILED unsent (file,
 /// line, size logged; exit 2) and does not disturb the rest of the file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_publisher_record_over_one_frame_fails_loudly_unsent() {
+async fn e2e_publisher_record_over_side_max_fails_loudly_unsent() {
     let Some(url) = gate() else { return };
     let fx = fixture();
     let case = &fx.oversize;
@@ -938,8 +958,9 @@ async fn e2e_publisher_record_over_one_frame_fails_loudly_unsent() {
     let big = lines.remove(case.oversize_line - 1);
 
     let file_arg = file.to_string_lossy().into_owned();
+    let side_max = case.side_max_bytes.to_string();
     let publisher = Publisher::spawn(
-        &["-q", &queue, &file_arg],
+        &["-q", &queue, "--side-max-bytes", &side_max, &file_arg],
         &[("SENZING_ACTIVEMQ_URL", url.as_str())],
     );
     let (code, out) = publisher
@@ -981,6 +1002,150 @@ async fn e2e_publisher_record_over_one_frame_fails_loudly_unsent() {
         "e2e_publisher_oversize: 1 FAILED unsent, {} published",
         drained.len()
     );
+}
+
+/// The same oversize record with --side-file: written there (byte-identical,
+/// one line), logged `sided <file> line <n> bytes <b>`, NOT published, exit 0;
+/// every small record published exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_publisher_record_over_side_max_goes_to_the_side_file() {
+    let Some(url) = gate() else { return };
+    let fx = fixture();
+    let case = &fx.oversize;
+    let queue = unique(&format!("{}-side", case.queue));
+    let dir = Scratch::new("side");
+    let line = |i: usize, pad: &str| {
+        case.record_template
+            .replace("{tag}", "PUB_SIDE")
+            .replace("{i}", &i.to_string())
+            .replace("{pad}", pad)
+    };
+    let mut lines: Vec<String> = (0..case.small_count).map(|i| line(i, "x")).collect();
+    let fixed = line(case.small_count, "").len();
+    let big = line(case.small_count, &"x".repeat(case.oversize_bytes - fixed));
+    lines.insert(case.oversize_line - 1, big);
+    let name = "part-00000-side.json";
+    let file = dir.jsonl(name, &lines, 0);
+    let big = lines.remove(case.oversize_line - 1);
+    let side = dir.0.join("sided.jsonl");
+
+    let (file_arg, side_arg) = (
+        file.to_string_lossy().into_owned(),
+        side.to_string_lossy().into_owned(),
+    );
+    let side_max = case.side_max_bytes.to_string();
+    let publisher = Publisher::spawn(
+        &[
+            "-q",
+            &queue,
+            "--side-max-bytes",
+            &side_max,
+            "--side-file",
+            &side_arg,
+            &file_arg,
+        ],
+        &[("SENZING_ACTIVEMQ_URL", url.as_str())],
+    );
+    let (code, out) = publisher
+        .finish(Duration::from_secs(case.exit_within_secs))
+        .await;
+    let (_stop_tx, stop) = watch::channel(true);
+    let drained = drain(
+        &url,
+        &queue,
+        stop,
+        Duration::from_secs(2),
+        Duration::from_secs(case.drained_within_secs),
+    )
+    .await;
+
+    assert_eq!(code, Some(0), "a sided record is not a failure\n{out}");
+    let marker = format!(
+        "sided {name} line {} bytes {}",
+        case.oversize_line, case.oversize_bytes
+    );
+    assert!(out.contains(&marker), "no '{marker}' line\n{out}");
+    assert_eq!(summary_count(&out, "sided"), 1, "{out}");
+    assert_eq!(summary_count(&out, "failed"), 0, "{out}");
+    assert_eq!(
+        summary_count(&out, "settled"),
+        case.small_count as u64,
+        "{out}"
+    );
+    let written = std::fs::read_to_string(&side).expect("side file");
+    assert_eq!(
+        written,
+        format!("{big}\n"),
+        "side file holds exactly the oversize record"
+    );
+    let seen: BTreeSet<&str> = drained.iter().map(|d| d.body.as_str()).collect();
+    let expected: BTreeSet<&str> = lines.iter().map(String::as_str).collect();
+    assert_eq!(
+        drained.len(),
+        case.small_count,
+        "the oversize record is not on the queue"
+    );
+    assert_eq!(seen, expected, "every small record, exactly once");
+}
+
+/// --resume skips the first N non-blank records of the named file (blank
+/// lines do not count), publishes the rest, reports skipped=N, and ends with
+/// `fileprogress <file> <total>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_publisher_resume_skips_already_published_records() {
+    let Some(url) = gate() else { return };
+    let fx = fixture();
+    let case = &fx.resume;
+    let queue = unique(&case.queue);
+    let dir = Scratch::new("resume");
+    let lines = records(&fx.record_template, "PUB_RESUME", 0..case.count);
+    let name = "part-00000-resume.json";
+    let file = dir.jsonl(name, &lines, case.blank_every);
+    let resume = dir.0.join("resume.txt");
+    std::fs::write(&resume, format!("fileprogress {name} {}\n", case.skip)).expect("resume file");
+
+    let (file_arg, resume_arg) = (
+        file.to_string_lossy().into_owned(),
+        resume.to_string_lossy().into_owned(),
+    );
+    let publisher = Publisher::spawn(
+        &["-q", &queue, "--resume", &resume_arg, &file_arg],
+        &[("SENZING_ACTIVEMQ_URL", url.as_str())],
+    );
+    let (code, out) = publisher
+        .finish(Duration::from_secs(case.exit_within_secs))
+        .await;
+    let (_stop_tx, stop) = watch::channel(true);
+    let drained = drain(
+        &url,
+        &queue,
+        stop,
+        Duration::from_secs(2),
+        Duration::from_secs(case.drained_within_secs),
+    )
+    .await;
+
+    assert_eq!(code, Some(0), "publisher exit\n{out}");
+    assert_eq!(summary_count(&out, "skipped"), case.skip as u64, "{out}");
+    assert_eq!(
+        summary_count(&out, "settled"),
+        (case.count - case.skip) as u64,
+        "{out}"
+    );
+    let last = out
+        .lines()
+        .rev()
+        .find(|l| l.starts_with(&format!("fileprogress {name} ")))
+        .unwrap_or_else(|| panic!("no fileprogress line\n{out}"));
+    assert_eq!(last, format!("fileprogress {name} {}", case.count), "{out}");
+    let seen: BTreeSet<&str> = drained.iter().map(|d| d.body.as_str()).collect();
+    let expected: BTreeSet<&str> = lines[case.skip..].iter().map(String::as_str).collect();
+    assert_eq!(
+        drained.len(),
+        case.count - case.skip,
+        "only the unpublished tail"
+    );
+    assert_eq!(seen, expected, "exactly the records after the resume point");
 }
 
 /// A broker that accepts TCP but never answers the AMQP header (its event
