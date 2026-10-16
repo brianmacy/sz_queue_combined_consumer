@@ -167,7 +167,7 @@ RUN set -eu; \
 # libs here; the Microsoft driver (msodbcsql18) + krb5/etc closure still come from
 # the backend-libs stage. glibc is forward-compatible (bookworm 2.36 libs run on
 # the cc-debian13 / glibc 2.41 runtime).
-FROM public.ecr.aws/docker/library/debian:12-slim AS odbcdm
+FROM public.ecr.aws/docker/library/debian:13-slim AS odbcdm
 RUN apt-get update && apt-get install -y --no-install-recommends unixodbc && \
     mkdir -p /dm && \
     cp -L /usr/lib/x86_64-linux-gnu/libodbc.so.2     /dm/ && \
