@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "sz-activemq-amqp"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "fe2o3-amqp",
  "percent-encoding",
@@ -3063,7 +3063,7 @@ dependencies = [
 
 [[package]]
 name = "sz-combined-consumer-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3081,11 +3081,11 @@ dependencies = [
 
 [[package]]
 name = "sz-record-transform"
-version = "0.4.1"
+version = "0.5.0"
 
 [[package]]
 name = "sz-record-transform-example"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "serde_json",
  "sz-record-transform",
@@ -3116,7 +3116,7 @@ dependencies = [
 
 [[package]]
 name = "sz_activemq_combined_consumer"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "sz_activemq_publisher"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bzip2",
@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "sz_rabbit_combined_consumer"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "sz_sqs_combined_consumer"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "aws-config",
