@@ -85,6 +85,15 @@ struct Args {
     )]
     mq_recheck_secs: u64,
 
+    /// Seconds to keep retrying an unreachable broker at startup (0 = never
+    /// give up). Bad credentials or URL still fail at once.
+    #[arg(
+        long = "reconnect-timeout",
+        env = "SENZING_ACTIVEMQ_RECONNECT_TIMEOUT",
+        default_value_t = 300
+    )]
+    reconnect_timeout: u64,
+
     #[command(flatten)]
     common: CommonArgs,
 }
@@ -133,7 +142,11 @@ fn main() -> ExitCode {
     };
 
     match params {
-        Some(params) => run_activemq(config, params, env),
+        Some(params) => {
+            let connect_timeout = (args.reconnect_timeout > 0)
+                .then(|| std::time::Duration::from_secs(args.reconnect_timeout));
+            run_activemq(config, params, env, connect_timeout)
+        }
         None if config.input_file.is_some() => runtime::run_file_loader(&config, env),
         None => runtime::run_pure_redoer(&config, env),
     }
@@ -234,9 +247,14 @@ fn validate_queue(queue: &str) -> Result<String, String> {
 /// redo% < 100: tokio runtime for the AMQP I/O layer only (engine calls run on
 /// the dedicated `sz-worker` OS threads), then the shared use-after-free exit
 /// discipline.
-fn run_activemq(config: Config, params: ActiveMqParams, env: Arc<SzEnvironmentCore>) -> ! {
+fn run_activemq(
+    config: Config,
+    params: ActiveMqParams,
+    env: Arc<SzEnvironmentCore>,
+    connect_timeout: Option<std::time::Duration>,
+) -> ! {
     queue_run::run_queue_mode(
-        activemq::run(&config, params, env),
+        activemq::run(&config, params, env, connect_timeout),
         &queue_run::ExitLogs {
             leak: "skipping Senzing environment destroy: a worker may still be in an \
                    engine call (leak-on-exit); forcing process exit",

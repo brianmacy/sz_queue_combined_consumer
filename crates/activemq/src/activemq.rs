@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use fe2o3_amqp::connection::ConnectionHandle;
+use fe2o3_amqp::connection::{ConnectionHandle, OpenError};
 use fe2o3_amqp::link::RecvError;
 use fe2o3_amqp::link::delivery::{Delivery as AmqpDelivery, DeliveryInfo};
 use fe2o3_amqp::link::receiver::CreditMode;
@@ -84,13 +84,25 @@ const REJECT_DESCRIPTION_MAX_BYTES: usize = 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bound on the orderly link/session/connection close at shutdown.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on one connect attempt (TCP + SASL + Open), so a half-up broker
+/// cannot hang the startup.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Pause between connect attempts while the broker is unreachable.
+const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// Runs the Artemis driver until SIGINT/SIGTERM/SIGHUP, a fatal engine error
 /// or the loss of the broker link.
+///
+/// `connect_timeout`: how long to keep retrying an unreachable broker at
+/// startup (`None` = forever). Without it a broker restart turned every
+/// consumer into a crash loop: exit on link loss, restart, connection
+/// refused, exit again (2026-10-14: ~7 restarts per container, each a full
+/// engine init).
 pub async fn run(
     config: &Config,
     params: ActiveMqParams,
     env: Arc<SzEnvironmentCore>,
+    connect_timeout: Option<Duration>,
 ) -> Result<RunOutcome> {
     let threads = config.threads;
     let redo_pref = config.redo_pref_workers();
@@ -106,7 +118,7 @@ pub async fn run(
     let cap = u32::try_from(config.prefetch).unwrap_or(u32::MAX);
     // The core loop spawns the engine pool BEFORE awaiting this connect (a
     // connect failure then stops it).
-    let connect = ActiveMqTransport::connect(params, cap);
+    let connect = ActiveMqTransport::connect(params, cap, connect_timeout);
     queue_loop::run(config, env, connect, ACTIVEMQ_POLICY).await
 }
 
@@ -131,20 +143,13 @@ impl ActiveMqTransport {
     /// Opens the connection (SASL PLAIN when credentials are set), a session
     /// and a manual-credit receiver on `params.queue`, then grants `cap`
     /// credit.
-    async fn connect(params: ActiveMqParams, cap: u32) -> Result<Self> {
+    async fn connect(
+        params: ActiveMqParams,
+        cap: u32,
+        connect_timeout: Option<Duration>,
+    ) -> Result<Self> {
         info!("Connecting to ActiveMQ at {}", params.url);
-        let container_id = format!("{INSTANCE_NAME}-{}", std::process::id());
-        let mut builder = Connection::builder()
-            .container_id(container_id)
-            .idle_time_out(IDLE_TIMEOUT.as_millis() as u32);
-        if let Some(c) = params.credentials {
-            builder = builder.sasl_profile(SaslProfile::Plain {
-                username: c.user,
-                password: c.password,
-            });
-        }
-        let mut connection = builder
-            .open(params.url.as_str())
+        let mut connection = connect_with_retry(&params, connect_timeout, CONNECT_RETRY_DELAY)
             .await
             .context("failed to connect to ActiveMQ")?;
         let mut session = Session::begin(&mut connection)
@@ -347,9 +352,224 @@ impl Transport for ActiveMqTransport {
     }
 }
 
+/// Opens the AMQP connection, retrying TRANSIENT failures (refused, reset,
+/// timeout — a broker restarting) every `delay` until `limit` has elapsed
+/// (`None` = forever). Permanent failures (bad credentials or URL) return at
+/// once: retrying cannot fix them.
+async fn connect_with_retry(
+    params: &ActiveMqParams,
+    limit: Option<Duration>,
+    delay: Duration,
+) -> Result<ConnectionHandle<()>> {
+    let start = std::time::Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let result = tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, open_connection(params))
+            .await
+            .map_err(|_| anyhow!("no AMQP handshake within {CONNECT_ATTEMPT_TIMEOUT:?}"))
+            .and_then(|r| r.map_err(Into::into));
+        let err = match result {
+            Ok(connection) => {
+                if attempt > 1 {
+                    info!(
+                        "connected to ActiveMQ after {attempt} attempts ({:.0}s)",
+                        start.elapsed().as_secs_f64()
+                    );
+                }
+                return Ok(connection);
+            }
+            Err(e) => e,
+        };
+        if err
+            .downcast_ref::<OpenError>()
+            .is_some_and(open_error_is_permanent)
+        {
+            return Err(err);
+        }
+        if let Some(limit) = limit
+            && start.elapsed() >= limit
+        {
+            return Err(err.context(format!(
+                "broker unreachable for {}s (--reconnect-timeout)",
+                limit.as_secs()
+            )));
+        }
+        warn!("ActiveMQ connect attempt {attempt} failed: {err:#}; retrying in {delay:?}");
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// One connect attempt: `params.url` with SASL PLAIN when credentials are set.
+async fn open_connection(params: &ActiveMqParams) -> Result<ConnectionHandle<()>, OpenError> {
+    let container_id = format!("{INSTANCE_NAME}-{}", std::process::id());
+    let mut builder = Connection::builder()
+        .container_id(container_id)
+        .idle_time_out(IDLE_TIMEOUT.as_millis() as u32);
+    if let Some(c) = &params.credentials {
+        builder = builder.sasl_profile(SaslProfile::Plain {
+            username: c.user.clone(),
+            password: c.password.clone(),
+        });
+    }
+    builder.open(params.url.as_str()).await
+}
+
+/// Whether an open error can never succeed by retrying (bad credentials, bad
+/// URL/scheme/TLS setup) — as opposed to a transport error worth a retry.
+/// Same classification as the publisher's.
+fn open_error_is_permanent(e: &OpenError) -> bool {
+    matches!(
+        e,
+        OpenError::SaslError { .. }
+            | OpenError::UrlError(_)
+            | OpenError::InvalidDomain
+            | OpenError::InvalidScheme
+            | OpenError::TlsConnectorNotFound
+            | OpenError::InvalidSchemeForSaslExternal
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn params(url: &str) -> ActiveMqParams {
+        ActiveMqParams {
+            url: url::Url::parse(url).expect("url"),
+            credentials: None,
+            queue: "q".into(),
+        }
+    }
+
+    /// A port nothing listens on (bound, then released): connects are REFUSED.
+    fn refused_url() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        drop(l);
+        format!("amqp://127.0.0.1:{port}")
+    }
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    /// Connection refused (a restarting broker) is retried until the limit,
+    /// then reported as unreachable — not a crash on the first refusal.
+    #[test]
+    fn refused_connect_is_retried_until_the_limit() {
+        let p = params(&refused_url());
+        let start = std::time::Instant::now();
+        let err = rt()
+            .block_on(connect_with_retry(
+                &p,
+                Some(Duration::from_millis(900)),
+                Duration::from_millis(200),
+            ))
+            .expect_err("nothing listens");
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(900), "gave up after {took:?}");
+        assert!(took < Duration::from_secs(5), "overran the limit: {took:?}");
+        assert!(
+            format!("{err:#}").contains("broker unreachable for"),
+            "{err:#}"
+        );
+    }
+
+    /// The fix itself: the broker is DOWN when the consumer starts and comes
+    /// up 1.5 s later — the connect must wait and then succeed (the old code
+    /// exited on the first refusal). Real broker behind a delayed TCP
+    /// forwarder; connect-only (no queue is touched). Gated on
+    /// SENZING_ACTIVEMQ_URL; fails instead of skipping under IT_REQUIRE_INFRA.
+    #[test]
+    fn connect_waits_for_a_broker_that_comes_up_late() {
+        let Some(raw) = std::env::var("SENZING_ACTIVEMQ_URL")
+            .ok()
+            .filter(|v| !v.is_empty())
+        else {
+            let required =
+                std::env::var("IT_REQUIRE_INFRA").is_ok_and(|v| !v.is_empty() && v != "0");
+            assert!(
+                !required,
+                "IT_REQUIRE_INFRA set but SENZING_ACTIVEMQ_URL is not"
+            );
+            eprintln!("SKIP: SENZING_ACTIVEMQ_URL not set");
+            return;
+        };
+        let upstream = url::Url::parse(&raw).expect("broker url");
+        let target = format!(
+            "{}:{}",
+            upstream.host_str().expect("host"),
+            upstream.port().unwrap_or(5672)
+        );
+        let credentials = (!upstream.username().is_empty()).then(|| crate::Credentials {
+            user: upstream.username().to_string(),
+            password: upstream.password().unwrap_or_default().to_string(),
+        });
+        let local = refused_url(); // nothing listens yet
+        let port = url::Url::parse(&local).expect("url").port().expect("port");
+        let p = ActiveMqParams {
+            url: url::Url::parse(&local).expect("url"),
+            credentials,
+            queue: "q".into(),
+        };
+        rt().block_on(async move {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                    .await
+                    .expect("late bind");
+                let (mut inbound, _) = listener.accept().await.expect("accept");
+                let mut outbound = tokio::net::TcpStream::connect(&target)
+                    .await
+                    .expect("upstream");
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+            let start = std::time::Instant::now();
+            let mut connection = connect_with_retry(
+                &p,
+                Some(Duration::from_secs(20)),
+                Duration::from_millis(250),
+            )
+            .await
+            .expect("must connect once the broker is up");
+            assert!(
+                start.elapsed() >= Duration::from_millis(1500),
+                "connected before the broker was up?"
+            );
+            let _ = connection.close().await;
+        });
+    }
+
+    /// A permanent error (here: a scheme fe2o3 cannot open) fails at once,
+    /// with no retry delay spent. fe2o3 checks the scheme only AFTER the TCP
+    /// connect, so a live listener is needed to reach it.
+    #[test]
+    fn permanent_connect_error_is_not_retried() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let p = params(&format!("http://127.0.0.1:{port}"));
+        let start = std::time::Instant::now();
+        let err = rt()
+            .block_on(connect_with_retry(
+                &p,
+                Some(Duration::from_secs(30)),
+                Duration::from_secs(10),
+            ))
+            .expect_err("bad scheme");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "retried a permanent error"
+        );
+        assert!(
+            err.downcast_ref::<OpenError>()
+                .is_some_and(open_error_is_permanent),
+            "{err:#}"
+        );
+    }
     use fe2o3_amqp::link::{LinkStateError, MessageSizeExceeded};
     use fe2o3_amqp::types::messaging::Data;
     use fe2o3_amqp::types::primitives::Binary;
