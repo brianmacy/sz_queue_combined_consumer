@@ -4,6 +4,32 @@ Sections headed `0.4.1 — …` ship in tag `v0.4.1` (2026-10-09); all sections 
 
 ## Unreleased
 
+### Added
+
+* **`sz_activemq_publisher` — bulk JSONL publisher for Apache ActiveMQ
+  Artemis** (new crate `crates/activemq-publisher`, no Senzing dependency).
+  Streams plain / gzip / bzip2 files (detected from content) or Spark output
+  directories (`part-*`) onto the ANYCAST queue `sz_activemq_combined_consumer`
+  reads, one AMQP `Data` section per non-blank line, durable by default.
+  Bounded in flight (`--max-pending` per file, `--parallel` files), counts
+  `settled` only on `accepted`, retries `rejected`/`released` up to
+  `--max-attempts` (then FAILED, exit 2), reconnects and re-sends on link loss
+  (bounded by `--reconnect-timeout`, at-least-once). A send blocked on broker
+  credit (`address-full-policy=BLOCK`) waits indefinitely and logs
+  `blocked on broker credit` — never treated as link loss, so no duplicates.
+  Flags follow `sz_rabbit_publisher`; see README "Loading the queue".
+* **`sz-activemq-amqp`** (new lib crate): the Artemis broker URL / SASL
+  credential resolution, connection setup, `queue`-capability terminus and
+  record body encode/decode, moved out of `sz_activemq_combined_consumer` so the
+  consumer and publisher share them (no behavior change for the consumer).
+* Tests: `crates/activemq-publisher/tests/publisher_e2e.rs` (real Artemis:
+  mixed-compression directory, BLOCK address with a tiny `maxSizeBytes` —
+  plateau then exactly-once delivery, link loss via TCP proxy, startup
+  failures) and `e2e_activemq_publisher_round_trip` in the consumer e2e
+  (publisher -> real consumer -> engine). CI runs the publisher suite before the
+  consumer suite; the release tarball ships the new binary. `deny.toml` allows
+  `bzip2-1.0.6` (libbz2-rs-sys, permissive), as in `sz_rabbit_publisher`.
+
 * **`--version` comes from the release tag.** Release builds set `RELEASE_VERSION`
   from the git tag (`core::VERSION`), and the release workflow fails if any
   binary's `--version` does not match the tag. Other builds report the workspace

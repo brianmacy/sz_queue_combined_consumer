@@ -17,9 +17,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use percent_encoding::percent_decode_str;
+use sz_activemq_amqp::{BrokerParams, parse_broker_url, validate_queue};
 use sz_rust_sdk::prelude::*;
-use url::Url;
 
 use sz_combined_consumer_core::config::{
     CommonArgs, Config, DEFAULT_MQ_RECHECK_SECS, engine_config_from_env, resolve_prefetch,
@@ -31,9 +30,6 @@ mod activemq;
 /// Instance/module name passed to the Senzing environment; also the AMQP
 /// container id and receiver link name.
 pub(crate) const INSTANCE_NAME: &str = "sz_activemq_combined_consumer";
-
-/// Separator of an Artemis fully qualified queue name (`address::queue`).
-const FQQN_SEPARATOR: &str = "::";
 
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -89,30 +85,8 @@ struct Args {
     common: CommonArgs,
 }
 
-/// SASL PLAIN credentials.
-#[derive(Clone, PartialEq, Eq)]
-pub struct Credentials {
-    pub user: String,
-    pub password: String,
-}
-
-impl std::fmt::Debug for Credentials {
-    /// Never prints the password.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Credentials {{ user: {:?}, password: *** }}", self.user)
-    }
-}
-
 /// Artemis ingestion parameters (validated), handed to the transport.
-#[derive(Debug, Clone)]
-pub struct ActiveMqParams {
-    /// Broker URL with any embedded credentials removed.
-    pub url: Url,
-    /// `None` = no SASL PLAIN (anonymous).
-    pub credentials: Option<Credentials>,
-    /// Queue name or FQQN, used as the receiver source address.
-    pub queue: String,
-}
+pub type ActiveMqParams = BrokerParams;
 
 fn main() -> ExitCode {
     runtime::init_logging();
@@ -174,63 +148,6 @@ fn build(args: &Args, engine_config: String) -> Result<(Config, Option<ActiveMqP
     ))
 }
 
-/// Parses an `amqp://` / `amqps://` URL and resolves the SASL credentials:
-/// `user` / `password` (env/flag) each override the URL's (percent-decoded)
-/// userinfo. Returns the URL stripped of credentials (so it is safe to log).
-fn parse_broker_url(
-    raw: &str,
-    user: Option<&str>,
-    password: Option<&str>,
-) -> Result<(Url, Option<Credentials>), String> {
-    let mut url = Url::parse(raw).map_err(|e| format!("invalid ActiveMQ URL: {e}"))?;
-    if !matches!(url.scheme(), "amqp" | "amqps") {
-        return Err(format!(
-            "ActiveMQ URL must use amqp:// or amqps://, got {}://",
-            url.scheme()
-        ));
-    }
-    if url.host_str().is_none_or(str::is_empty) {
-        return Err("ActiveMQ URL has no host".to_string());
-    }
-    let decode = |s: &str| percent_decode_str(s).decode_utf8_lossy().into_owned();
-    let url_user = Some(decode(url.username())).filter(|s| !s.is_empty());
-    let url_password = url.password().map(decode);
-    // Strip userinfo: credentials travel only in the SASL profile.
-    let _ = url.set_username("");
-    let _ = url.set_password(None);
-
-    let user = user.map(str::to_string).or(url_user);
-    let password = password.map(str::to_string).or(url_password);
-    let credentials = match (user.filter(|u| !u.is_empty()), password) {
-        (Some(user), password) => Some(Credentials {
-            user,
-            password: password.unwrap_or_default(),
-        }),
-        (None, Some(_)) => {
-            return Err(
-                "ActiveMQ password given without a user (set SENZING_ACTIVEMQ_USER or put \
-                 user:password in the URL)"
-                    .to_string(),
-            );
-        }
-        (None, None) => None,
-    };
-    Ok((url, credentials))
-}
-
-/// Accepts a plain queue name or an Artemis FQQN (`address::queue`, both
-/// parts non-empty).
-fn validate_queue(queue: &str) -> Result<String, String> {
-    if let Some((address, name)) = queue.split_once(FQQN_SEPARATOR)
-        && (address.is_empty() || name.is_empty() || name.contains(FQQN_SEPARATOR))
-    {
-        return Err(format!(
-            "invalid fully qualified queue name {queue:?}: expected address::queue"
-        ));
-    }
-    Ok(queue.to_string())
-}
-
 /// redo% < 100: tokio runtime for the AMQP I/O layer only (engine calls run on
 /// the dedicated `sz-worker` OS threads), then the shared use-after-free exit
 /// discipline.
@@ -269,75 +186,6 @@ mod tests {
 
     fn params(extra: &[&str]) -> Result<ActiveMqParams, String> {
         build(&args(extra), "{}".into()).map(|(_, p)| p.expect("load path builds params"))
-    }
-
-    #[test]
-    fn url_credentials_are_decoded_and_stripped() {
-        let (url, c) = parse_broker_url("amqp://us%40er:p%3Ass@host:5673", None, None).unwrap();
-        assert_eq!(url.as_str(), "amqp://host:5673");
-        let c = c.expect("credentials from URL");
-        assert_eq!((c.user.as_str(), c.password.as_str()), ("us@er", "p:ss"));
-    }
-
-    #[test]
-    fn user_and_password_override_url_userinfo() {
-        let (_, c) = parse_broker_url("amqp://a:b@h", Some("u"), None).unwrap();
-        assert_eq!(
-            c,
-            Some(Credentials {
-                user: "u".into(),
-                password: "b".into()
-            })
-        );
-        let (_, c) = parse_broker_url("amqps://a:b@h", None, Some("p")).unwrap();
-        assert_eq!(c.map(|c| c.password), Some("p".into()));
-        let (_, c) = parse_broker_url("amqp://h", Some("u"), Some("p")).unwrap();
-        assert_eq!(c.map(|c| c.user), Some("u".into()));
-    }
-
-    #[test]
-    fn anonymous_without_any_credentials() {
-        let (url, c) = parse_broker_url("amqp://localhost:5672", None, None).unwrap();
-        assert_eq!(
-            (url.host_str(), url.port(), c),
-            (Some("localhost"), Some(5672), None)
-        );
-    }
-
-    #[test]
-    fn password_without_user_is_an_error() {
-        let err = parse_broker_url("amqp://h", None, Some("p")).unwrap_err();
-        assert!(err.contains("without a user"), "{err}");
-        assert!(parse_broker_url("amqp://:p@h", None, None).is_err());
-    }
-
-    #[test]
-    fn url_scheme_and_host_are_validated() {
-        assert!(
-            parse_broker_url("http://h", None, None)
-                .unwrap_err()
-                .contains("amqp://")
-        );
-        assert!(parse_broker_url("not a url", None, None).is_err());
-        assert!(parse_broker_url("amqp://", None, None).is_err());
-    }
-
-    #[test]
-    fn credentials_debug_hides_the_password() {
-        let c = Credentials {
-            user: "u".into(),
-            password: "secret".into(),
-        };
-        assert!(!format!("{c:?}").contains("secret"));
-    }
-
-    #[test]
-    fn queue_accepts_plain_and_fqqn() {
-        assert_eq!(validate_queue("q").unwrap(), "q");
-        assert_eq!(validate_queue("addr::q").unwrap(), "addr::q");
-        for bad in ["::q", "addr::", "a::b::c"] {
-            assert!(validate_queue(bad).is_err(), "{bad}");
-        }
     }
 
     #[test]
