@@ -215,15 +215,25 @@ fn create_repo(base: &str) -> Repo {
     // A byte copy of the still-empty, configured repository for tests that
     // need a PRIVATE repository to break. The database is in WAL mode and
     // idle here (no writer, no checkpoint), so the main file plus its WAL is
-    // a consistent snapshot. NEVER open the shared repository with libsqlite3-sys:
-    // a second SQLite library in this process would release the engine's
-    // POSIX locks on close and corrupt it.
+    // a consistent snapshot. NEVER open the shared repository in this process
+    // except through the engine: on Linux, closing ANY descriptor on the file
+    // releases all of the process's POSIX locks on it, so a second SQLite
+    // library, or `std::fs::copy`, would drop the engine's locks and corrupt
+    // it. The copy runs in a child process, whose descriptors are its own.
     for (from, to) in sqlite_files(&db)
         .into_iter()
         .zip(sqlite_files(&pristine(&work)))
     {
         if from.exists() {
-            std::fs::copy(&from, &to).expect("snapshot the pristine repository");
+            let status = Command::new("cp")
+                .arg(&from)
+                .arg(&to)
+                .status()
+                .expect("run cp");
+            assert!(
+                status.success(),
+                "snapshot the pristine repository: {status}"
+            );
         }
     }
     Repo {
