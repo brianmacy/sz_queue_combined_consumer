@@ -726,7 +726,7 @@ sz_rabbit_combined_consumer --file /data/records.jsonl.rejected.jsonl \
 | SQS e2e | `cargo test -p sz_sqs_combined_consumer --test sqs_e2e -- --nocapture --test-threads=1` | ElasticMQ + engine |
 | ActiveMQ publisher e2e | `cargo test -p sz_activemq_publisher --test publisher_e2e -- --nocapture --test-threads=1` | Artemis (AMQP + Jolokia); no engine |
 | ActiveMQ e2e | `cargo test -p sz_activemq_combined_consumer --test activemq_e2e -- --nocapture --test-threads=1` | Artemis (AMQP + Jolokia) + engine; run after the publisher suite (its round-trip test runs `target/debug/sz_activemq_publisher`) |
-| INFO sink + drain cap e2e | `cargo test -p sz_rabbit_combined_consumer --test info_sink_e2e -- --nocapture --test-threads=1` | engine only (creates its own throwaway SQLite repository from `PIPELINE` in `SENZING_ENGINE_CONFIGURATION_JSON`); the queue-mode cases also need `SENZING_AMQP_URL` |
+| INFO sink + drain cap e2e | `cargo test -p sz_rabbit_combined_consumer --test info_sink_e2e -- --nocapture --test-threads=1` | engine only (creates its own throwaway SQLite repository from `PIPELINE` in `SENZING_ENGINE_CONFIGURATION_JSON`; copies `templates/G2C.db.template`, or the file named by `SZ_E2E_SQLITE_TEMPLATE` on Linux packages that ship only the schema DDL); the queue-mode cases also need `SENZING_AMQP_URL` |
 
 `.github/workflows/ci.yml` runs fmt + clippy, the release build + unit tests,
 the e2e suites in one `integration` job (Postgres, RabbitMQ, ElasticMQ

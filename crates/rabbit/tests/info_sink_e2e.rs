@@ -172,6 +172,18 @@ fn repo() -> Option<&'static Repo> {
     .as_ref()
 }
 
+/// The empty SQLite repository to copy. macOS packages ship
+/// `templates/G2C.db.template`; the Linux packages ship only the schema DDL,
+/// so CI builds the file from it and points `SZ_E2E_SQLITE_TEMPLATE` here.
+fn sqlite_template(resources: &str) -> PathBuf {
+    std::env::var_os("SZ_E2E_SQLITE_TEMPLATE")
+        .filter(|p| !p.is_empty())
+        .map_or_else(
+            || Path::new(resources).join("templates/G2C.db.template"),
+            PathBuf::from,
+        )
+}
+
 fn create_repo(base: &str) -> Repo {
     let base: Value = serde_json::from_str(base).expect("engine config is JSON");
     let pipeline = base["PIPELINE"].clone();
@@ -182,8 +194,7 @@ fn create_repo(base: &str) -> Repo {
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).expect("mkdir work");
     let db = work.join("G2C.db");
-    std::fs::copy(Path::new(resources).join("templates/G2C.db.template"), &db)
-        .expect("copy SQLite template");
+    std::fs::copy(sqlite_template(resources), &db).expect("copy SQLite template");
     let engine_config = serde_json::json!({
         "PIPELINE": pipeline,
         "SQL": {"CONNECTION": format!("sqlite3://na:na@{}", db.display())},

@@ -281,9 +281,20 @@ jobs:
         # parallel get_instance() calls race its init. Serialize the suite.
         run: cargo test -p sz_rabbit_combined_consumer --test integration_test -- --nocapture --test-threads=1
 
+      - name: Build the empty SQLite repository for the e2e tests
+        # The Linux packages ship the schema DDL but no G2C.db.template (the
+        # macOS cask does), so build the empty repository from the DDL. Python's
+        # sqlite3 runs in its own process; the test copies this file per repo.
+        run: |
+          python3 -I -c 'import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); db.executescript(open(sys.argv[2]).read()); db.commit()' \
+            /tmp/sz_e2e_sqlite_template.db \
+            /opt/senzing/er/resources/schema/szcore-schema-sqlite-create.sql
+
       - name: Run INFO sink + redo drain cap e2e tests (throwaway SQLite)
         # Borrows PIPELINE from SENZING_ENGINE_CONFIGURATION_JSON and creates
-        # its own SQLite repository from the SDK template (no broker needed).
+        # its own SQLite repository from the file built above (no broker needed).
+        env:
+          SZ_E2E_SQLITE_TEMPLATE: /tmp/sz_e2e_sqlite_template.db
         run: cargo test -p sz_rabbit_combined_consumer --test info_sink_e2e -- --nocapture --test-threads=1
 
       - name: Run SQS e2e tests (ElasticMQ)

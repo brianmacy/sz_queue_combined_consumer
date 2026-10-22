@@ -50,7 +50,8 @@ Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections head
   call fails). Opt-in `"seal_marker": true` writes an empty `<file>.sealed`
   after each seal. Files appear under their final name before they are sealed.
 * Tests: new `info_sink_e2e` suite (real engine on a throwaway SQLite
-  repository; queue-mode case on RabbitMQ), added to the CI integration job;
+  repository, built in CI from the schema DDL because the Linux packages ship no
+  `G2C.db.template`; queue-mode case on RabbitMQ), added to the CI integration job;
   covers SIGKILL durability, a sink failing mid-load, timed seals during the
   load, the drained-at-cap case and failed redo INFO writes. Benchmarks (ignored
   tests): `bench_unbuffered_vs_buffered_100k_lines` (plugin) and
