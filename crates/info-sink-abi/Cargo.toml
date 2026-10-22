@@ -1,0 +1,18 @@
+[package]
+name = "sz-info-sink"
+description = "C ABI contract (and a Rust export macro) for INFO sink plugins that receive every WITH_INFO payload from the combined consumer"
+version.workspace = true
+publish = false  # not published to crates.io
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "sz_info_sink"
+path = "src/lib.rs"
+
+[dependencies]
+# Shared plugin-side helpers (error strings, free, config decoding, panic
+# messages): the same conventions as the record-transform ABI.
+sz-record-transform.workspace = true

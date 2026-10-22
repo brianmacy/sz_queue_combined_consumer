@@ -100,8 +100,8 @@ pub fn spawn_engine_pool(config: &Config, env: &Arc<SzEnvironmentCore>) -> Resul
     let started: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
     let shutdown_notify = Arc::new(Notify::new());
 
-    let add_flags = add_record_flags(config.info);
-    let rflags = redo_flags(config.info);
+    let add_flags = add_record_flags(config.with_info());
+    let rflags = redo_flags(config.with_info());
     let want_info = config.info;
 
     // --- Redo side (only when redo% > 0) -------------------------------------
@@ -156,6 +156,8 @@ pub fn spawn_engine_pool(config: &Config, env: &Arc<SzEnvironmentCore>) -> Resul
             redo_flags: rflags,
             want_info,
             transform: config.transform.clone(),
+            info_sink: config.info_sink.clone(),
+            redo_stats_interval: config.redo_stats_interval,
         };
         let handle = std::thread::Builder::new()
             .name(format!("sz-worker-{worker_id}"))

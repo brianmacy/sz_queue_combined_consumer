@@ -219,6 +219,12 @@ pub static RUNNING: AtomicBool = AtomicBool::new(true);
 /// non-zero after orderly teardown.
 pub static WORKER_FATAL: AtomicBool = AtomicBool::new(false);
 
+/// Set by the redo fetcher when the file-mode redo drain cap
+/// (`--redo-drain-max-secs`) stopped redo fetching before the queue drained.
+/// Not a fatal error: the run finishes its orderly teardown and exits with
+/// `runtime::EXIT_REDO_DRAIN_CAP`.
+pub static REDO_DRAIN_CAP_EXPIRED: AtomicBool = AtomicBool::new(false);
+
 pub static ADDS_PROCESSED: AtomicUsize = AtomicUsize::new(0);
 pub static ADDS_REJECTED: AtomicUsize = AtomicUsize::new(0);
 pub static REDOS_PROCESSED: AtomicUsize = AtomicUsize::new(0);
@@ -242,6 +248,12 @@ static START_TIME: OnceLock<Instant> = OnceLock::new();
 /// Process start time (first call wins; call once early in `main`).
 pub fn start_time() -> Instant {
     *START_TIME.get_or_init(Instant::now)
+}
+
+/// Throughput of `count` items over `secs` seconds; 0 when no time has
+/// elapsed (never a division by zero).
+pub fn per_sec(count: usize, secs: f64) -> f64 {
+    if secs > 0.0 { count as f64 / secs } else { 0.0 }
 }
 
 /// Inputs for one `Combined stats:` status line (design §7).
@@ -327,6 +339,13 @@ fn mode(s: &StatusLine) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_sec_divides_and_never_by_zero() {
+        assert_eq!(per_sec(10, 4.0), 2.5);
+        assert_eq!(per_sec(10, 0.0), 0.0, "no elapsed time: 0, not inf");
+        assert_eq!(per_sec(0, 3.0), 0.0);
+    }
 
     #[test]
     fn throughput_ticker_fires_only_on_interval_boundary_crossings() {

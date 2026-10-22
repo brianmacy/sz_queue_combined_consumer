@@ -13,6 +13,10 @@ members = [
     "crates/activemq-publisher",
     "crates/transform-abi",
     "crates/transform-example",
+    "crates/info-sink-abi",
+    "crates/info-sink-file",
+    "crates/info-sink-abi-v2-fixture",
+    "crates/info-sink-fault-fixture",
 ]
 
 [workspace.package]
@@ -70,6 +74,8 @@ sz-combined-consumer-core = { path = "crates/core" }
 sz-activemq-amqp = { path = "crates/activemq-amqp" }
 # Record-transform plugin ABI (no Senzing dependency; plugins depend on it too).
 sz-record-transform = { path = "crates/transform-abi" }
+# INFO sink plugin ABI (no Senzing dependency; plugins depend on it too).
+sz-info-sink = { path = "crates/info-sink-abi" }
 
 [profile.release]
 opt-level = 3

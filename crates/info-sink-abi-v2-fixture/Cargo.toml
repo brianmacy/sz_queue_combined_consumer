@@ -1,0 +1,14 @@
+[package]
+name = "sz-info-sink-abi-v2-fixture"
+description = "Test fixture (cdylib): an INFO sink plugin from a future ABI version 2 that exports only sz_is_abi_version, so the loader's version check can be tested against a real library"
+version.workspace = true
+publish = false  # test fixture, never published
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "sz_info_sink_abi_v2_fixture"
+path = "src/lib.rs"
+crate-type = ["cdylib"]

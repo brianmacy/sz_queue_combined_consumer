@@ -2015,6 +2015,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
+name = "libsqlite3-sys"
+version = "0.38.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2634,9 +2645,9 @@ checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -3071,12 +3082,44 @@ dependencies = [
  "libc",
  "num_cpus",
  "serde_json",
+ "sz-info-sink",
+ "sz-info-sink-abi-v2-fixture",
+ "sz-info-sink-file",
  "sz-record-transform",
  "sz-record-transform-example",
  "sz-rust-sdk",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sz-info-sink"
+version = "0.5.0"
+dependencies = [
+ "sz-record-transform",
+]
+
+[[package]]
+name = "sz-info-sink-abi-v2-fixture"
+version = "0.5.0"
+
+[[package]]
+name = "sz-info-sink-fault-fixture"
+version = "0.5.0"
+dependencies = [
+ "serde_json",
+ "sz-info-sink",
+]
+
+[[package]]
+name = "sz-info-sink-file"
+version = "0.5.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sz-info-sink",
 ]
 
 [[package]]
@@ -3164,10 +3207,13 @@ dependencies = [
  "futures-lite",
  "lapin",
  "libc",
+ "libsqlite3-sys",
  "serde",
  "serde_json",
  "serde_norway",
  "sz-combined-consumer-core",
+ "sz-info-sink-fault-fixture",
+ "sz-info-sink-file",
  "sz-record-transform-example",
  "sz-rust-sdk",
  "tokio",
@@ -3518,6 +3564,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
+
+[[package]]
 name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3615,18 +3667,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]

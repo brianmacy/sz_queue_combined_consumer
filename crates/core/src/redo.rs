@@ -30,19 +30,38 @@
 //!   outstanding work before the FIRST empty probe means nothing in this
 //!   process can enqueue new redo afterwards; the second probe absorbs redo
 //!   still arriving from sibling processes on the same store.
+//! * Drain cap (file mode only, `--redo-drain-max-secs`, opt-in: default 0 =
+//!   off): the drain tail is bounded. The clock starts when the input file has
+//!   been read to the end (EOF), so a slow load never eats into it. Whichever
+//!   comes first ends redo fetching: the two-empty-probe drain exit above
+//!   (exit 0) or the cap. The cap can expire while the drain rule is still
+//!   waiting for its second empty probe (a cap shorter than
+//!   2 x `redo_sleep_secs` always does), so at expiry the fetcher first
+//!   makes ONE final probe when the input is done and nothing it fetched is
+//!   outstanding: an empty probe means redo is drained and the run ends
+//!   normally (exit 0, no cap flag). Otherwise (work outstanding, or the
+//!   probe returned a record, which is still handed over and processed) the
+//!   fetcher stops fetching (a record it already fetched is still processed),
+//!   sets [`REDO_DRAIN_CAP_EXPIRED`], and the run exits with
+//!   `runtime::EXIT_REDO_DRAIN_CAP` after the file loader logs how many redo
+//!   records remain queued. A shutdown signal or a fatal error is never
+//!   reported as a cap expiry (see [`stop_reason`]).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sz_rust_sdk::prelude::*;
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::record::RecordInfo;
-use crate::stats::{ERRORS, REDO_IN_FLIGHT, REDOS_DROPPED, REDOS_PROCESSED, RUNNING, WORKER_FATAL};
+use crate::stats::{
+    ERRORS, REDO_DRAIN_CAP_EXPIRED, REDO_IN_FLIGHT, REDOS_DROPPED, REDOS_PROCESSED, RUNNING,
+    WORKER_FATAL,
+};
 use crate::worker::{Action, Outcome, RedoJob};
 
 /// Monotonic id source for redo jobs (keys the in-flight map).
@@ -58,9 +77,87 @@ pub const DRAIN_EXIT_EMPTY_PROBES: u32 = 2;
 /// File-mode drain-exit wiring for [`fetcher_loop`]. `input_done` is set by
 /// the file loader once the file is exhausted AND every dispatched load record
 /// has reported an outcome (a still-running `add_record` can enqueue redo).
+/// `input_read_at` is set once, when the reader hits end of file: the drain
+/// cap's clock (`max_drain`, `None` = no cap).
 #[derive(Clone)]
 pub struct DrainExit {
     pub input_done: Arc<AtomicBool>,
+    pub input_read_at: Arc<OnceLock<Instant>>,
+    pub max_drain: Option<Duration>,
+}
+
+impl DrainExit {
+    /// Fresh wiring: input not done, clock not started.
+    pub fn new(max_drain: Option<Duration>) -> Self {
+        Self {
+            input_done: Arc::new(AtomicBool::new(false)),
+            input_read_at: Arc::new(OnceLock::new()),
+            max_drain,
+        }
+    }
+
+    /// Starts the drain-cap clock (first call wins).
+    pub fn mark_input_read(&self) {
+        let _ = self.input_read_at.set(Instant::now());
+    }
+
+    /// `true` once the drain cap has elapsed since end of input.
+    pub fn cap_expired(&self) -> bool {
+        cap_expired(
+            self.input_read_at.get().copied(),
+            self.max_drain,
+            Instant::now(),
+        )
+    }
+}
+
+/// `--redo-drain-max-secs` as a cap: `0` disables it.
+pub fn drain_cap(secs: u64) -> Option<Duration> {
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// Pure drain-cap check: `max` has elapsed since end of input (`eof`) at
+/// `now`. No EOF yet, or no cap, never expires.
+pub fn cap_expired(eof: Option<Instant>, max: Option<Duration>, now: Instant) -> bool {
+    match (eof, max) {
+        (Some(eof), Some(max)) => now.saturating_duration_since(eof) >= max,
+        _ => false,
+    }
+}
+
+/// Why the fetcher stops before its next probe (other exits — drained,
+/// fatal fetch error, channel gone — happen inside the loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetcherStop {
+    /// Shutdown signal or fatal error elsewhere (`RUNNING` = false).
+    Shutdown,
+    /// The file-mode drain cap elapsed.
+    DrainCap,
+}
+
+/// The fetcher's stop decision. A shutdown always wins over the cap so a
+/// SIGTERM or fatal run keeps its own exit code.
+pub fn stop_reason(running: bool, cap_expired: bool) -> Option<FetcherStop> {
+    match (running, cap_expired) {
+        (false, _) => Some(FetcherStop::Shutdown),
+        (true, true) => Some(FetcherStop::DrainCap),
+        (true, false) => None,
+    }
+}
+
+/// At cap expiry: is redo drained? Only when the input is done, nothing
+/// this fetcher handed out is outstanding, and the final probe was empty.
+pub fn drained_at_cap(input_done: bool, quiescent: bool, probe_empty: bool) -> bool {
+    input_done && quiescent && probe_empty
+}
+
+/// `true` when a cap is set below what the two-empty-probe drain rule needs
+/// (2 x `redo_sleep_secs`), so it routinely expires before the rule can
+/// confirm an empty queue (startup warning; the final probe still decides).
+pub fn cap_shorter_than_drain_rule(cap: Option<Duration>, redo_sleep_secs: u64) -> bool {
+    cap.is_some_and(|c| {
+        c < Duration::from_secs(redo_sleep_secs.saturating_mul(u64::from(DRAIN_EXIT_EMPTY_PROBES)))
+    })
 }
 
 /// Pure decision state for the drain exit (unit-tested without an engine).
@@ -81,6 +178,28 @@ impl DrainGate {
             self.consecutive_empty = 0;
         }
         self.consecutive_empty >= DRAIN_EXIT_EMPTY_PROBES
+    }
+}
+
+/// Marks the process fatal from the fetcher and (mixed mode) hands the async
+/// side its durable fatal signal plus a wakeup.
+fn fetcher_fatal(
+    result_tx: Option<&mpsc::Sender<Outcome>>,
+    shutdown_notify: Option<&Arc<Notify>>,
+    msg: String,
+) {
+    ERRORS.fetch_add(1, Ordering::Relaxed);
+    WORKER_FATAL.store(true, Ordering::Relaxed);
+    RUNNING.store(false, Ordering::Relaxed);
+    if let Some(result_tx) = result_tx {
+        let _ = result_tx.blocking_send(Outcome {
+            delivery_tag: 0,
+            info: RecordInfo::empty(),
+            action: Action::Fatal(msg),
+        });
+    }
+    if let Some(notify) = shutdown_notify {
+        notify.notify_waiters();
     }
 }
 
@@ -112,19 +231,11 @@ pub fn fetcher_loop(
             // Fatal misconfiguration: signal durably and exit (dropping `tx`
             // closes redo_ch so redo-capable workers stop polling it).
             error!("redo fetcher: failed to get engine: {e}");
-            ERRORS.fetch_add(1, Ordering::Relaxed);
-            WORKER_FATAL.store(true, Ordering::Relaxed);
-            RUNNING.store(false, Ordering::Relaxed);
-            if let Some(result_tx) = &result_tx {
-                let _ = result_tx.blocking_send(Outcome {
-                    delivery_tag: 0,
-                    info: RecordInfo::empty(),
-                    action: Action::Fatal(format!("redo fetcher could not initialize engine: {e}")),
-                });
-            }
-            if let Some(notify) = &shutdown_notify {
-                notify.notify_waiters();
-            }
+            fetcher_fatal(
+                result_tx.as_ref(),
+                shutdown_notify.as_ref(),
+                format!("redo fetcher could not initialize engine: {e}"),
+            );
             return;
         }
     };
@@ -133,7 +244,58 @@ pub fn fetcher_loop(
     // Records this fetcher has handed to the workers (drain-exit quiescence).
     let mut sent: usize = 0;
 
-    while RUNNING.load(Ordering::Relaxed) {
+    let cap_hit = || drain_exit.as_ref().is_some_and(DrainExit::cap_expired);
+    loop {
+        match stop_reason(RUNNING.load(Ordering::Relaxed), cap_hit()) {
+            None => {}
+            Some(FetcherStop::Shutdown) => break,
+            Some(FetcherStop::DrainCap) => {
+                let drain = drain_exit
+                    .as_ref()
+                    .expect("the cap exists only with DrainExit");
+                let input_done = drain.input_done.load(Ordering::Acquire);
+                let quiescent = REDOS_PROCESSED.load(Ordering::Relaxed)
+                    + REDOS_DROPPED.load(Ordering::Relaxed)
+                    >= sent;
+                // The final probe (only when it can prove a drain).
+                let probe = if input_done && quiescent {
+                    match engine.get_redo_record() {
+                        Ok(record) => Some(record),
+                        Err(e) => {
+                            error!("Error retrieving redo record: {e}");
+                            fetcher_fatal(
+                                result_tx.as_ref(),
+                                shutdown_notify.as_ref(),
+                                format!("redo fetcher: {e}"),
+                            );
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let probe_empty = probe.as_ref().is_some_and(|r| r.trim().is_empty());
+                if drained_at_cap(input_done, quiescent, probe_empty) {
+                    info!(
+                        "redo drain cap reached, but the final probe found the redo queue empty \
+                         with nothing outstanding; redo drained, stopping"
+                    );
+                    break;
+                }
+                if let Some(record) = probe.filter(|r| !r.trim().is_empty()) {
+                    // Already dequeued: hand it over so it is still processed.
+                    let id = NEXT_REDO_ID.fetch_add(1, Ordering::Relaxed);
+                    let _ = send_interruptible(&tx, (id, record));
+                }
+                REDO_DRAIN_CAP_EXPIRED.store(true, Ordering::Relaxed);
+                warn!(
+                    "redo drain cap reached ({}s after the input was read); no longer fetching \
+                     redo (records already fetched are still processed)",
+                    drain.max_drain.map_or(0, |d| d.as_secs())
+                );
+                break;
+            }
+        }
         // Periodic live-config-reload check (throttled process-globally; this is
         // the redo reader thread — see config_reload).
         crate::config_reload::poll(&env);
@@ -146,19 +308,11 @@ pub fn fetcher_loop(
             Err(e) => {
                 // Fatal engine/DB failure: tear the process down loudly.
                 error!("Error retrieving redo record: {e}");
-                ERRORS.fetch_add(1, Ordering::Relaxed);
-                WORKER_FATAL.store(true, Ordering::Relaxed);
-                RUNNING.store(false, Ordering::Relaxed);
-                if let Some(result_tx) = &result_tx {
-                    let _ = result_tx.blocking_send(Outcome {
-                        delivery_tag: 0,
-                        info: RecordInfo::empty(),
-                        action: Action::Fatal(format!("redo fetcher: {e}")),
-                    });
-                }
-                if let Some(notify) = &shutdown_notify {
-                    notify.notify_waiters();
-                }
+                fetcher_fatal(
+                    result_tx.as_ref(),
+                    shutdown_notify.as_ref(),
+                    format!("redo fetcher: {e}"),
+                );
                 break;
             }
         };
@@ -176,12 +330,15 @@ pub fn fetcher_loop(
                 );
                 break;
             }
+            // The cap also cuts a pause short (the drain tail must not
+            // overrun it by up to a full --redo-sleep-secs).
+            let keep_sleeping = || !cap_hit();
             if REDO_IN_FLIGHT.load(Ordering::Relaxed) > 0 {
                 debug!("redo queue empty but redo still in flight; re-probing for cascades");
-                interruptible_sleep(DRAIN_TAIL_REPROBE.min(sleep_dur));
+                interruptible_sleep_while(DRAIN_TAIL_REPROBE.min(sleep_dur), keep_sleeping);
             } else {
                 info!("No redo records available. Pausing for {redo_sleep_secs} seconds.");
-                interruptible_sleep(sleep_dur);
+                interruptible_sleep_while(sleep_dur, keep_sleeping);
             }
             continue;
         }
@@ -225,9 +382,14 @@ fn send_interruptible(tx: &SyncSender<RedoJob>, mut job: RedoJob) -> Result<(), 
 /// Sleep up to `dur`, waking early (in 250 ms steps) if shutdown is requested
 /// (redoer parity).
 pub fn interruptible_sleep(dur: Duration) {
+    interruptible_sleep_while(dur, || true);
+}
+
+/// [`interruptible_sleep`] that also wakes early once `keep` returns `false`.
+pub fn interruptible_sleep_while(dur: Duration, keep: impl Fn() -> bool) {
     let step = Duration::from_millis(250);
     let mut remaining = dur;
-    while remaining > Duration::ZERO && RUNNING.load(Ordering::Relaxed) {
+    while remaining > Duration::ZERO && RUNNING.load(Ordering::Relaxed) && keep() {
         let nap = remaining.min(step);
         thread::sleep(nap);
         remaining = remaining.saturating_sub(nap);
@@ -237,6 +399,7 @@ pub fn interruptible_sleep(dur: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn drain_gate_exits_only_after_consecutive_quiescent_empty_probes_post_input() {
@@ -249,6 +412,86 @@ mod tests {
         assert!(!g.observe(true, true, true));
         // ...the second consecutive one is.
         assert!(g.observe(true, true, true));
+    }
+
+    #[test]
+    fn drain_cap_clock_starts_only_once_input_is_read() {
+        let max = Some(Duration::from_secs(5));
+        let t0 = Instant::now();
+        // No EOF yet: the cap never fires, however long the load takes.
+        assert!(!cap_expired(None, max, t0 + Duration::from_secs(3600)));
+        // EOF at t0: not yet / exactly at / past the cap.
+        assert!(!cap_expired(Some(t0), max, t0 + Duration::from_secs(4)));
+        assert!(cap_expired(Some(t0), max, t0 + Duration::from_secs(5)));
+        assert!(cap_expired(Some(t0), max, t0 + Duration::from_secs(6)));
+        // A clock reading before EOF (cannot happen, but must not underflow).
+        assert!(!cap_expired(Some(t0 + Duration::from_secs(1)), max, t0));
+    }
+
+    #[test]
+    fn cap_expiry_is_a_drain_only_with_an_empty_final_probe_and_nothing_outstanding() {
+        assert!(drained_at_cap(true, true, true), "drained: exit 0");
+        assert!(!drained_at_cap(true, true, false), "probe returned redo");
+        assert!(!drained_at_cap(true, false, true), "redo still outstanding");
+        assert!(!drained_at_cap(false, true, true), "adds still running");
+    }
+
+    #[test]
+    fn a_cap_below_two_redo_sleeps_is_flagged() {
+        let s = |n| Some(Duration::from_secs(n));
+        assert!(cap_shorter_than_drain_rule(s(3), 10), "reviewer case");
+        assert!(cap_shorter_than_drain_rule(s(19), 10));
+        assert!(!cap_shorter_than_drain_rule(s(20), 10));
+        assert!(!cap_shorter_than_drain_rule(None, 10), "no cap");
+        assert!(!cap_shorter_than_drain_rule(s(3600), 60));
+    }
+
+    #[test]
+    fn drain_cap_zero_or_unset_disables_it() {
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(1_000_000);
+        assert!(!cap_expired(Some(t0), None, later));
+        assert_eq!(drain_cap(0), None, "0 disables the cap");
+        assert_eq!(drain_cap(3600), Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn fetcher_stop_reason_prefers_shutdown_over_cap() {
+        assert_eq!(stop_reason(true, false), None, "keep fetching");
+        assert_eq!(stop_reason(true, true), Some(FetcherStop::DrainCap));
+        // SIGTERM / fatal (RUNNING = false) is never reported as a cap expiry,
+        // even when the cap has also passed: the exit code stays the
+        // shutdown's (0 for a signal, 255 for a fatal).
+        assert_eq!(stop_reason(false, false), Some(FetcherStop::Shutdown));
+        assert_eq!(stop_reason(false, true), Some(FetcherStop::Shutdown));
+    }
+
+    #[test]
+    fn drain_exit_reports_cap_from_its_own_clock() {
+        let d = DrainExit::new(Some(Duration::from_secs(60)));
+        assert!(!d.cap_expired(), "no EOF yet");
+        d.mark_input_read();
+        assert!(!d.cap_expired(), "EOF just now, 60 s cap");
+        let first = *d.input_read_at.get().expect("set");
+        d.mark_input_read();
+        assert_eq!(
+            *d.input_read_at.get().expect("set"),
+            first,
+            "the clock starts once; later marks do not restart it"
+        );
+        let unlimited = DrainExit::new(None);
+        unlimited.mark_input_read();
+        assert!(!unlimited.cap_expired());
+    }
+
+    #[test]
+    fn interruptible_sleep_while_returns_early_when_told_to_stop() {
+        let start = Instant::now();
+        interruptible_sleep_while(Duration::from_secs(30), || false);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        let start = Instant::now();
+        interruptible_sleep_while(Duration::from_millis(300), || true);
+        assert!(start.elapsed() >= Duration::from_millis(300));
     }
 
     #[test]

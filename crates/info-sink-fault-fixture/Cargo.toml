@@ -1,0 +1,18 @@
+[package]
+name = "sz-info-sink-fault-fixture"
+description = "Test fixture (cdylib): an INFO sink plugin whose flush or close fails or blocks forever on command (config string), so the consumer's sink-failure and stuck-sink paths can be tested end to end through the real loader"
+version.workspace = true
+publish = false  # test fixture, never published
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "sz_info_sink_fault_fixture"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+sz-info-sink.workspace = true
+serde_json.workspace = true

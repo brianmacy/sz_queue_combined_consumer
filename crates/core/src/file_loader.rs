@@ -47,7 +47,24 @@
 //!   `get_redo_record()` probes `--redo-sleep-secs` apart with no redo
 //!   outstanding in this process (see `redo` module docs). That closes the redo
 //!   channel, the workers exit, and the process exits 0.
+//! * Drain cap (`--redo-drain-max-secs`, opt-in: default 0 = off): the clock
+//!   starts when the reader reaches end of file. If redo has not drained by
+//!   then, the fetcher stops fetching (already-fetched records still run),
+//!   the workers finish, the remaining redo count is logged and the process
+//!   exits `runtime::EXIT_REDO_DRAIN_CAP` (3) — non-zero although nothing
+//!   failed, so a scheduler sees the backlog was left behind.
 //! * SIGTERM / fatal: stop reading and fetching; bounded grace as elsewhere.
+//!   A SIGTERM before the drain cap expires is a clean stop (exit 0), never
+//!   a cap expiry; after the cap expired the exit is already 3 and a SIGTERM
+//!   does not change it.
+//! * INFO sink (optional): flushed every `--info-sink-flush-secs` by its own
+//!   timer thread (so timed seals also happen while the reader is blocked
+//!   feeding a busy pool), stopped before the final close, and closed explicitly after the pool is joined (or the grace
+//!   ran out), before `main` tears the engine down. Any sink error is fatal.
+//!   With a sink, the printed resume point is the watermark captured just
+//!   before the last SUCCESSFUL seal (flush or close): every line up to it
+//!   has its INFO in a sealed file. After a sink failure the run exits
+//!   non-zero and the resume point stays there, never past it.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -63,10 +80,12 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::config::{Config, redo_preferring_count};
+use crate::info_sink::{CLOSE_TIMEOUT, FlushTimer, InfoSinkHandle, fail_fatal};
 use crate::record::parse_record;
 use crate::redo::{DrainExit, fetcher_loop};
 use crate::stats::{
-    self, ADDS_PROCESSED, ADDS_REJECTED, ERRORS, REDOS_PROCESSED, RUNNING, WORKER_FATAL,
+    self, ADDS_PROCESSED, ADDS_REJECTED, ERRORS, REDO_DRAIN_CAP_EXPIRED, REDOS_PROCESSED, RUNNING,
+    WORKER_FATAL,
 };
 use crate::worker::{
     Action, Class, LoadItem, LoadSide, Outcome, RedoInFlight, RedoJob, RedoSide, SHUTDOWN_GRACE,
@@ -200,6 +219,81 @@ fn load_input_done(reader_finished: bool, dispatched: u64, outcomes: u64) -> boo
     reader_finished && outcomes >= dispatched
 }
 
+/// The `--skip-lines` value to print. Without a sink it is the completion
+/// watermark; with one it is capped at `sealed`, the watermark captured just
+/// before the last successful seal, so a resume never skips a line whose
+/// INFO did not reach a sealed file.
+fn resume_point(sink_enabled: bool, sealed: u64, watermark: u64) -> u64 {
+    if sink_enabled {
+        sealed.min(watermark)
+    } else {
+        watermark
+    }
+}
+
+/// Poll step of the flush thread (bounds how late a stop is noticed).
+const FLUSH_POLL: Duration = Duration::from_millis(100);
+
+/// Timed INFO sink flushes on their own thread. Each successful flush
+/// publishes the watermark captured just before it into `sealed`; a failed
+/// flush is fatal and ends the thread.
+fn flush_loop(
+    sink: InfoSinkHandle,
+    every: Duration,
+    resume: Arc<Mutex<ResumeTracker>>,
+    sealed: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+) {
+    let mut timer = FlushTimer::new(every);
+    let running = || !stop.load(Ordering::Acquire) && RUNNING.load(Ordering::Relaxed);
+    while running() {
+        std::thread::sleep(FLUSH_POLL.min(every));
+        if !running() || !timer.due() {
+            continue;
+        }
+        // Captured BEFORE the seal: every line up to it was acknowledged
+        // after its INFO write returned, so the seal covers it.
+        let wm = watermark(&resume);
+        match sink.flush() {
+            Ok(()) => sealed.store(wm, Ordering::Release),
+            Err(e) => {
+                fail_fatal(&e);
+                break;
+            }
+        }
+    }
+}
+
+/// Stops the flush thread and waits up to `timeout` for it (a flush in
+/// progress finishes first, so it can never race the final close). `false`:
+/// it is stuck inside a flush.
+fn stop_flusher(
+    flusher: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
+    timeout: Duration,
+) -> bool {
+    let Some((stop, handle)) = flusher else {
+        return true;
+    };
+    stop.store(true, Ordering::Release);
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = handle.join();
+    true
+}
+
+/// Current completion watermark.
+fn watermark(resume: &Arc<Mutex<ResumeTracker>>) -> u64 {
+    resume
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .watermark()
+}
+
 /// Runs file mode to completion (EOF, plus redo drain when redo% > 0) or
 /// SIGTERM, and returns `(workers_clean, result)` mirroring
 /// [`crate::pure_redoer::run`], so `main` can share the bounded-teardown exit
@@ -233,7 +327,26 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
     if redo_enabled {
         info!(
             "redo is processed while the file loads; at EOF all workers drain redo and \
-             the process exits once redo reads empty on {} consecutive probes {}s apart",
+             the process exits once redo reads empty on {} consecutive probes {}s apart \
+             (drain cap: {})",
+            crate::redo::DRAIN_EXIT_EMPTY_PROBES,
+            config.redo_sleep_secs,
+            config
+                .redo_drain_max
+                .map_or("none".to_string(), |d| format!(
+                    "{}s after EOF",
+                    d.as_secs()
+                ))
+        );
+    }
+    if redo_enabled
+        && crate::redo::cap_shorter_than_drain_rule(config.redo_drain_max, config.redo_sleep_secs)
+    {
+        warn!(
+            "--redo-drain-max-secs ({}s) is shorter than the drain rule's {} x \
+             --redo-sleep-secs ({}s): the cap will usually expire before an empty redo queue \
+             is confirmed; a final probe then decides (exit 0 if drained, 3 if not)",
+            config.redo_drain_max.map_or(0, |d| d.as_secs()),
             crate::redo::DRAIN_EXIT_EMPTY_PROBES,
             config.redo_sleep_secs
         );
@@ -248,21 +361,20 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
     // file mode it is harmless bookkeeping.
     let started: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
-    let add_flags = add_record_flags(config.info);
+    let add_flags = add_record_flags(config.with_info());
     let want_info = config.info;
 
     let mut handles = Vec::with_capacity(n_workers + 1);
 
     // --- Redo side (only when redo% > 0; queue-mode shape verbatim) ----------
     let redo_in_flight: Arc<Mutex<RedoInFlight>> = Arc::new(Mutex::new(HashMap::new()));
-    let input_done = Arc::new(AtomicBool::new(false));
+    let drain = DrainExit::new(config.redo_drain_max);
+    let input_done = drain.input_done.clone();
     let redo_side = if redo_enabled {
         let (redo_tx, redo_rx) = std::sync::mpsc::sync_channel::<RedoJob>(redo_pref + 2);
         let fetcher_env = env.clone();
         let sleep_secs = config.redo_sleep_secs;
-        let drain = DrainExit {
-            input_done: input_done.clone(),
-        };
+        let drain = drain.clone();
         // No result_tx/notify: the main thread polls RUNNING/WORKER_FATAL (the
         // pure-redoer arrangement), so the result channel closes with the
         // workers alone.
@@ -301,9 +413,11 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
             }),
             redo: redo_side.clone(),
             add_flags,
-            redo_flags: redo_flags(config.info),
+            redo_flags: redo_flags(config.with_info()),
             want_info,
             transform: config.transform.clone(),
+            info_sink: config.info_sink.clone(),
+            redo_stats_interval: config.redo_stats_interval,
         };
         match std::thread::Builder::new()
             .name(format!("sz-worker-{worker_id}"))
@@ -349,10 +463,39 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
     // Drop our extra result sender so the channel closes once all workers exit.
     drop(result_tx);
 
+    // --- INFO sink flush timer (own thread: runs during the load too) --------
+    // Watermark covered by sealed INFO files (see `resume_point`).
+    let sealed = Arc::new(AtomicU64::new(skip));
+    let flusher = if config.info_sink.is_enabled() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (sink, every, resume, sealed, stop2) = (
+            config.info_sink.clone(),
+            config.info_sink_flush,
+            resume.clone(),
+            sealed.clone(),
+            stop.clone(),
+        );
+        match std::thread::Builder::new()
+            .name("sz-info-flush".to_string())
+            .spawn(move || flush_loop(sink, every, resume, sealed, stop2))
+        {
+            Ok(h) => Some((stop, h)),
+            Err(e) => {
+                fail_fatal(&format!("failed to spawn the INFO sink flush thread: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // --- Reader: skip, then feed each line to the worker pool ----------------
     let read_result = read_and_feed(Path::new(&path), skip, &work_tx, &resume, &sink, &in_flight);
     let dispatched = read_result.as_ref().map_or(0, |r| r.dispatched);
-    if read_result.is_err() {
+    if read_result.is_ok() {
+        // End of input: the redo drain cap's clock starts now.
+        drain.mark_input_read();
+    } else {
         // A broken input is a failed run: stop the fetcher/workers promptly
         // instead of draining redo first and reporting the error afterwards.
         RUNNING.store(false, Ordering::Relaxed);
@@ -361,11 +504,14 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
     // EOF / stop: closing work_tx lets the workers observe end-of-stream on the
     // load channel; with a redo side they now fall through to redo (the ramp).
     drop(work_tx);
-    if redo_enabled {
-        info!(
-            "file input exhausted ({dispatched} record(s) dispatched); ramping all workers to redo"
-        );
-    }
+    info!(
+        "file input exhausted ({dispatched} record(s) dispatched){}",
+        if redo_enabled {
+            "; ramping all workers to redo"
+        } else {
+            ""
+        }
+    );
 
     // --- Wait for the pool: unbounded while running, bounded after a stop ----
     let monitor_interval = Duration::from_secs((config.long_record_secs / 2).max(1));
@@ -427,11 +573,37 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
     if workers_clean && let Ok(handle) = consumer {
         let _ = handle.join();
     }
+    // Final seal: after the join (or the grace), before the engine teardown in
+    // `main`. Explicit, because the forced-exit paths never run destructors.
+    // Bounded (CLOSE_TIMEOUT); a stuck close is fatal and takes the
+    // leak-on-exit path.
+    let flusher_done = stop_flusher(flusher, CLOSE_TIMEOUT);
+    if !flusher_done {
+        fail_fatal("INFO sink is stuck: a timed sz_is_flush did not return");
+    }
+    let wm = watermark(&resume);
+    let (closed, stuck) = if flusher_done {
+        config.info_sink.close_or_fail()
+    } else {
+        (false, true)
+    };
+    if closed {
+        sealed.store(wm, Ordering::Release);
+    }
+    let workers_clean = workers_clean && !stuck;
+    let sealed = sealed.load(Ordering::Acquire);
+    if REDO_DRAIN_CAP_EXPIRED.load(Ordering::Relaxed) {
+        log_remaining_redo(&env, workers_clean, config.redo_drain_max);
+    }
 
-    let watermark = resume
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .watermark();
+    let completed = watermark(&resume);
+    let watermark = resume_point(config.info_sink.is_enabled(), sealed, completed);
+    if watermark < completed {
+        warn!(
+            "INFO sink failed: resume point held at line {watermark}, the last line covered \
+             by a sealed INFO file (lines up to {completed} completed)"
+        );
+    }
     let adds = ADDS_PROCESSED.load(Ordering::Relaxed);
     let rejected = ADDS_REJECTED.load(Ordering::Relaxed);
     let written = sink
@@ -473,6 +645,26 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, Result<()>) {
         Err(e) => Err(anyhow::anyhow!("file read failed: {e:#}")),
     };
     (workers_clean, result)
+}
+
+/// Logs how much redo the drain cap left queued. Counted once, after the pool
+/// stopped (nothing in this process can add more), with a fresh engine handle;
+/// skipped when the run is not clean — a worker still inside the engine (the
+/// database may be the reason it is stuck) or a stuck INFO sink close — since
+/// that run takes the leak-on-exit path and must not start new engine work.
+fn log_remaining_redo(env: &Arc<SzEnvironmentCore>, workers_clean: bool, cap: Option<Duration>) {
+    let cap = cap.map_or(0, |d| d.as_secs());
+    let remaining = if workers_clean {
+        env.get_engine()
+            .and_then(|engine| engine.count_redo_records())
+            .map_or_else(|e| format!("unknown ({e})"), |n| n.to_string())
+    } else {
+        "unknown (a worker or the INFO sink close is still running)".to_string()
+    };
+    warn!(
+        "REDO DRAIN CAP EXPIRED: redo still not drained {cap}s after the input was read; \
+         stopped fetching redo with {remaining} redo record(s) remaining in the queue"
+    );
 }
 
 /// What [`read_and_feed`] got through: physical lines read (incl. skipped) and
@@ -662,6 +854,75 @@ mod tests {
         let (classes, redo) = worker_plan(4, 100);
         assert!(redo);
         assert!(classes.iter().all(|c| *c == Class::RedoPreferring));
+    }
+
+    /// The real file-sink plugin (a dev-dependency cdylib next to this test).
+    fn file_sink_plugin() -> String {
+        let deps = std::env::current_exe().unwrap();
+        let p = deps.parent().unwrap().join(format!(
+            "{}sz_info_sink_file.{}",
+            std::env::consts::DLL_PREFIX,
+            std::env::consts::DLL_EXTENSION
+        ));
+        assert!(p.exists(), "file-sink plugin not built at {p:?}");
+        p.to_string_lossy().into_owned()
+    }
+
+    /// M7: the flush thread seals on its own timer and publishes the
+    /// watermark captured before the seal; stopping it waits for it.
+    #[test]
+    fn flush_thread_seals_on_its_timer_and_publishes_the_watermark() {
+        use crate::info_sink::InfoKind;
+        let dir = std::env::temp_dir().join(format!("sz_flush_thread_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = serde_json::json!({"dir": dir, "prefix": "t-", "rotate_records": 1000, "rotate_secs": 3600})
+            .to_string();
+        let sink = InfoSinkHandle::load(Some(&file_sink_plugin()), Some(&cfg)).unwrap();
+        let resume = Arc::new(Mutex::new(ResumeTracker::new(1)));
+        let sealed = Arc::new(AtomicU64::new(0));
+        sink.write(InfoKind::Add, "{}").unwrap();
+        complete(&resume, 1);
+        complete(&resume, 2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (s2, r2, sl2, st2) = (sink.clone(), resume.clone(), sealed.clone(), stop.clone());
+        let h = std::thread::spawn(move || flush_loop(s2, Duration::from_millis(50), r2, sl2, st2));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sealed.load(Ordering::Acquire) != 2 {
+            assert!(Instant::now() < deadline, "no timed flush");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The seal happened while "the reader" (this thread) did nothing.
+        assert!(dir.join("t-000001.jsonl").exists());
+        sink.write(InfoKind::Add, "{}").unwrap();
+        assert!(stop_flusher(Some((stop, h)), Duration::from_secs(5)));
+        sink.close().unwrap();
+        assert!(dir.join("t-000002.jsonl").exists(), "a second timed seal");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stop_flusher_reports_a_stuck_flush() {
+        assert!(stop_flusher(None, Duration::ZERO), "no flusher");
+        let (release, rx) = std::sync::mpsc::channel::<()>();
+        let stuck = std::thread::spawn(move || {
+            let _ = rx.recv();
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        assert!(!stop_flusher(
+            Some((stop.clone(), stuck)),
+            Duration::from_millis(50)
+        ));
+        assert!(stop.load(Ordering::Acquire), "told to stop");
+        release.send(()).unwrap();
+    }
+
+    #[test]
+    fn resume_point_never_passes_the_last_seal_with_a_sink() {
+        assert_eq!(resume_point(false, 0, 42), 42, "no sink: the watermark");
+        assert_eq!(resume_point(true, 42, 42), 42, "sink sealed everything");
+        assert_eq!(resume_point(true, 10, 42), 10, "seal failed after line 10");
+        assert_eq!(resume_point(true, 50, 42), 42, "never past the watermark");
     }
 
     #[test]
