@@ -4,6 +4,7 @@ Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections head
 
 ## Unreleased
 
+* **Security: `ctutils` 0.4.3 -> 0.4.4 (RUSTSEC-2026-0385,** non-constant-time mask generation; transitive via the RustCrypto stack). Lock-only change.
 * **Redo fetcher counters `stats::REDO_FETCHED` and `stats::REDO_EMPTY_PROBES`** (non-empty `get_redo_record()` results, counted at dequeue, and empty probes, including the drain-cap final probe), so an embedding service can prove no redo is outstanding (`REDO_FETCHED - REDOS_PROCESSED - REDOS_DROPPED == 0` covers records still in the channel). No behaviour change.
 * **CI: `dtolnay/rust-toolchain` pinned to the `v1` tag commit (`683b588`, `# v1`),** with the toolchain set explicitly: `1.94.1` (the MSRV) for the build, test and release jobs and `stable` for the security audit, whose `cargo-audit` needs a newer compiler (it was a `stable` branch commit with a custom comment that Dependabot could not track). The `ci.yml` image build step now passes its build arguments as a bash array (actionlint SC2086).
 * **Redo drain cap (file mode): `--redo-drain-max-secs` /
