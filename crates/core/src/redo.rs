@@ -59,8 +59,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::record::RecordInfo;
 use crate::stats::{
-    ERRORS, REDO_DRAIN_CAP_EXPIRED, REDO_IN_FLIGHT, REDOS_DROPPED, REDOS_PROCESSED, RUNNING,
-    WORKER_FATAL,
+    ERRORS, REDO_DRAIN_CAP_EXPIRED, REDO_EMPTY_PROBES, REDO_FETCHED, REDO_IN_FLIGHT, REDOS_DROPPED,
+    REDOS_PROCESSED, RUNNING, WORKER_FATAL,
 };
 use crate::worker::{Action, Outcome, RedoJob};
 
@@ -181,6 +181,21 @@ impl DrainGate {
     }
 }
 
+/// Classifies one `get_redo_record()` result and counts it: an empty probe
+/// bumps [`REDO_EMPTY_PROBES`], a record bumps [`REDO_FETCHED`] (at dequeue,
+/// before the hand-off, so a worker can never finish it before it is counted).
+/// Returns `true` when the probe was empty.
+fn count_probe(record: &str) -> bool {
+    let empty = record.trim().is_empty();
+    let counter = if empty {
+        &REDO_EMPTY_PROBES
+    } else {
+        &REDO_FETCHED
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    empty
+}
+
 /// Marks the process fatal from the fetcher and (mixed mode) hands the async
 /// side its durable fatal signal plus a wakeup.
 fn fetcher_fatal(
@@ -274,7 +289,7 @@ pub fn fetcher_loop(
                 } else {
                     None
                 };
-                let probe_empty = probe.as_ref().is_some_and(|r| r.trim().is_empty());
+                let probe_empty = probe.as_deref().is_some_and(count_probe);
                 if drained_at_cap(input_done, quiescent, probe_empty) {
                     info!(
                         "redo drain cap reached, but the final probe found the redo queue empty \
@@ -317,7 +332,7 @@ pub fn fetcher_loop(
             }
         };
 
-        if record.trim().is_empty() {
+        if count_probe(&record) {
             // Emptiness is ALWAYS detected here, by get_redo_record() coming
             // back empty — never by count_redo_records() (a table scan; it is
             // monitoring-only, design §2.4).
@@ -399,7 +414,36 @@ pub fn interruptible_sleep_while(dur: Duration, keep: impl Fn() -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    /// Serializes the probe-counter tests: both read the two process-global
+    /// counters, so one test's bump must not land inside the other's window.
+    static PROBE_COUNTERS: Mutex<()> = Mutex::new(());
+
+    fn probe_counters() -> (u64, u64) {
+        (
+            REDO_FETCHED.load(Ordering::Relaxed),
+            REDO_EMPTY_PROBES.load(Ordering::Relaxed),
+        )
+    }
+
+    #[test]
+    fn a_redo_record_counts_as_fetched_only() {
+        let _guard = PROBE_COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+        let (fetched, empty) = probe_counters();
+        assert!(!count_probe(r#"{"DATA_SOURCE":"X","RECORD_ID":"1"}"#));
+        assert_eq!(probe_counters(), (fetched + 1, empty));
+    }
+
+    #[test]
+    fn an_empty_probe_counts_as_empty_only() {
+        let _guard = PROBE_COUNTERS.lock().unwrap_or_else(|e| e.into_inner());
+        let (fetched, empty) = probe_counters();
+        assert!(count_probe(""));
+        assert!(count_probe(" \n"), "whitespace-only is empty, as before");
+        assert_eq!(probe_counters(), (fetched, empty + 2));
+    }
 
     #[test]
     fn drain_gate_exits_only_after_consecutive_quiescent_empty_probes_post_input() {

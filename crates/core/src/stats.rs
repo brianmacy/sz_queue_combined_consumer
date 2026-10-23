@@ -237,6 +237,16 @@ pub static ERRORS: AtomicUsize = AtomicUsize::new(0);
 /// the full `redo_sleep_secs`.
 pub static REDO_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
+/// Non-empty `get_redo_record()` results, counted by the fetcher as soon as
+/// the record is dequeued (before it is handed to the workers), so
+/// `REDO_FETCHED - REDOS_PROCESSED - REDOS_DROPPED` covers records still
+/// waiting in the channel and never goes negative. Exported for callers that
+/// must prove "no redo outstanding" (e.g. a settle protocol).
+pub static REDO_FETCHED: AtomicU64 = AtomicU64::new(0);
+
+/// `get_redo_record()` probes that came back empty.
+pub static REDO_EMPTY_PROBES: AtomicU64 = AtomicU64::new(0);
+
 /// Cumulative wall-clock nanoseconds workers spent inside load / redo engine
 /// calls. Their ratio is the measured `redo_share_effective`, so the redo
 /// capacity floor is verifiable from logs rather than assumed (design §7).
