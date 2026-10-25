@@ -37,3 +37,12 @@ serde_norway = "0.9"
 serde_json.workspace = true
 # Example record-transform cdylib, dlopened by the transform e2e test.
 sz-record-transform-example = { path = "../transform-example" }
+# File INFO sink cdylib, dlopened by the driver in the INFO sink e2e tests.
+sz-info-sink-file = { path = "../info-sink-file" }
+# INFO sink cdylib that fails / blocks on command (stuck-sink e2e tests).
+sz-info-sink-fault-fixture = { path = "../info-sink-fault-fixture" }
+# A genuine mid-run database failure in the e2e tests: DROP TABLE on a
+# PRIVATE throwaway SQLite repository (never the one the test process's
+# engine has open). The raw C API (bundled SQLite, MIT) keeps the dev tree
+# small; rusqlite would add Zlib-licensed transitive crates.
+libsqlite3-sys = { version = "0.38", features = ["bundled"] }

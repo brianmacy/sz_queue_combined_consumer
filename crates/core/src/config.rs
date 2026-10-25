@@ -30,6 +30,21 @@ pub const DEFAULT_MQ_RECHECK_SECS: u64 = 30;
 /// (redoer-compatible name/default).
 pub const DEFAULT_REDO_SLEEP_SECS: u64 = 60;
 
+/// Default cadence of the redo throughput line (`--redo-stats-interval`):
+/// one `Stats: N redo records processed` line every this many redo records
+/// (redoer parity).
+pub const DEFAULT_REDO_STATS_INTERVAL: u64 = 1000;
+
+/// Default bound on the file-mode redo drain tail (`--redo-drain-max-secs`),
+/// seconds after the input file is read to the end. `0` disables the cap, and
+/// the cap is off by default (opt-in): set it together with the caller's own
+/// job/task timeout.
+pub const DEFAULT_REDO_DRAIN_MAX_SECS: u64 = 0;
+
+/// Default cadence (seconds) at which the main loop flushes (seals) the INFO
+/// sink's current output (`--info-sink-flush-secs`).
+pub const DEFAULT_INFO_SINK_FLUSH_SECS: u64 = 30;
+
 /// Flags and environment variables shared verbatim by every backend binary
 /// (file mode, redo share, worker pool, long-record, transform, info/trace).
 /// Each binary flattens this into its own clap `Args` next to its
@@ -78,6 +93,49 @@ pub struct CommonArgs {
         default_value_t = DEFAULT_REDO_SLEEP_SECS
     )]
     pub redo_sleep_secs: u64,
+
+    /// Log a redo throughput line (`Stats: N redo records processed, R/sec`)
+    /// every this many processed redo records. Must be >= 1.
+    #[arg(
+        long = "redo-stats-interval",
+        env = "SENZING_REDO_STATS_INTERVAL",
+        default_value_t = DEFAULT_REDO_STATS_INTERVAL,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub redo_stats_interval: u64,
+
+    /// File mode, redo% > 0: maximum seconds to keep draining redo after the
+    /// input file has been read to the end. On expiry one final redo probe is
+    /// made: drained -> normal exit 0; otherwise redo fetching stops, the
+    /// remaining redo count is logged and the process exits 3. 0 (default) =
+    /// no cap; opt-in, set it together with the caller's job/task timeout.
+    /// Not applicable in queue mode or the pure redoer (no end of input).
+    #[arg(
+        long = "redo-drain-max-secs",
+        env = "SENZING_REDO_DRAIN_MAX_SECS",
+        default_value_t = DEFAULT_REDO_DRAIN_MAX_SECS
+    )]
+    pub redo_drain_max_secs: u64,
+
+    /// Shared library implementing the INFO sink ABI (sz-info-sink). When set,
+    /// add_record and process_redo_record run WITH_INFO and every INFO
+    /// payload is written to the sink; any sink error is fatal.
+    #[arg(long = "info-sink", env = "SENZING_INFO_SINK")]
+    pub info_sink: Option<String>,
+
+    /// Config string passed to the INFO sink plugin at create (e.g. JSON).
+    #[arg(long = "info-sink-config", env = "SENZING_INFO_SINK_CONFIG")]
+    pub info_sink_config: Option<String>,
+
+    /// Seconds between INFO sink flushes (seal the current output) issued by
+    /// a timer (file mode: its own thread, also during the load). Must be >= 1.
+    #[arg(
+        long = "info-sink-flush-secs",
+        env = "SENZING_INFO_SINK_FLUSH_SECS",
+        default_value_t = DEFAULT_INFO_SINK_FLUSH_SECS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub info_sink_flush_secs: u64,
 
     /// Seconds before a record is considered long-running; stats cadence is
     /// long_record / 2 (both sibling drivers' semantics).
@@ -160,11 +218,19 @@ pub struct Config {
     /// backend); inert 0 from [`Config::from_common`].
     pub mq_recheck_secs: u64,
     pub redo_sleep_secs: u64,
+    /// Redo throughput line cadence, in processed redo records (>= 1).
+    pub redo_stats_interval: u64,
     pub long_record_secs: u64,
     pub info: bool,
     pub debug_trace: bool,
     /// Optional per-record transform (loaded at resolve time, fail-fast).
     pub transform: crate::transform::TransformHandle,
+    /// File mode: redo drain cap after end of input; `None` = no cap.
+    pub redo_drain_max: Option<std::time::Duration>,
+    /// Optional INFO sink (created at resolve time, fail-fast).
+    pub info_sink: crate::info_sink::InfoSinkHandle,
+    /// Main-loop INFO sink flush cadence.
+    pub info_sink_flush: std::time::Duration,
 }
 
 /// Reads and validates `SENZING_ENGINE_CONFIGURATION_JSON` from the environment.
@@ -228,6 +294,11 @@ impl Config {
             common.record_transform_config.as_deref(),
         )?;
 
+        let info_sink = crate::info_sink::InfoSinkHandle::load(
+            common.info_sink.as_deref(),
+            common.info_sink_config.as_deref(),
+        )?;
+
         let input_file = common.input_file.clone().filter(|s| !s.is_empty());
         Ok(Self {
             engine_config,
@@ -241,11 +312,21 @@ impl Config {
             prefetch: 0,
             mq_recheck_secs: 0,
             redo_sleep_secs: common.redo_sleep_secs,
+            redo_stats_interval: common.redo_stats_interval,
             long_record_secs: common.long_record,
             info: common.info,
             debug_trace: common.debug_trace,
             transform,
+            redo_drain_max: crate::redo::drain_cap(common.redo_drain_max_secs),
+            info_sink,
+            info_sink_flush: std::time::Duration::from_secs(common.info_sink_flush_secs),
         })
+    }
+
+    /// Whether engine calls must return INFO: `--info` (print) or an INFO
+    /// sink (which needs every payload).
+    pub fn with_info(&self) -> bool {
+        self.info || self.info_sink.is_enabled()
     }
 
     /// Number of redo-preferring workers (|B|) for this configuration.
@@ -353,6 +434,108 @@ mod tests {
         );
         assert_eq!((c.prefetch, c.mq_recheck_secs), (0, 0));
         assert!(!c.info && !c.debug_trace);
+    }
+
+    #[test]
+    fn redo_drain_cap_is_off_by_default_and_zero_disables_it() {
+        let c = Config::from_common(&common(&[]), "{}".into()).unwrap();
+        assert_eq!(c.redo_drain_max, None, "the cap is opt-in");
+        assert_eq!(DEFAULT_REDO_DRAIN_MAX_SECS, 0);
+        let c =
+            Config::from_common(&common(&["--redo-drain-max-secs", "3600"]), "{}".into()).unwrap();
+        assert_eq!(c.redo_drain_max, Some(std::time::Duration::from_secs(3600)));
+        let c = Config::from_common(&common(&["--redo-drain-max-secs", "0"]), "{}".into()).unwrap();
+        assert_eq!(c.redo_drain_max, None);
+        let c = Config::from_common(&common(&["--redo-drain-max-secs", "5"]), "{}".into()).unwrap();
+        assert_eq!(c.redo_drain_max, Some(std::time::Duration::from_secs(5)));
+        assert!(Cli::try_parse_from(["bin", "--redo-drain-max-secs", "-1"]).is_err());
+    }
+
+    #[test]
+    fn info_sink_defaults_off_and_with_info_follows_print_flag() {
+        let c = Config::from_common(&common(&[]), "{}".into()).unwrap();
+        assert!(!c.info_sink.is_enabled());
+        assert!(!c.with_info());
+        assert_eq!(
+            c.info_sink_flush,
+            std::time::Duration::from_secs(DEFAULT_INFO_SINK_FLUSH_SECS)
+        );
+        let c = Config::from_common(&common(&["--info"]), "{}".into()).unwrap();
+        assert!(c.with_info(), "--info alone still requests INFO");
+        let c = Config::from_common(&common(&["--info-sink", ""]), "{}".into()).unwrap();
+        assert!(!c.info_sink.is_enabled(), "empty path = no sink");
+    }
+
+    /// The env names are part of the contract (deployments set them); check
+    /// them through clap's own metadata rather than mutating the process env.
+    #[test]
+    fn new_options_bind_their_contract_env_names() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        let env_of = |long: &str| {
+            cmd.get_arguments()
+                .find(|a| a.get_long() == Some(long))
+                .and_then(|a| a.get_env())
+                .map(|e| e.to_string_lossy().into_owned())
+        };
+        assert_eq!(
+            env_of("redo-drain-max-secs").as_deref(),
+            Some("SENZING_REDO_DRAIN_MAX_SECS")
+        );
+        assert_eq!(env_of("info-sink").as_deref(), Some("SENZING_INFO_SINK"));
+        assert_eq!(
+            env_of("info-sink-config").as_deref(),
+            Some("SENZING_INFO_SINK_CONFIG")
+        );
+        assert_eq!(
+            env_of("info-sink-flush-secs").as_deref(),
+            Some("SENZING_INFO_SINK_FLUSH_SECS")
+        );
+        assert_eq!(
+            env_of("redo-stats-interval").as_deref(),
+            Some("SENZING_REDO_STATS_INTERVAL")
+        );
+    }
+
+    #[test]
+    fn redo_stats_interval_defaults_to_1000_and_must_be_positive() {
+        let c = Config::from_common(&common(&[]), "{}".into()).unwrap();
+        assert_eq!(c.redo_stats_interval, 1000, "redoer-parity default");
+        assert_eq!(DEFAULT_REDO_STATS_INTERVAL, 1000);
+        let c = Config::from_common(&common(&["--redo-stats-interval", "5"]), "{}".into()).unwrap();
+        assert_eq!(c.redo_stats_interval, 5);
+        let err = Cli::try_parse_from(["bin", "--redo-stats-interval", "0"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn info_sink_flush_secs_must_be_positive() {
+        let err = Cli::try_parse_from(["bin", "--info-sink-flush-secs", "0"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        let ok = Cli::try_parse_from(["bin", "--info-sink-flush-secs", "2"]).unwrap();
+        assert_eq!(ok.common.info_sink_flush_secs, 2);
+    }
+
+    #[test]
+    fn info_sink_options_parse_from_cli() {
+        let c = common(&[
+            "--info-sink",
+            "/x/libsink.so",
+            "--info-sink-config",
+            r#"{"dir":"/w"}"#,
+        ]);
+        assert_eq!(c.info_sink.as_deref(), Some("/x/libsink.so"));
+        assert_eq!(c.info_sink_config.as_deref(), Some(r#"{"dir":"/w"}"#));
+    }
+
+    #[test]
+    fn info_sink_load_failure_is_a_config_error() {
+        let err = Config::from_common(
+            &common(&["--info-sink", "/nonexistent/libsink.so"]),
+            "{}".into(),
+        )
+        .expect_err("missing plugin must fail before engine init");
+        assert!(err.contains("dlopen"), "{err}");
     }
 
     #[test]

@@ -17,7 +17,7 @@ use sz_rust_sdk::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::config::Config;
-use crate::stats::{self, RUNNING};
+use crate::stats::{self, REDO_DRAIN_CAP_EXPIRED, RUNNING};
 use crate::{file_loader, pure_redoer};
 
 /// Upper bound on the native environment teardown at shutdown.
@@ -255,21 +255,60 @@ fn flush_and_exit(code: u8) -> ! {
 fn flush_and_force_exit(code: u8) -> ! {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+    write_coverage_profile();
     // SAFETY: `_exit` is async-signal-safe and never returns. It deliberately skips
     // atexit handlers / static destructors — that is the entire point of this path.
     unsafe { libc::_exit(code as i32) }
 }
 
+/// Coverage builds only (`cargo llvm-cov` sets `--cfg coverage`): `_exit`
+/// skips the atexit handler that writes the LLVM coverage profile, so every
+/// run ending on a forced-exit path would report its lines as never run.
+/// Write the profile explicitly first. Normal builds compile this to nothing;
+/// it changes no behavior, only what a coverage report can see.
+#[cfg(coverage)]
+fn write_coverage_profile() {
+    unsafe extern "C" {
+        /// The profiler runtime linked by `-C instrument-coverage`.
+        fn __llvm_profile_write_file() -> i32;
+    }
+    // SAFETY: no arguments; writes the counters to `LLVM_PROFILE_FILE`.
+    let _ = unsafe { __llvm_profile_write_file() };
+}
+
+#[cfg(not(coverage))]
+fn write_coverage_profile() {}
+
+/// Exit code of a file-mode run that completed cleanly but stopped redo at the
+/// `--redo-drain-max-secs` cap with redo still queued (distinct from 1 =
+/// configuration error and 255 = fatal runtime error).
+pub const EXIT_REDO_DRAIN_CAP: u8 = 3;
+
+/// Exit code for a std-thread run (file loader / pure redoer): a fatal error
+/// (255) outranks a drain-cap expiry (3), which outranks success (0). A
+/// SIGTERM before the cap expires never sets the cap flag (see
+/// `redo::stop_reason`), so it exits 0; once the cap has expired the flag is
+/// set and a later SIGTERM still exits 3.
+fn exit_code(result: &anyhow::Result<()>, drain_cap_expired: bool) -> u8 {
+    match (result, drain_cap_expired) {
+        (Err(_), _) => 255,
+        (Ok(()), true) => EXIT_REDO_DRAIN_CAP,
+        (Ok(()), false) => 0,
+    }
+}
+
 /// Applies the shared use-after-free exit discipline given `(workers_clean,
 /// result)` from a run: destroy + exit on a clean join, else leak-on-exit.
 fn finish(workers_clean: bool, result: anyhow::Result<()>) -> ! {
-    let code = match result {
-        Ok(()) => 0,
-        Err(e) => {
-            eprintln!("{e:#}");
-            255
-        }
-    };
+    let code = exit_code(&result, REDO_DRAIN_CAP_EXPIRED.load(Ordering::Relaxed));
+    match (&result, code) {
+        (Err(e), _) => eprintln!("{e:#}"),
+        (Ok(()), EXIT_REDO_DRAIN_CAP) => eprintln!(
+            "redo drain cap (--redo-drain-max-secs) expired before the redo queue drained; \
+             exiting {EXIT_REDO_DRAIN_CAP}"
+        ),
+        (Ok(()), _) => {}
+    }
     if workers_clean {
         teardown_and_exit(code);
     } else {
@@ -299,6 +338,22 @@ pub fn run_file_loader(config: &Config, env: Arc<SzEnvironmentCore>) -> ! {
 #[cfg(test)]
 mod tests {
     use std::io::Read;
+
+    #[test]
+    fn exit_code_ranks_fatal_over_drain_cap_over_success() {
+        use super::{EXIT_REDO_DRAIN_CAP, exit_code};
+        let ok = || Ok(());
+        let fatal = || Err(anyhow::anyhow!("boom"));
+        assert_eq!(exit_code(&ok(), false), 0, "clean drain or SIGTERM");
+        assert_eq!(exit_code(&ok(), true), EXIT_REDO_DRAIN_CAP);
+        assert_eq!(EXIT_REDO_DRAIN_CAP, 3, "documented exit code");
+        assert_eq!(exit_code(&fatal(), false), 255);
+        assert_eq!(
+            exit_code(&fatal(), true),
+            255,
+            "a fatal error outranks the cap"
+        );
+    }
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 

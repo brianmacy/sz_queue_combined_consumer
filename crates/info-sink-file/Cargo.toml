@@ -1,0 +1,20 @@
+[package]
+name = "sz-info-sink-file"
+description = "INFO sink plugin (cdylib) writing WITH_INFO payloads as JSONL into new, sealed-once files rotated by record count and age"
+version.workspace = true
+publish = false  # not published to crates.io
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "sz_info_sink_file"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+sz-info-sink.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+libc.workspace = true

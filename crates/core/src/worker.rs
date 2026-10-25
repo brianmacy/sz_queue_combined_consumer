@@ -34,6 +34,7 @@ use sz_rust_sdk::prelude::*;
 use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error, info, warn};
 
+use crate::info_sink::InfoKind;
 use crate::record::{ErrorClass, RecordInfo, classify_error, logging_id};
 use crate::stats::{
     ERRORS, LOAD_BUSY_NS, REDO_BUSY_NS, REDO_IN_FLIGHT, REDOS_DROPPED, REDOS_PROCESSED, RUNNING,
@@ -47,7 +48,8 @@ use crate::stats::{
 /// whether the flag is passed (and thus whether the payload is produced/PRINTED).
 pub const SZ_WITH_INFO_BITS: u64 = 1 << 62;
 
-/// Flags for `add_record` (consumer parity; observably a no-op at the engine).
+/// Flags for `add_record`: WITH_INFO when INFO is wanted (`--info` printing
+/// or an INFO sink, see `Config::with_info`).
 pub fn add_record_flags(info: bool) -> Option<SzFlags> {
     if info {
         Some(SzFlags::from_bits_retain(SZ_WITH_INFO_BITS))
@@ -56,7 +58,8 @@ pub fn add_record_flags(info: bool) -> Option<SzFlags> {
     }
 }
 
-/// Flags for `process_redo_record` (redoer parity; same no-op caveat).
+/// Flags for `process_redo_record`: WITH_INFO when INFO is wanted (redoer
+/// parity otherwise).
 pub fn redo_flags(info: bool) -> Option<SzFlags> {
     if info {
         Some(SzFlags::from_bits_retain(SZ_WITH_INFO_BITS))
@@ -64,9 +67,6 @@ pub fn redo_flags(info: bool) -> Option<SzFlags> {
         None
     }
 }
-
-/// Throughput line cadence for redo records (redoer parity).
-const REDO_STATS_INTERVAL: usize = 1000;
 
 /// Short poll interval between non-blocking dispatch passes (mixed mode).
 const SHORT_POLL: Duration = Duration::from_millis(1);
@@ -171,6 +171,10 @@ pub struct WorkerCtx {
     pub want_info: bool,
     /// Optional record transform applied before `add_record`.
     pub transform: crate::transform::TransformHandle,
+    /// Optional INFO sink receiving every add / redo INFO payload.
+    pub info_sink: crate::info_sink::InfoSinkHandle,
+    /// Redo throughput line cadence (`--redo-stats-interval`, >= 1).
+    pub redo_stats_interval: u64,
 }
 
 /// Worker thread entry point: derive an engine handle, then run the dispatch
@@ -459,7 +463,19 @@ fn add_record_action(
         result = engine.add_record(&info.data_source, &info.record_id, body_str, ctx.add_flags);
     }
     match result {
-        Ok(resp) => Action::Ack(if ctx.want_info { Some(resp) } else { None }),
+        Ok(resp) => match ctx.info_sink.write(InfoKind::Add, &resp) {
+            // The record IS in the repository, but its INFO is not persisted:
+            // never report it as loaded (no ack / no watermark advance), so a
+            // redelivery or resume re-adds it and re-emits the INFO.
+            Err(e) => {
+                error!(
+                    "worker {}: {e} [{} : {}]",
+                    ctx.worker_id, info.data_source, info.record_id
+                );
+                Action::Fatal(e)
+            }
+            Ok(()) => Action::Ack(if ctx.want_info { Some(resp) } else { None }),
+        },
         Err(e) => match classify_error(&e) {
             ErrorClass::BadInputOrTimeout => {
                 // The backend logs WHERE the record went (DLQ / reject
@@ -499,21 +515,20 @@ fn process_redo(ctx: &WorkerCtx, engine: &dyn SzEngine, redo: &RedoSide, job: Re
         redo_result = engine.process_redo_record(&record, ctx.redo_flags);
     }
     match redo_result {
-        Ok(result) => {
-            let count = REDOS_PROCESSED.fetch_add(1, Ordering::Relaxed) + 1;
-            if ctx.want_info && !result.is_empty() {
-                println!("{result}");
+        Ok(result) => match ctx.info_sink.write(InfoKind::Redo, &result) {
+            // The redo IS applied, but its INFO is lost: never count or print
+            // it as processed (the run is fatal).
+            Err(e) => {
+                error!(
+                    "FATAL [worker {}]: {e} [{}]",
+                    ctx.worker_id,
+                    logging_id(&record)
+                );
+                redo_fatal(ctx, e);
+                keep_going = false;
             }
-            if count.is_multiple_of(REDO_STATS_INTERVAL) {
-                let elapsed = start_time().elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 {
-                    count as f64 / elapsed
-                } else {
-                    0.0
-                };
-                info!("Stats: {count} redo records processed, {rate:.1}/sec");
-            }
-        }
+            Ok(()) => redo_processed(ctx, &result),
+        },
         Err(e) => match classify_error(&e) {
             ErrorClass::BadInputOrTimeout => {
                 // Bad data, SENZ0082, or a SENZ0010 retry timeout. Redo records
@@ -533,18 +548,7 @@ fn process_redo(ctx: &WorkerCtx, engine: &dyn SzEngine, redo: &RedoSide, job: Re
                     ctx.worker_id,
                     logging_id(&record)
                 );
-                ERRORS.fetch_add(1, Ordering::Relaxed);
-                WORKER_FATAL.store(true, Ordering::Relaxed);
-                RUNNING.store(false, Ordering::Relaxed);
-                if let Some(load) = &ctx.load {
-                    // Durable fatal for the async side (mixed mode).
-                    let _ = load.result_tx.blocking_send(Outcome {
-                        delivery_tag: 0,
-                        info: RecordInfo::empty(),
-                        action: Action::Fatal(e.to_string()),
-                    });
-                    load.shutdown_notify.notify_waiters();
-                }
+                redo_fatal(ctx, e.to_string());
                 keep_going = false;
             }
         },
@@ -556,6 +560,35 @@ fn process_redo(ctx: &WorkerCtx, engine: &dyn SzEngine, redo: &RedoSide, job: Re
     }
     REDO_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
     keep_going
+}
+
+/// Counts (and with `--info` prints) one successfully processed redo
+/// record, with the periodic throughput line.
+fn redo_processed(ctx: &WorkerCtx, result: &str) {
+    let count = REDOS_PROCESSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if ctx.want_info && !result.is_empty() {
+        println!("{result}");
+    }
+    if (count as u64).is_multiple_of(ctx.redo_stats_interval) {
+        let rate = crate::stats::per_sec(count, start_time().elapsed().as_secs_f64());
+        info!("Stats: {count} redo records processed, {rate:.1}/sec");
+    }
+}
+
+/// A fatal error on the redo path: mark the process fatal, stop the run, and
+/// (mixed mode) hand the async side its DURABLE fatal signal.
+fn redo_fatal(ctx: &WorkerCtx, msg: String) {
+    ERRORS.fetch_add(1, Ordering::Relaxed);
+    WORKER_FATAL.store(true, Ordering::Relaxed);
+    RUNNING.store(false, Ordering::Relaxed);
+    if let Some(load) = &ctx.load {
+        let _ = load.result_tx.blocking_send(Outcome {
+            delivery_tag: 0,
+            info: RecordInfo::empty(),
+            action: Action::Fatal(msg),
+        });
+        load.shutdown_notify.notify_waiters();
+    }
 }
 
 /// Scans the redo in-flight map for long runners (redoer parity), warning

@@ -28,6 +28,7 @@
 pub mod config;
 pub mod config_reload;
 pub mod file_loader;
+pub mod info_sink;
 pub mod pool;
 pub mod pure_redoer;
 pub mod queue_loop;

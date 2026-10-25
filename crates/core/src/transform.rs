@@ -59,7 +59,7 @@ unsafe impl Send for PluginTransform {}
 // SAFETY: see above.
 unsafe impl Sync for PluginTransform {}
 
-fn dl_error() -> String {
+pub(crate) fn dl_error() -> String {
     // SAFETY: dlerror returns null or a valid NUL-terminated thread-local string.
     let e = unsafe { libc::dlerror() };
     if e.is_null() {
@@ -72,7 +72,8 @@ fn dl_error() -> String {
 
 /// # Safety
 /// `lib` must be a live dlopen handle and `T` the correct fn-pointer type.
-unsafe fn sym<T: Copy>(lib: *mut c_void, name: &[u8]) -> Result<T, String> {
+/// Shared by every plugin loader (record transform, INFO sink).
+pub(crate) unsafe fn sym<T: Copy>(lib: *mut c_void, name: &[u8]) -> Result<T, String> {
     // SAFETY: name is a NUL-terminated constant from the ABI crate.
     let p = unsafe { libc::dlsym(lib, name.as_ptr().cast()) };
     if p.is_null() {
@@ -135,11 +136,12 @@ impl PluginTransform {
     }
 }
 
-/// Copies and frees a plugin-owned C string.
+/// Copies and frees a plugin-owned C string (any plugin ABI: every `*_free`
+/// has this signature).
 ///
 /// # Safety
 /// `p` must be null or a NUL-terminated string owned by the plugin.
-unsafe fn take_string(free: FreeFn, p: *mut c_char) -> Option<String> {
+pub(crate) unsafe fn take_string(free: FreeFn, p: *mut c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }

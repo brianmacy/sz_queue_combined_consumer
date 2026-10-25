@@ -15,6 +15,7 @@ use sz_rust_sdk::prelude::*;
 use tracing::{info, warn};
 
 use crate::config::Config;
+use crate::info_sink::{FlushTimer, fail_fatal};
 use crate::redo::{fetcher_loop, interruptible_sleep};
 use crate::stats::{self, ERRORS, REDOS_DROPPED, REDOS_PROCESSED, RUNNING, WORKER_FATAL};
 use crate::worker::{
@@ -43,7 +44,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
     let (redo_tx, redo_rx) = std::sync::mpsc::sync_channel::<RedoJob>(n_workers + 2);
     let redo_rx = Arc::new(Mutex::new(redo_rx));
     let in_flight: Arc<Mutex<RedoInFlight>> = Arc::new(Mutex::new(HashMap::new()));
-    let rflags = redo_flags(config.info);
+    let rflags = redo_flags(config.with_info());
 
     // --- Workers --------------------------------------------------------------
     let mut handles = Vec::with_capacity(n_workers + 1);
@@ -61,6 +62,8 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
             redo_flags: rflags,
             want_info: config.info,
             transform: Default::default(),
+            info_sink: config.info_sink.clone(),
+            redo_stats_interval: config.redo_stats_interval,
         };
         match std::thread::Builder::new()
             .name(format!("sz-worker-{worker_id}"))
@@ -111,13 +114,31 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
     };
 
     let interval = Duration::from_secs((config.long_record_secs / 2).max(1));
+    // Wake for whichever comes first: the stats tick or the INFO sink flush.
+    let tick = if config.info_sink.is_enabled() {
+        interval.min(config.info_sink_flush)
+    } else {
+        interval
+    };
+    let mut flush_timer = FlushTimer::new(config.info_sink_flush);
+    let mut stats_timer = FlushTimer::new(interval);
     let mut last_status_at = Instant::now();
     let mut prev_redos: usize = 0;
 
     while RUNNING.load(Ordering::Relaxed) {
-        interruptible_sleep(interval);
+        interruptible_sleep(tick);
         if !RUNNING.load(Ordering::Relaxed) {
             break;
+        }
+        if config.info_sink.is_enabled()
+            && flush_timer.due()
+            && let Err(e) = config.info_sink.flush()
+        {
+            fail_fatal(&e);
+            break;
+        }
+        if !stats_timer.due() {
+            continue;
         }
 
         match monitor_engine.get_stats() {
@@ -156,6 +177,12 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
     // --- Teardown ---------------------------------------------------------------
     RUNNING.store(false, Ordering::Relaxed);
     let workers_clean = join_workers_bounded(handles);
+    // Final INFO seal: after the join (or the grace), before the engine
+    // teardown in `main`; explicit because forced exits skip destructors.
+    // Bounded (CLOSE_TIMEOUT); a stuck close is fatal and takes the
+    // leak-on-exit path.
+    let (_, stuck) = config.info_sink.close_or_fail();
+    let workers_clean = workers_clean && !stuck;
 
     let redos = REDOS_PROCESSED.load(Ordering::Relaxed);
     let dropped = REDOS_DROPPED.load(Ordering::Relaxed);
@@ -164,11 +191,7 @@ pub fn run(config: &Config, env: Arc<SzEnvironmentCore>) -> (bool, anyhow::Resul
     // Redoer parity: final throughput line, then the same "Processed total of"
     // stdout line every other mode emits (the e2e harness scrapes its prefix).
     let elapsed = crate::stats::start_time().elapsed().as_secs_f64();
-    let rate = if elapsed > 0.0 {
-        redos as f64 / elapsed
-    } else {
-        0.0
-    };
+    let rate = crate::stats::per_sec(redos, elapsed);
     println!("Stats: {redos} redo records processed, {rate:.1}/sec, runtime: {elapsed:.0}s");
     crate::stats::print_final_totals(0);
     if let Ok(engine_stats) = monitor_engine.get_stats() {

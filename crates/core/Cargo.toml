@@ -29,7 +29,17 @@ num_cpus.workspace = true
 # Record-transform plugin ABI + dlopen (libc) for the optional per-record hook.
 sz-record-transform.workspace = true
 libc.workspace = true
+# INFO sink plugin ABI (dlopen'd like the transform plugin).
+sz-info-sink.workspace = true
+
+# `cargo llvm-cov` builds with `--cfg coverage` (runtime.rs writes the
+# coverage profile before a forced `_exit`); declare it for check-cfg.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
 [dev-dependencies]
 # Built so the transform tests can dlopen the example plugin cdylib.
 sz-record-transform-example = { path = "../transform-example" }
+# Built so the INFO sink tests can dlopen the real file-sink plugin cdylib.
+sz-info-sink-file = { path = "../info-sink-file" }
+sz-info-sink-abi-v2-fixture = { path = "../info-sink-abi-v2-fixture" }

@@ -18,6 +18,81 @@ Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections head
   (RUSTSEC-2026-0382), `webpki-roots` / `webpki-root-certs` 1.0.9 -> 1.0.10
   (RUSTSEC-2026-0381 / -0383).
 
+* **CI: `docker/setup-buildx-action` 4.3.0 -> 4.4.1** (Dependabot #36).
+* **Test: `e2e_redo_processing_failure_is_fatal` loads its records with one worker.** A concurrent load enqueues a scheduling-dependent amount of redo (measured 6-8 rows with 4 workers, usually 0 with 8; always 5 with 1); a load that enqueued none left the pure redoer idle until the 120 s exit timeout (CI failure on f82f2e8).
+* **Docs: the README states that this repository replaces `sz_rabbit_consumer_rust` and `sz_simple_redoer_rust`** (both archived); `sz_rabbit_publisher` (RabbitMQ publisher) is not replaced.
+* **Redo fetcher counters `stats::REDO_FETCHED` and `stats::REDO_EMPTY_PROBES`** (non-empty `get_redo_record()` results, counted at dequeue, and empty probes, including the drain-cap final probe), so an embedding service can prove no redo is outstanding (`REDO_FETCHED - REDOS_PROCESSED - REDOS_DROPPED == 0` covers records still in the channel). No behaviour change.
+* **CI: `dtolnay/rust-toolchain` pinned to the `v1` tag commit (`683b588`, `# v1`),** with the toolchain set explicitly: `1.94.1` (the MSRV) for the build, test and release jobs and `stable` for the security audit, whose `cargo-audit` needs a newer compiler (it was a `stable` branch commit with a custom comment that Dependabot could not track). The `ci.yml` image build step now passes its build arguments as a bash array (actionlint SC2086).
+* **Redo drain cap (file mode): `--redo-drain-max-secs` /
+  `SENZING_REDO_DRAIN_MAX_SECS`, opt-in: default `0` = off.** Disabled by
+  default (owner decision); set it together with the caller's job/task timeout
+  so the cap fires before the timeout kills the run. The clock starts
+  when the input file has been read to its end. If the two-empty-probe drain
+  exit has not ended the run by then, the fetcher makes ONE final redo probe
+  (when every record has completed and no redo it fetched is outstanding): an
+  empty probe means redo is drained and the run exits 0. Otherwise it stops
+  fetching redo (records already fetched still run), the remaining redo count
+  is logged (`REDO DRAIN CAP EXPIRED: … N redo record(s) remaining`) and the
+  process exits **3** — non-zero although nothing failed. A cap below
+  2 × `--redo-sleep-secs` logs a startup warning. A SIGTERM before the cap
+  expires stays a clean exit 0; after it expired the run still exits 3; a fatal
+  error stays 255. Not applicable in queue mode or the pure redoer (no end of
+  input).
+* **INFO sink plugins: `--info-sink` / `SENZING_INFO_SINK`,
+  `--info-sink-config` / `SENZING_INFO_SINK_CONFIG`,
+  `--info-sink-flush-secs` / `SENZING_INFO_SINK_FLUSH_SECS` (default 30).** New
+  C ABI crate `sz-info-sink` (`sz_is_abi_version/create/write/flush/close/free/
+  destroy`, version 1, mirroring the record-transform ABI). A configured sink
+  forces WITH_INFO on add and redo, receives every payload (kind ADD / REDO),
+  is flushed on a timer (file mode: its own thread, so also during the load)
+  and closed explicitly after the workers join and before engine teardown
+  (SIGTERM path included), in file, queue and pure-redoer modes; the close is
+  bounded by 5 s (a stuck close is fatal, names the plugin, and takes the
+  leak-on-exit path). Every sink error is fatal (exit 255; create failure
+  exits 1); a record whose INFO was not written is never acked / never
+  advances the resume watermark, and a redo whose INFO write failed is not
+  counted or printed as processed. Contract: `sz_is_write` returning 0 means
+  the line left the plugin's memory (handed to the OS). File mode prints a
+  resume point no further than the watermark captured before the last
+  successful seal; after a sink failure it stays there and the run exits 255.
+  The ABI version is checked before any other symbol is resolved (a plugin for
+  another version reports a version mismatch). Readers read the INFO output
+  only after the job exited successfully; a failed run's files are discarded
+  by the caller. `--info` printing is unchanged.
+* **New `sz-info-sink-file` plugin (cdylib):** JSONL into new, sealed-once files
+  `<prefix><seq06>.jsonl` (never append or rename; 7 digits after 999999 —
+  sort by number, not name), rotated by `rotate_records` and `rotate_secs`,
+  numbering continued across restarts. Each line is one unbuffered write; a
+  seal is fsync (EINVAL/ENOTSUP tolerated) plus an error-checked close; any
+  I/O error marks the sink FAILED (open file dropped unsealed, every later
+  call fails). Opt-in `"seal_marker": true` writes an empty `<file>.sealed`
+  after each seal. Files appear under their final name before they are sealed.
+* Tests: new `info_sink_e2e` suite (real engine on a throwaway SQLite
+  repository, built in CI from the schema DDL because the Linux packages ship no
+  `G2C.db.template`; queue-mode case on RabbitMQ), added to the CI integration job;
+  covers SIGKILL durability, a sink failing mid-load, timed seals during the
+  load, the drained-at-cap case and failed redo INFO writes. Benchmarks (ignored
+  tests): `bench_unbuffered_vs_buffered_100k_lines` (plugin) and
+  `bench_file_load_with_and_without_info_sink` (consumer). New test-fixture
+  crate `sz-info-sink-abi-v2-fixture`.
+* **`--redo-stats-interval` / `SENZING_REDO_STATS_INTERVAL` (default 1000,
+  ≥ 1):** the redo throughput line (`Stats: N redo records processed,
+  R/sec`) cadence, previously a hard-coded 1000. Default behavior unchanged.
+* With the drain cap expired and the final INFO sink close stuck, the
+  remaining-redo count reads `unknown (a worker or the INFO sink close is
+  still running)` (was `… a worker is still inside the engine`): no new engine
+  work starts on a leak-on-exit run.
+* Tests: real fault injection for the remaining failure paths — new
+  test-fixture plugin `sz-info-sink-fault-fixture` (flush / close / write
+  fail, block forever or sleep, by config) for stuck and failing sinks in
+  file, queue and pure-redoer modes; redo fetch / final-probe / processing
+  failures from a table dropped in a private throwaway SQLite repository
+  (dev-dependency `libsqlite3-sys`, bundled); fetcher engine-init failure;
+  the drain-tail re-probe; the redo stats line. The read-only-directory tests
+  no longer skip as root (fault fixture, or a regular file replacing the sink
+  directory). Coverage builds (`--cfg coverage`) write the LLVM profile
+  before a forced `_exit`; the RLIMIT_FSIZE test child lifts its limit before
+  exiting (it left a truncated profile).
 ## 0.5.0 — ActiveMQ publisher; multi-frame AMQP transfers (2026-10-16)
 
 ### Fixed

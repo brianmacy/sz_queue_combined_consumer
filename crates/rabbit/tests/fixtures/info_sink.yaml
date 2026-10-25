@@ -1,0 +1,89 @@
+# Test data for info_sink_e2e.rs (INFO sink + redo drain cap, file mode,
+# throwaway SQLite repository). "{tag}" is unique per test so each group's
+# shared email goes generic (and enqueues redo) the first time it is loaded;
+# "{i}" = 0..n-1, "{name}" = redo_names[i].
+data_source: TEST
+redo_names: ["Andrew Quill", "Andy Quill", "Bruno Marchetti", "Carmen Okafor", "Dmitri Halvorsen", "Esther Nakamura", "Farid Osei", "Greta Lindqvist"]
+record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","NAME_FULL":"{name}","EMAIL_ADDRESS":"{tag}@redo.example.com"}'
+sink:
+  prefix: "info-c0-"
+  rotate_records: 4
+  rotate_secs: 3600
+  flush_secs: 1
+  # Every sealed file gets an empty <file>.sealed marker, so the tests can
+  # tell a sealed file from one still being written (lines are visible on
+  # disk as soon as they are written).
+  seal_marker: true
+# Drain-cap case: a slow transform keeps adds running past end of input so the
+# 1 s cap expires first; redo enqueued after it stays behind.
+drain_cap:
+  max_secs: 1
+  transform_sleep_ms: 1500
+  threads: 2
+  redo_percent: 50
+# Reviewer reproduction: records that enqueue no redo, a cap shorter than the
+# two-empty-probe drain rule needs (2 x redo_sleep_secs): redo is drained, so
+# the run must exit 0, not 3.
+drained_cap:
+  records: 3
+  max_secs: 3
+  redo_sleep_secs: 10
+sigterm:
+  redo_sleep_secs: 120
+  draining_marker: "all file records completed; draining redo"
+# Queue mode (RabbitMQ, skipped without SENZING_AMQP_URL) and pure redoer:
+# both run until SIGTERM once redo reads empty.
+# Slow single-thread load (transform sleep per record) for the durability
+# cases: SIGKILL mid-load, and a sink that starts failing mid-load.
+slow_load:
+  transform_sleep_ms: 600
+  acked_before_kill: 3
+  files_before_failure: 2
+queue:
+  name_prefix: "sz-info-sink-e2e"
+# Configs of the fault-fixture INFO sink plugin (sz_info_sink_fault_fixture):
+# each names the entry points that fail (return an error) or block forever.
+faults:
+  fail_write: '{"fail":["write"]}'
+  fail_write_and_close: '{"fail":["write","close"]}'
+  fail_flush: '{"fail":["flush"]}'
+  block_flush: '{"block":["flush"]}'
+  block_close: '{"block":["close"]}'
+  slow_write: '{"sleep_ms":{"write":1000}}'
+# Throughput-line case: --redo-stats-interval (the default 1000 is out of
+# reach under the 500-record unlicensed cap) and LONG_RECORD (the pure
+# redoer's engine-stats cadence is LONG_RECORD / 2 seconds).
+redo_stats:
+  interval: 2
+  long_record_secs: 2
+# A redo fetch that fails mid-run (redo table dropped from a private
+# throwaway repository): fetcher redo sleep, seconds.
+fetch_failure_redo_sleep_secs: 1
+# Dropped from a private repository so process_redo_record (not the fetch)
+# fails.
+redo_process_failure_table: RES_ENT
+# The drain cap's final probe fails: the cap is shorter than the drain rule
+# (2 x redo_sleep_secs) so the final probe, not the rule, ends the drain.
+final_probe:
+  records: 3
+  max_secs: 6
+  redo_sleep_secs: 20
+markers:
+  redo_idle: "No redo records available"
+  sink_closed: "INFO sink closed"
+  cap_expired: "REDO DRAIN CAP EXPIRED"
+  remaining_prefix: "stopped fetching redo with "
+  write_failed: "INFO sink write failed"
+  final_total: "Processed total of "
+  resume_prefix: "safe resume with --skip-lines "
+  input_exhausted: "file input exhausted"
+  fetch_failed: "Error retrieving redo record"
+  engine_init_failed: "redo fetcher: failed to get engine"
+  close_stuck: "sz_is_close did not return"
+  flush_stuck: "a timed sz_is_flush did not return"
+  flush_failed: "INFO sink flush failed"
+  remaining_unknown: "unknown (a worker or the INFO sink close is still running)"
+  redo_stats: "redo records processed, "
+  redo_fatal: "FATAL error processing redo record"
+  reprobe: "re-probing for cascades"
+exit_within_secs: 120

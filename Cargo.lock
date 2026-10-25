@@ -2015,6 +2015,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
+name = "libsqlite3-sys"
+version = "0.38.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "vcpkg",
+]
+
+[[package]]
 name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3071,12 +3082,44 @@ dependencies = [
  "libc",
  "num_cpus",
  "serde_json",
+ "sz-info-sink",
+ "sz-info-sink-abi-v2-fixture",
+ "sz-info-sink-file",
  "sz-record-transform",
  "sz-record-transform-example",
  "sz-rust-sdk",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "sz-info-sink"
+version = "0.5.0"
+dependencies = [
+ "sz-record-transform",
+]
+
+[[package]]
+name = "sz-info-sink-abi-v2-fixture"
+version = "0.5.0"
+
+[[package]]
+name = "sz-info-sink-fault-fixture"
+version = "0.5.0"
+dependencies = [
+ "serde_json",
+ "sz-info-sink",
+]
+
+[[package]]
+name = "sz-info-sink-file"
+version = "0.5.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sz-info-sink",
 ]
 
 [[package]]
@@ -3164,10 +3207,13 @@ dependencies = [
  "futures-lite",
  "lapin",
  "libc",
+ "libsqlite3-sys",
  "serde",
  "serde_json",
  "serde_norway",
  "sz-combined-consumer-core",
+ "sz-info-sink-fault-fixture",
+ "sz-info-sink-file",
  "sz-record-transform-example",
  "sz-rust-sdk",
  "tokio",
@@ -3516,6 +3562,12 @@ name = "valuable"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
+name = "vcpkg"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "version_check"

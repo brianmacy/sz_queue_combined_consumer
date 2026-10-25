@@ -14,6 +14,11 @@
 //! key replaces the record, so a redelivered in-worker record is re-added
 //! idempotently; dead-lettering it would put a valid record in the DLQ on
 //! every rolling restart.
+//!
+//! INFO sink (optional): flushed on its own tick inside the running loop and
+//! closed explicitly after the bounded join, before `main` tears the engine
+//! down; a flush/close error is fatal (exit 255). Both run on the blocking
+//! pool: a sink may block (backpressure) and must never stall the reactor.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -27,6 +32,7 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Notify, mpsc};
 
 use crate::config::Config;
+use crate::info_sink::{CLOSE_TIMEOUT, CloseOutcome, InfoSinkHandle};
 use crate::pool::{EnginePool, spawn_engine_pool};
 use crate::queue_run::{RunOutcome, monitor_interval};
 use crate::record::{ParseError, RecordInfo, parse_record};
@@ -177,6 +183,27 @@ async fn recv_if_installed(sig: &mut Option<Signal>) {
     }
 }
 
+/// Waits for the next tick of `tick`; never completes when it is `None`.
+/// Cancel-safe.
+async fn tick_if_enabled(tick: &mut Option<tokio::time::Interval>) {
+    match tick {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Runs a (possibly blocking) INFO sink call on the blocking pool.
+async fn run_blocking(
+    sink: InfoSinkHandle,
+    f: fn(&InfoSinkHandle) -> Result<(), String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || f(&sink))
+        .await
+        .unwrap_or_else(|e| Err(format!("INFO sink call panicked: {e}")))
+}
+
 /// Last known queue depth + the mode-transition log hysteresis.
 #[derive(Default)]
 struct DepthProbe {
@@ -269,6 +296,11 @@ where
     let mut depth_tick = tokio::time::interval(Duration::from_secs(config.mq_recheck_secs.max(1)));
     depth_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut probe = DepthProbe::default();
+    let mut flush_tick = config.info_sink.is_enabled().then(|| {
+        let mut t = tokio::time::interval(config.info_sink_flush);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        t
+    });
     let mut status = StatusTicker::new(config.redo_percent, threads - redo_pref, redo_pref);
     let mut throughput = ThroughputTicker::default();
     let mut s = Session {
@@ -321,6 +353,16 @@ where
                 probe.observe(s.transport.depth().await);
                 false
             }
+            _ = tick_if_enabled(&mut flush_tick) => {
+                match run_blocking(config.info_sink.clone(), |sink| sink.flush()).await {
+                    Ok(()) => false,
+                    Err(e) => {
+                        tracing::error!("{e}");
+                        s.fail(e);
+                        true
+                    }
+                }
+            }
             delivery = s.transport.recv() => {
                 s.on_delivery(delivery, &work_tx, &shutdown_notify).await
             }
@@ -357,9 +399,28 @@ where
     // whether it waits on a request or on handing back a response.
     drop(stats_req_tx);
     drop(stats_resp_rx);
-    let all_workers_joined = engine_threads
+    let mut all_workers_joined = engine_threads
         .join_bounded(deadline, Some(stats_handle))
         .await;
+
+    // Final INFO seal, after the join and before the engine teardown; bounded
+    // by CLOSE_TIMEOUT. A stuck close is fatal and takes the leak-on-exit path.
+    let sink = config.info_sink.clone();
+    let closed = tokio::task::spawn_blocking(move || sink.close_within(CLOSE_TIMEOUT))
+        .await
+        .unwrap_or_else(|e| CloseOutcome::Failed(format!("INFO sink close panicked: {e}")));
+    match closed {
+        CloseOutcome::Closed => {}
+        CloseOutcome::Failed(e) => {
+            tracing::error!("{e}");
+            s.fail(e);
+        }
+        CloseOutcome::TimedOut(e) => {
+            tracing::error!("{e}");
+            s.fail(e);
+            all_workers_joined = false;
+        }
+    }
 
     let started_snapshot: HashSet<u64> = started
         .lock()
@@ -673,6 +734,37 @@ mod tests {
         assert_eq!(e.len(), POISON_EXCERPT_CHARS + "…truncated".len());
         // Non-UTF-8 is decoded lossily, never panics.
         assert_eq!(poison_excerpt(&[0xff]), "\u{fffd}");
+    }
+
+    #[test]
+    fn disabled_flush_tick_never_fires_and_enabled_one_does() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("tokio runtime");
+        rt.block_on(async {
+            let mut none = None;
+            let r = tokio::time::timeout(Duration::from_millis(50), tick_if_enabled(&mut none));
+            assert!(r.await.is_err(), "a disabled tick must never complete");
+            let mut some = Some(tokio::time::interval(Duration::from_millis(10)));
+            let r = tokio::time::timeout(Duration::from_secs(5), tick_if_enabled(&mut some));
+            assert!(r.await.is_ok());
+        });
+    }
+
+    #[test]
+    fn run_blocking_returns_the_sink_result() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let none = InfoSinkHandle::default();
+        assert_eq!(
+            rt.block_on(run_blocking(none.clone(), |s| s.flush())),
+            Ok(())
+        );
+        assert_eq!(rt.block_on(run_blocking(none, |s| s.close())), Ok(()));
     }
 
     #[test]

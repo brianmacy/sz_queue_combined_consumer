@@ -1,14 +1,19 @@
-# sz_rabbit_combined_consumer
+# sz_queue_combined_consumer
 
 Combined Senzing **load + redo** driver in Rust. One binary runs both roles —
-the load role of [`sz_rabbit_consumer_rust`](../sz_rabbit_consumer_rust)
-(queue → `add_record`) and the redo role of
-[`sz_simple_redoer_rust`](../sz_simple_redoer_rust) (`get_redo_record` →
+the load role (queue → `add_record`) and the redo role (`get_redo_record` →
 `process_redo_record`) — in a single worker pool, governed by a single
-`SENZING_REDO_PERCENT` knob. It does **not** replace those standalone drivers;
-it combines their two roles into one process so capacity can flow between load
-and redo. Like its siblings, the container is **distroless** (no interpreter,
-no shell) and glue-layer errors surface at compile time.
+`SENZING_REDO_PERCENT` knob, so capacity can flow between load and redo. It
+**replaces** the standalone Rust drivers
+[`sz_rabbit_consumer_rust`](https://github.com/brianmacy/sz_rabbit_consumer_rust)
+(load) and
+[`sz_simple_redoer_rust`](https://github.com/brianmacy/sz_simple_redoer_rust)
+(redo), both now archived: run the RabbitMQ binary for the consumer and
+`--redo-percent 100` (the pure redoer) for the redoer. The RabbitMQ publisher
+[`sz_rabbit_publisher`](https://github.com/brianmacy/sz_rabbit_publisher) is
+not replaced (this repository ships only an Artemis publisher). The container
+is **distroless** (no interpreter, no shell) and glue-layer errors surface at
+compile time.
 
 Design document: `~/.claude/plans/dbperf_combined_consumer_design.md`.
 
@@ -28,6 +33,8 @@ client (compile-time backend selection — no runtime switch, no feature flags):
 | `sz-activemq-amqp` | lib | — (Artemis URL/credentials, connection, anycast terminus, record body encode/decode; shared by the ActiveMQ consumer + publisher) | `fe2o3-amqp` |
 | `sz-record-transform` | lib | — (record-transform plugin C ABI + Rust export macro) | none |
 | `sz-record-transform-example` | cdylib | — (example plugin; used by tests) | none |
+| `sz-info-sink` | lib | — (INFO sink plugin C ABI + Rust export macro) | none |
+| `sz-info-sink-file` | cdylib | — (INFO sink plugin writing sealed JSONL files) | none |
 
 `cargo build -p sz_rabbit_combined_consumer` never compiles the AWS SDK, and
 `cargo build -p sz_sqs_combined_consumer` never compiles `lapin`. All three binaries
@@ -40,8 +47,9 @@ The ActiveMQ binary takes `--url` / `SENZING_ACTIVEMQ_URL` and `--queue` /
 `SENZING_ACTIVEMQ_QUEUE` and compiles neither `lapin` nor the AWS SDK; see
 [ActiveMQ Artemis specifics](#activemq-artemis-specifics).
 
-> NOTE: the repository is being renamed to `sz_queue_combined_consumer` to
-> reflect the multi-backend scope (the binaries keep their per-backend names).
+> NOTE: the repository was renamed from `sz_rabbit_combined_consumer` to
+> `sz_queue_combined_consumer` for the multi-backend scope; the binaries keep
+> their per-backend names.
 
 ## Why combined
 
@@ -99,6 +107,10 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_REJECT_FILE` (`--reject-file`) | `<input>.rejected.jsonl` | file mode only: JSONL file that receives every rejected input line **verbatim** (unparseable, engine bad input, retry timeout, SENZ0082). Created lazily on the first reject, opened in append mode. Reprocess with `--file <reject file>`. |
 | `SENZING_RECORD_TRANSFORM_PLUGIN` (`--record-transform-plugin`) | none | shared library that rewrites every load record before `add_record` (all backends). See [Record transform plugins](#record-transform-plugins). |
 | `SENZING_RECORD_TRANSFORM_CONFIG` (`--record-transform-config`) | empty | opaque string passed to the plugin's init (e.g. JSON) |
+| `SENZING_REDO_DRAIN_MAX_SECS` (`--redo-drain-max-secs`) | `0` (off) | file mode, redo% > 0: maximum seconds to keep draining redo after the input file is read to its end; `0` = no cap (default: the cap is opt-in; set it together with the caller's job/task timeout). On expiry one final redo probe is made; if redo is drained the run ends normally (exit 0), otherwise redo fetching stops, the remaining redo count is logged and the process exits **3**. A cap below 2 × `--redo-sleep-secs` logs a startup warning. Not applicable in queue mode or the pure redoer (no end of input; accepted and ignored). See *File input*. |
+| `SENZING_INFO_SINK` (`--info-sink`) | none | shared library implementing the INFO sink ABI; forces WITH_INFO on add and redo and receives every payload (all modes). See [INFO sink plugins](#info-sink-plugins). |
+| `SENZING_INFO_SINK_CONFIG` (`--info-sink-config`) | empty | config string passed to the sink's `sz_is_create` (the file sink takes JSON) |
+| `SENZING_INFO_SINK_FLUSH_SECS` (`--info-sink-flush-secs`) | 30 | seconds between flushes (seal the current output) issued by a timer (file mode: its own thread, so it also runs during the load); ≥ 1 |
 | `SENZING_PREFETCH` (`--prefetch`) | RabbitMQ/ActiveMQ: threads + 2; SQS: 2 × threads | queue mode, every binary: the **total** in-flight cap — messages received but not yet settled (RabbitMQ: the `basic_qos` prefetch; SQS: received and not yet deleted; ActiveMQ: AMQP link credit kept at cap − unsettled). A value below threads is raised to threads (with a warning). |
 | `SENZING_SQS_QUEUE_URL` (`-q`/`--queue-url`) | required iff redo% < 100 | SQS binary only: source queue URL |
 | `SENZING_SQS_DEAD_LETTER_QUEUE_URL` (`--dead-letter-queue-url`) | discovered | SQS binary only: where rejected records are sent. Default: the source queue's `RedrivePolicy` → `deadLetterTargetArn` → `GetQueueUrl`. Printed at startup as `DeadLetter: <url>`. |
@@ -113,9 +125,10 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_ACTIVEMQ_RECONNECT_TIMEOUT` (`--reconnect-timeout`) | 300 | ActiveMQ binary only: seconds to keep retrying an unreachable broker at **startup** (every 5 s, 30 s per attempt); `0` = never give up. Bad credentials / URL still fail at once. |
 | `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | every binary, queue mode: diagnostic MQ depth probe cadence (RabbitMQ: passive declare; SQS: `ApproximateNumberOfMessages`; ActiveMQ: no AMQP depth verb, depth reported unknown) and the `MQ drained (depth 0)` / `MQ active (depth N)` transition log. Not a correctness poll. |
 | `SENZING_REDO_SLEEP_TIME_IN_SECONDS` (`--redo-sleep-secs`) | 60 | fetcher pause on empty redo queue (auto-shortened to 2 s while redo is still in flight, for cascade drain) |
+| `SENZING_REDO_STATS_INTERVAL` (`--redo-stats-interval`) | 1000 | log a redo throughput line (`Stats: N redo records processed, R/sec`) every this many processed redo records; ≥ 1 |
 | `LONG_RECORD` (`--long-record`) | 300 | long-record threshold, seconds; stats cadence = LONG_RECORD/2 |
 | `SENZING_LOG_LEVEL` | info | log level (`RUST_LOG` overrides) |
-| `-i`/`--info` | off | print WithInfo payloads (engine-level no-op; print gating only) |
+| `-i`/`--info` | off | print WithInfo payloads to stdout (passes WITH_INFO). Independent of `--info-sink`; both may be set. |
 | `-t`/`--debugTrace` | off | engine debug trace |
 
 Validation is loud (exit 1) and completes before the Senzing engine is
@@ -125,8 +138,14 @@ initialized, in all three binaries: redo% ∉ [0,100]; redo% < 100 without URL/q
 `--max-messages` ∉ 1..=10, `--visibility-timeout` ∉ 0..=43200; ActiveMQ URL
 not `amqp://` / `amqps://` with a host, or a password without a user. Exit codes:
 **1** = configuration/validation failure at startup, **255** = fatal runtime
-error (engine/DB/broker) after an orderly teardown, **0** = clean shutdown or
-file EOF. (The standalone drivers disagreed with each other here; the combined
+error (engine/DB/broker/INFO sink, including a sink close stuck past 5 s)
+after an orderly teardown, **3** = file mode stopped at the redo drain cap
+(`--redo-drain-max-secs`) with redo still queued (nothing failed; the backlog
+was left behind), **0** = clean shutdown or file EOF. A fatal error outranks
+the cap (255). A SIGTERM received BEFORE the cap expires is a clean stop (0),
+never a cap expiry; once the cap HAS expired (the fetcher stopped and the run
+is finishing already-fetched records) the exit is decided and a SIGTERM still
+exits 3. (The standalone drivers disagreed with each other here; the combined
 driver uses this one convention for all three binaries.)
 
 ## SQS specifics
@@ -347,6 +366,117 @@ sz_rabbit_combined_consumer --file records.jsonl \
     --record-transform-config '{"ADDED_FIELD":"Y"}'
 ```
 
+## INFO sink plugins
+
+`--info-sink <lib.so>` loads a shared library that receives every WITH_INFO
+payload (`{"DATA_SOURCE":…,"RECORD_ID":…,"AFFECTED_ENTITIES":[{"ENTITY_ID":…}]}`,
+kept raw — a redo INFO may legitimately carry an empty key and no affected
+entities). It works exactly like the transform plugin: `dlopen`ed once at
+startup with an ABI version check (load/create failure exits 1, before engine
+init), shared by every worker, never `dlclose`d. With a sink configured:
+
+- `add_record` and `process_redo_record` run WITH_INFO; each worker writes the
+  payload right after the engine call (kind 0 ADD, 2 REDO; kind 1 DELETE is
+  reserved for a delete program and never written by this consumer). A
+  blocking write is backpressure.
+- A timer calls `sz_is_flush` every `--info-sink-flush-secs` (file mode: on
+  its own thread from before the first read, so files are sealed during the
+  load too; queue mode: the event loop; pure redoer: the monitor loop).
+- `sz_is_close` (final seal) is called EXPLICITLY once the workers have joined
+  — or the shutdown grace ran out — and before the engine is torn down, on the
+  SIGTERM path too. Nothing relies on `Drop`: the forced-exit paths skip
+  destructors. The close runs on its own thread and is bounded by **5 s**: a
+  close that does not return is fatal (exit 255, the stuck plugin's path is
+  logged) and the process takes the leak-on-exit path (no native teardown).
+- **Durability contract.** `sz_is_write` returning 0 must mean the line has
+  left the plugin's process memory (handed to the OS): the consumer acks the
+  delivery / advances the resume watermark right after it, so an in-process
+  buffer would lose INFO of acknowledged records on SIGKILL / OOM. A seal
+  (`sz_is_flush` / `sz_is_close`) makes the output complete.
+- **Every sink error (create, write, flush, close) is fatal** — never a reject:
+  orderly shutdown, exit 255 (create: exit 1). A record whose INFO could not
+  be written is never reported as loaded: file mode does not advance the
+  `--skip-lines` watermark past it, queue mode leaves the delivery unsettled
+  for redelivery (re-adding is idempotent and re-emits the INFO). A redo record
+  is dequeued at fetch, so its INFO is lost if that one write fails; it is
+  then not counted (or printed) as processed.
+- **Resume point with a sink (file mode).** The printed `--skip-lines N` is the
+  completion watermark captured just before the last SUCCESSFUL seal, so
+  every line up to N has its INFO in a sealed file. After a write, flush or
+  close failure the run exits 255 and N stays at that last seal (never past
+  it). Queue mode has no resume point: deliveries acked before a later seal
+  failure stay acked (their lines were handed to the OS; the run exits 255).
+- **Reader contract.** Read the INFO output only after the consuming job has
+  exited successfully (0, or 3 for the drain cap). The files of a failed run
+  are discarded by the caller (or, in file mode, kept only when the caller
+  resumes from the printed `--skip-lines`, whose lines are all in sealed
+  files). To pick files up while the job runs, use the file sink's
+  `seal_marker`.
+- The ABI version is checked first, before any other symbol is resolved, so a
+  plugin built for another version fails with a version-mismatch error.
+- `--info` printing is unchanged and independent.
+
+C ABI (version 1, `crates/info-sink-abi/src/lib.rs`; Rust plugins implement
+`InfoSink` and call `export_info_sink!(Type, Type::new)`):
+
+```c
+uint32_t sz_is_abi_version(void);
+void*    sz_is_create(const char* cfg_utf8, char** err_out);     // NULL = failure
+int32_t  sz_is_write(void* h, uint32_t kind /*0 ADD,1 DELETE,2 REDO*/,
+                     const char* info, size_t len, char** err_out); // thread-safe, may block; 0 ok / -1 fatal
+int32_t  sz_is_flush(void* h, char** err_out);  // seal current file; next write opens a NEW one
+int32_t  sz_is_close(void* h, char** err_out);  // final seal, called once
+void     sz_is_free(char* p);                   // frees plugin-owned strings
+void     sz_is_destroy(void* h);                // no dlclose
+```
+
+### File sink (`sz-info-sink-file`)
+
+Writes each payload as one JSONL line into NEW files only (`create_new`;
+never append, never rename, no temp files — stage volumes reject those),
+named `<prefix><seq06>.jsonl` (from `000001`). Each line is written with ONE
+unbuffered `write(2)` (no in-process buffer; see the durability contract). A
+file is sealed — `fsync` (`EINVAL`/`ENOTSUP`/`EOPNOTSUPP`/`ENODEV`/unsupported
+tolerated, for volumes without it) then an explicit, error-checked `close(2)` — after
+`rotate_records` lines, when a write finds it older than `rotate_secs`, on
+every consumer flush and on close; no empty files are created. Any write,
+create, fsync or close error marks the sink FAILED: the open file is dropped
+unsealed (it may end in a partial line) and every later call fails. At create
+the directory is scanned and numbering continues after the highest existing
+`<prefix>NNNNNN.jsonl`, so a restart never collides. A payload containing a
+line break is rejected (fatal) rather than altered.
+
+A file exists under its FINAL name from its first line (no rename at seal), so
+a listing taken mid-run can show a file still being written; see the reader
+contract above. With `"seal_marker": true` an empty `<file>.sealed` is created
+after each successful seal (only marked files are complete; a crash can leave
+a sealed file without its marker, never the reverse). File names are
+`<seq06>`: after file 999999 the number grows to 7 digits
+(`…1000000.jsonl`), where lexical order no longer matches sequence order —
+readers must sort by the parsed number, not by name.
+
+Cost (measured on a local APFS volume): an unbuffered line write is ~1.9 µs
+(~530k lines/s through the plugin's mutex) vs ~0.14 µs buffered; with the
+default rotation the consumer's records/s with the sink is unchanged within
+run-to-run noise. Each seal costs one `fsync` (macOS: `F_FULLFSYNC`, several
+ms), so a very small `rotate_records` is slower (rotating every 4 records:
+9–30 % fewer records/s in the same test).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `dir` | required | output directory; must exist |
+| `prefix` | required | file-name prefix, no `/` |
+| `rotate_records` | 10000 | lines per file, ≥ 1 |
+| `rotate_secs` | 30 | maximum file age, ≥ 1 (checked at write; the consumer's flush seals idle files) |
+| `seal_marker` | `false` | create an empty `<file>.sealed` after each successful seal |
+
+```bash
+cargo build --release -p sz-info-sink-file   # target/release/libsz_info_sink_file.so
+sz_rabbit_combined_consumer --file /work/in/p0/records.json \
+    --info-sink ./libsz_info_sink_file.so \
+    --info-sink-config '{"dir":"/work/info","prefix":"info-c0-","rotate_records":10000,"rotate_secs":30}'
+```
+
 ## Failure handling
 
 * **Poison MQ record** (bad JSON / missing DATA_SOURCE/RECORD_ID / non-UTF-8 /
@@ -499,7 +629,9 @@ You need:
   baseline as the Senzing 4.3.x runtime packages. Running inside
   `senzing/senzingsdk-runtime` always works.
 
-The record-transform example plugin (`crates/transform-example`) is not
+The INFO file sink (`crates/info-sink-file`) is not in the archive yet;
+build it with `cargo build --release -p sz-info-sink-file`. The
+record-transform example plugin (`crates/transform-example`) is not
 shipped: it is a reference implementation for writing your own plugin, not a
 useful transform, and a plugin must be built against the same
 `sz-record-transform` ABI version as the driver anyway — build it with
@@ -568,6 +700,23 @@ the load. On completion — or on SIGTERM — it prints a safe resume
 offset; restart with `--skip-lines N` to continue where it stopped
 (`add_record` is idempotent, so an interrupted run is safe to resume).
 
+**Redo drain cap.** The drain tail is bounded by `--redo-drain-max-secs`
+(opt-in: default `0` = no cap; set it together with the caller's own job or
+task timeout so the cap fires first). Its clock starts when the reader reaches the
+end of the file (a slow load never eats into it). Whichever comes first wins:
+the two-empty-probe rule above (exit 0) or the cap. The cap can expire while
+the rule is still waiting for its second empty probe (a cap below
+2 × `--redo-sleep-secs` always can, and logs a startup warning), so at expiry
+the fetcher makes ONE final probe when every record has completed and no redo
+it fetched is outstanding: empty means redo is drained and the run exits 0.
+Otherwise (adds or redo still running, or the probe returned a record, which
+is still processed) the fetcher stops fetching (a record it already fetched is
+still processed), in-flight work finishes, the INFO sink is closed, `REDO
+DRAIN CAP EXPIRED: … stopped fetching redo with N redo record(s) remaining in
+the queue` is logged (counted once after the pool stopped) and the process
+exits **3**. A SIGTERM before the cap expires is a normal graceful stop (exit
+0); a SIGTERM after it expired still exits 3; a fatal error exits 255.
+
 **Rejects.** A file has no dead-letter queue, so every rejected line —
 unparseable JSON, engine bad input, retry timeout (`SENZ0010`), `SENZ0082` — is
 appended verbatim to a JSONL reject file (`--reject-file`, default
@@ -592,6 +741,7 @@ sz_rabbit_combined_consumer --file /data/records.jsonl.rejected.jsonl \
 | SQS e2e | `cargo test -p sz_sqs_combined_consumer --test sqs_e2e -- --nocapture --test-threads=1` | ElasticMQ + engine |
 | ActiveMQ publisher e2e | `cargo test -p sz_activemq_publisher --test publisher_e2e -- --nocapture --test-threads=1` | Artemis (AMQP + Jolokia); no engine |
 | ActiveMQ e2e | `cargo test -p sz_activemq_combined_consumer --test activemq_e2e -- --nocapture --test-threads=1` | Artemis (AMQP + Jolokia) + engine; run after the publisher suite (its round-trip test runs `target/debug/sz_activemq_publisher`) |
+| INFO sink + drain cap e2e | `cargo test -p sz_rabbit_combined_consumer --test info_sink_e2e -- --nocapture --test-threads=1` | engine only (creates its own throwaway SQLite repository from `PIPELINE` in `SENZING_ENGINE_CONFIGURATION_JSON`; copies `templates/G2C.db.template`, or the file named by `SZ_E2E_SQLITE_TEMPLATE` on Linux packages that ship only the schema DDL); the queue-mode cases also need `SENZING_AMQP_URL` |
 
 `.github/workflows/ci.yml` runs fmt + clippy, the release build + unit tests,
 the e2e suites in one `integration` job (Postgres, RabbitMQ, ElasticMQ
@@ -600,6 +750,27 @@ postgres / mssql DB-closure variants on the RabbitMQ and SQS images).
 `--test-threads=1` is required: the engine is a process-global singleton.
 An e2e test whose infrastructure is missing prints `SKIP` and passes, unless
 `IT_REQUIRE_INFRA=1` (set in CI), which turns every skip into a failure.
+
+The `info_sink_e2e` failure cases use only real components and real faults,
+and all of them run as root (CI containers): a sink that fails or wedges is
+the test-fixture plugin `sz-info-sink-fault-fixture` (a real cdylib behind
+the real loader; its config string names the entry points that fail, block
+forever or sleep); a database failure is a table dropped from a PRIVATE
+throwaway SQLite copy of the repository while the driver runs; an engine that
+cannot initialize is a repository path that cannot be opened; a sink
+directory that disappears mid-load is replaced by a regular file (ENOTDIR).
+
+Coverage: `cargo llvm-cov` (with Homebrew rustc, point `LLVM_COV` and
+`LLVM_PROFDATA` at a matching LLVM's `bin/`). Coverage builds (`--cfg
+coverage`) write the profile before a forced `_exit`, so leak-on-exit runs
+are measured too. Two kinds of lines stay uncovered: an OS thread-spawn
+failure (`std::thread::Builder::spawn` returning `Err`), which no real limit
+reproduces reliably (macOS has no per-process thread rlimit; Linux
+`RLIMIT_NPROC` counts every task of the user and does not apply to root),
+and the `export_info_sink!` entry points when several plugins are measured in
+one report: their `#[no_mangle]` symbols share names across binaries, so
+their profile records collide (`cargo llvm-cov -p sz-info-sink` alone shows
+them covered).
 
 ### Running the e2e tests locally
 
