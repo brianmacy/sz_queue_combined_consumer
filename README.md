@@ -1,14 +1,19 @@
-# sz_rabbit_combined_consumer
+# sz_queue_combined_consumer
 
 Combined Senzing **load + redo** driver in Rust. One binary runs both roles —
-the load role of [`sz_rabbit_consumer_rust`](../sz_rabbit_consumer_rust)
-(queue → `add_record`) and the redo role of
-[`sz_simple_redoer_rust`](../sz_simple_redoer_rust) (`get_redo_record` →
+the load role (queue → `add_record`) and the redo role (`get_redo_record` →
 `process_redo_record`) — in a single worker pool, governed by a single
-`SENZING_REDO_PERCENT` knob. It does **not** replace those standalone drivers;
-it combines their two roles into one process so capacity can flow between load
-and redo. Like its siblings, the container is **distroless** (no interpreter,
-no shell) and glue-layer errors surface at compile time.
+`SENZING_REDO_PERCENT` knob, so capacity can flow between load and redo. It
+**replaces** the standalone Rust drivers
+[`sz_rabbit_consumer_rust`](https://github.com/brianmacy/sz_rabbit_consumer_rust)
+(load) and
+[`sz_simple_redoer_rust`](https://github.com/brianmacy/sz_simple_redoer_rust)
+(redo), both now archived: run the RabbitMQ binary for the consumer and
+`--redo-percent 100` (the pure redoer) for the redoer. The RabbitMQ publisher
+[`sz_rabbit_publisher`](https://github.com/brianmacy/sz_rabbit_publisher) is
+not replaced (this repository ships only an Artemis publisher). The container
+is **distroless** (no interpreter, no shell) and glue-layer errors surface at
+compile time.
 
 Design document: `~/.claude/plans/dbperf_combined_consumer_design.md`.
 
@@ -42,8 +47,9 @@ The ActiveMQ binary takes `--url` / `SENZING_ACTIVEMQ_URL` and `--queue` /
 `SENZING_ACTIVEMQ_QUEUE` and compiles neither `lapin` nor the AWS SDK; see
 [ActiveMQ Artemis specifics](#activemq-artemis-specifics).
 
-> NOTE: the repository is being renamed to `sz_queue_combined_consumer` to
-> reflect the multi-backend scope (the binaries keep their per-backend names).
+> NOTE: the repository was renamed from `sz_rabbit_combined_consumer` to
+> `sz_queue_combined_consumer` for the multi-backend scope; the binaries keep
+> their per-backend names.
 
 ## Why combined
 
