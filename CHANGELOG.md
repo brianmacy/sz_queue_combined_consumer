@@ -4,11 +4,23 @@ Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections head
 
 ## Unreleased
 
-* **Security: `tokio` 1.53.2 -> 1.53.3 (RUSTSEC-2026-0386,** `AsyncFd::new` I/O-safety unsoundness; cargo-deny failed the scheduled Security Audit on it). Lock-only change.
+* **ActiveMQ: retry an unreachable broker at startup.** New `--reconnect-timeout`
+  / `SENZING_ACTIVEMQ_RECONNECT_TIMEOUT` (default 300 s, `0` = forever): the
+  startup connect retries transient errors every 5 s (30 s per attempt) instead
+  of exiting on the first `ECONNREFUSED`; SASL / URL / scheme errors still fail
+  immediately. A lost link mid-run stays fatal (exit 255). Fixes a broker restart
+  turning every driver into a restart loop (measured ~7 restarts each); after the
+  fix one broker restart cost exactly one restart per driver (62/62).
+
+* **Security: lock-only bumps for the advisories cargo-deny reports:** `tokio`
+  1.53.2 -> 1.53.3 (RUSTSEC-2026-0386), `ctutils` 0.4.3 -> 0.4.4
+  (RUSTSEC-2026-0385), `rustls-webpki` 0.103.15 -> 0.103.16
+  (RUSTSEC-2026-0382), `webpki-roots` / `webpki-root-certs` 1.0.9 -> 1.0.10
+  (RUSTSEC-2026-0381 / -0383).
+
 * **CI: `docker/setup-buildx-action` 4.3.0 -> 4.4.1** (Dependabot #36).
 * **Test: `e2e_redo_processing_failure_is_fatal` loads its records with one worker.** A concurrent load enqueues a scheduling-dependent amount of redo (measured 6-8 rows with 4 workers, usually 0 with 8; always 5 with 1); a load that enqueued none left the pure redoer idle until the 120 s exit timeout (CI failure on f82f2e8).
 * **Docs: the README states that this repository replaces `sz_rabbit_consumer_rust` and `sz_simple_redoer_rust`** (both archived); `sz_rabbit_publisher` (RabbitMQ publisher) is not replaced.
-* **Security: `ctutils` 0.4.3 -> 0.4.4 (RUSTSEC-2026-0385,** non-constant-time mask generation; transitive via the RustCrypto stack). Lock-only change.
 * **Redo fetcher counters `stats::REDO_FETCHED` and `stats::REDO_EMPTY_PROBES`** (non-empty `get_redo_record()` results, counted at dequeue, and empty probes, including the drain-cap final probe), so an embedding service can prove no redo is outstanding (`REDO_FETCHED - REDOS_PROCESSED - REDOS_DROPPED == 0` covers records still in the channel). No behaviour change.
 * **CI: `dtolnay/rust-toolchain` pinned to the `v1` tag commit (`683b588`, `# v1`),** with the toolchain set explicitly: `1.94.1` (the MSRV) for the build, test and release jobs and `stable` for the security audit, whose `cargo-audit` needs a newer compiler (it was a `stable` branch commit with a custom comment that Dependabot could not track). The `ci.yml` image build step now passes its build arguments as a bash array (actionlint SC2086).
 * **Redo drain cap (file mode): `--redo-drain-max-secs` /
@@ -81,10 +93,6 @@ Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections head
   directory). Coverage builds (`--cfg coverage`) write the LLVM profile
   before a forced `_exit`; the RLIMIT_FSIZE test child lifts its limit before
   exiting (it left a truncated profile).
-* **Dependencies:** rustls-webpki 0.103.16, webpki-roots and
-  webpki-root-certs 1.0.10 (RUSTSEC-2026-0381, -0382, -0383; transitive via
-  aws-sdk-sqs and fe2o3-amqp).
-
 ## 0.5.0 — ActiveMQ publisher; multi-frame AMQP transfers (2026-10-16)
 
 ### Fixed

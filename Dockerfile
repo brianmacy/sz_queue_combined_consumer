@@ -17,7 +17,8 @@
 # binary name in the final COPY, and the ENTRYPOINT differ.
 
 ARG SENZING_RUNTIME_IMAGE=senzing/senzingsdk-runtime:4.3.3
-# Official images via the mirror.gcr.io mirror (same digests as Docker Hub, no pull rate limit).
+# Docker Official Images via mirror.gcr.io (Google's cache of Docker Hub) to avoid Docker Hub's
+# anonymous pull limit; public.ecr.aws returned 429 to unauthenticated pulls.
 ARG RUST_IMAGE=mirror.gcr.io/library/rust:1.94.1
 
 # Global build args (declared before the first FROM so the backend-libs stage

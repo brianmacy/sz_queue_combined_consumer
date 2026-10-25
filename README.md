@@ -122,6 +122,7 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_ACTIVEMQ_URL` (`-u`/`--url`) | required iff redo% < 100 | ActiveMQ binary only: `amqp://` or `amqps://` broker URL; credentials may be embedded (`amqp://user:pass@host:5672`, percent-encoded) |
 | `SENZING_ACTIVEMQ_USER` / `SENZING_ACTIVEMQ_PASSWORD` (`--user` / `--password`) | from URL | ActiveMQ binary only: SASL PLAIN credentials; each overrides the URL's. None at all = anonymous. |
 | `SENZING_ACTIVEMQ_QUEUE` (`-q`/`--queue`) | required iff redo% < 100 | ActiveMQ binary only: ANYCAST queue name, or an FQQN `address::queue` |
+| `SENZING_ACTIVEMQ_RECONNECT_TIMEOUT` (`--reconnect-timeout`) | 300 | ActiveMQ binary only: seconds to keep retrying an unreachable broker at **startup** (every 5 s, 30 s per attempt); `0` = never give up. Bad credentials / URL still fail at once. |
 | `SENZING_MQ_RECHECK_SECONDS` (`--mq-recheck-secs`) | 30 | every binary, queue mode: diagnostic MQ depth probe cadence (RabbitMQ: passive declare; SQS: `ApproximateNumberOfMessages`; ActiveMQ: no AMQP depth verb, depth reported unknown) and the `MQ drained (depth 0)` / `MQ active (depth N)` transition log. Not a correctness poll. |
 | `SENZING_REDO_SLEEP_TIME_IN_SECONDS` (`--redo-sleep-secs`) | 60 | fetcher pause on empty redo queue (auto-shortened to 2 s while redo is still in flight, for cascade drain) |
 | `SENZING_REDO_STATS_INTERVAL` (`--redo-stats-interval`) | 1000 | log a redo throughput line (`Stats: N redo records processed, R/sec`) every this many processed redo records; ≥ 1 |
@@ -235,6 +236,14 @@ driver uses this one convention for all three binaries.)
   60 s idle timeout catches a silent broker), or a protocol violation — is
   **fatal**: orderly shutdown, final totals, exit 255. Unsettled deliveries
   are redelivered by the broker.
+* **Broker restarts.** The connect at startup retries transient failures
+  (connection refused / reset / timed out — a broker restarting) every 5 s for
+  up to `--reconnect-timeout` (default 300 s), logging each failed attempt and
+  `connected to ActiveMQ after N attempts`; permanent failures (SASL, URL,
+  scheme) fail at once. So when the broker restarts, each driver exits once on
+  the lost link and its restart waits for the broker instead of exiting again
+  (before this, a restart policy turned one broker outage into a crash loop:
+  ~7 restarts per driver, each a full engine init).
 * **Bodies.** An AMQP `Data` section (bytes; multiple sections are
   concatenated) or an `AmqpValue` string (what a JMS `TextMessage` sends) is
   the record JSON; an `AmqpValue` binary is accepted too. Anything else
