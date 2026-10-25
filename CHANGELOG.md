@@ -2,6 +2,22 @@
 
 Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections headed `0.4.1 — …` ship in tag `v0.4.1` (2026-10-09); all sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); all sections headed `0.3.0 — …` shipped in tag `v0.3.0` (2026-09-23). Each keeps the date it landed on `main`.
 
+## Unreleased
+
+* **ActiveMQ: retry an unreachable broker at startup.** New `--reconnect-timeout`
+  / `SENZING_ACTIVEMQ_RECONNECT_TIMEOUT` (default 300 s, `0` = forever): the
+  startup connect retries transient errors every 5 s (30 s per attempt) instead
+  of exiting on the first `ECONNREFUSED`; SASL / URL / scheme errors still fail
+  immediately. A lost link mid-run stays fatal (exit 255). Fixes a broker restart
+  turning every driver into a restart loop (measured ~7 restarts each); after the
+  fix one broker restart cost exactly one restart per driver (62/62).
+
+* **Security: lock-only bumps for the advisories cargo-deny reports:** `tokio`
+  1.53.2 -> 1.53.3 (RUSTSEC-2026-0386), `ctutils` 0.4.3 -> 0.4.4
+  (RUSTSEC-2026-0385), `rustls-webpki` 0.103.15 -> 0.103.16
+  (RUSTSEC-2026-0382), `webpki-roots` / `webpki-root-certs` 1.0.9 -> 1.0.10
+  (RUSTSEC-2026-0381 / -0383).
+
 ## 0.5.0 — ActiveMQ publisher; multi-frame AMQP transfers (2026-10-16)
 
 ### Fixed
@@ -51,14 +67,6 @@ Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections head
   (publisher -> real consumer -> engine). CI runs the publisher suite before the
   consumer suite; the release tarball ships the new binary. `deny.toml` allows
   `bzip2-1.0.6` (libbz2-rs-sys, permissive), as in `sz_rabbit_publisher`.
-
-* **ActiveMQ: retry an unreachable broker at startup.** New `--reconnect-timeout`
-  / `SENZING_ACTIVEMQ_RECONNECT_TIMEOUT` (default 300 s, `0` = forever): the
-  startup connect retries transient errors every 5 s (30 s per attempt) instead
-  of exiting on the first `ECONNREFUSED`; SASL / URL / scheme errors still fail
-  immediately. A lost link mid-run stays fatal (exit 255). Fixes a broker restart
-  turning every driver into a restart loop (measured ~7 restarts each); after the
-  fix one broker restart cost exactly one restart per driver (62/62).
 
 * **`--version` comes from the release tag.** Release builds set `RELEASE_VERSION`
   from the git tag (`core::VERSION`), and the release workflow fails if any
