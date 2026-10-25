@@ -517,6 +517,17 @@ struct LoadFixture {
     combined: CombinedCase,
     redoer: RedoerCase,
     body_types: BodyTypesCase,
+    publisher_round_trip: PublisherRoundTripCase,
+}
+
+#[derive(serde::Deserialize)]
+struct PublisherRoundTripCase {
+    queue: String,
+    count: usize,
+    blank_every: usize,
+    published_within_secs: u64,
+    loaded_within_secs: u64,
+    record_template: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -733,6 +744,82 @@ async fn e2e_activemq_data_and_text_bodies_both_load() {
         "nothing may be rejected\n{stdout}"
     );
     assert_eq!(dead_letter_count(&queue), 0, "nothing dead-lettered");
+}
+
+/// `sz_activemq_publisher` (built from the workspace next to this driver)
+/// streams a gzip JSONL file onto the queue, then the driver loads all of
+/// it: the publisher's wire encoding is exactly what the consumer decodes.
+#[tokio::test]
+async fn e2e_activemq_publisher_round_trip() {
+    let Some(url) = gate() else { return };
+    let publisher = std::path::Path::new(driver_bin()).with_file_name("sz_activemq_publisher");
+    if !publisher.exists() {
+        skip(format_args!(
+            "SKIP: {} not built (cargo build -p sz_activemq_publisher)",
+            publisher.display()
+        ));
+        return;
+    }
+    let fx: LoadFixture = load_fixture("load.yaml");
+    let case = &fx.publisher_round_trip;
+    let queue = unique(&case.queue);
+    let mut text = String::new();
+    for (i, r) in records(&case.record_template, "AMQ_PUB_RT", case.count)
+        .iter()
+        .enumerate()
+    {
+        text.push_str(r);
+        text.push('\n');
+        if (i + 1) % case.blank_every == 0 {
+            text.push('\n');
+        }
+    }
+    let input = std::env::temp_dir().join(format!("{}.jsonl.gz", unique("sz-amq-pub-rt")));
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    std::io::Write::write_all(&mut gz, text.as_bytes()).expect("gzip");
+    std::fs::write(&input, gz.finish().expect("gzip")).expect("write input");
+
+    let mut child = Command::new(&publisher)
+        .args(["-q", &queue])
+        .arg(&input)
+        .env("SENZING_ACTIVEMQ_URL", &url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn publisher");
+    let deadline = Instant::now() + Duration::from_secs(case.published_within_secs);
+    while child.try_wait().expect("try_wait").is_none() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = child.kill();
+    let published = child.wait_with_output().expect("publisher output");
+    let _ = std::fs::remove_file(&input);
+    let pub_out = String::from_utf8_lossy(&published.stdout).into_owned()
+        + &String::from_utf8_lossy(&published.stderr);
+    assert!(published.status.success(), "publisher failed\n{pub_out}");
+    assert!(
+        pub_out.contains(&format!("settled={}", case.count)),
+        "publisher summary\n{pub_out}"
+    );
+
+    let driver = Driver::spawn(&queue, &[], &[]);
+    let drained = wait_queue_empty(&queue, Duration::from_secs(case.loaded_within_secs)).await;
+    driver.signal(libc::SIGTERM);
+    let (status, stdout, stderr) = driver.finish(Duration::from_secs(30)).await;
+
+    assert!(drained, "queue did not drain\n{stdout}\n{stderr}");
+    assert!(status.expect("exit").success(), "{stdout}\n{stderr}");
+    assert_eq!(
+        final_total(&stdout, &fx.final_total),
+        case.count,
+        "every published record loaded\n{stdout}"
+    );
+    assert!(!stdout.contains("REJECTING:"), "nothing rejected\n{stdout}");
+    assert_eq!(dead_letter_count(&queue), 0, "nothing dead-lettered");
+    eprintln!(
+        "e2e publisher round trip: {} records published + loaded",
+        case.count
+    );
 }
 
 // ==========================================================================

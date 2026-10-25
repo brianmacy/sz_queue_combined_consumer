@@ -50,12 +50,12 @@ use fe2o3_amqp::connection::{ConnectionHandle, OpenError};
 use fe2o3_amqp::link::RecvError;
 use fe2o3_amqp::link::delivery::{Delivery as AmqpDelivery, DeliveryInfo};
 use fe2o3_amqp::link::receiver::CreditMode;
-use fe2o3_amqp::sasl_profile::SaslProfile;
 use fe2o3_amqp::session::SessionHandle;
 use fe2o3_amqp::types::definitions::{Error as AmqpErrorBody, ErrorCondition};
-use fe2o3_amqp::types::messaging::{AmqpValue, Body, Source};
+use fe2o3_amqp::types::messaging::Body;
 use fe2o3_amqp::types::primitives::{Symbol, Value};
-use fe2o3_amqp::{Connection, Receiver, Session};
+use fe2o3_amqp::{Receiver, Session};
+use sz_activemq_amqp::{body_bytes, open_connection, open_error_is_permanent, queue_source};
 use sz_rust_sdk::prelude::*;
 use tracing::{error, info, warn};
 
@@ -72,16 +72,11 @@ const ACTIVEMQ_POLICY: Policy = Policy {
     stuck_records_label: "records",
 };
 
-/// Source capability that makes Artemis attach to an ANYCAST queue.
-const QUEUE_CAPABILITY: &str = "queue";
 /// Error condition on the `rejected` outcome (informational; Artemis
 /// dead-letters on `rejected` whatever the condition).
 const REJECT_CONDITION: &str = "senzing:rejected-record";
 /// Cap on the `rejected` error description, in bytes.
 const REJECT_DESCRIPTION_MAX_BYTES: usize = 1024;
-/// Local idle timeout: a broker silent for this long (no frames, no
-/// heartbeats) fails the connection, which then fails the receive (fatal).
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bound on the orderly link/session/connection close at shutdown.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound on one connect attempt (TCP + SASL + Open), so a half-up broker
@@ -149,16 +144,15 @@ impl ActiveMqTransport {
         connect_timeout: Option<Duration>,
     ) -> Result<Self> {
         info!("Connecting to ActiveMQ at {}", params.url);
+        // A broker silent past the shared idle timeout fails the connection,
+        // which then fails the receive (fatal).
         let mut connection = connect_with_retry(&params, connect_timeout, CONNECT_RETRY_DELAY)
             .await
             .context("failed to connect to ActiveMQ")?;
         let mut session = Session::begin(&mut connection)
             .await
             .context("failed to begin AMQP session")?;
-        let source = Source::builder()
-            .address(params.queue.clone())
-            .capabilities(vec![Symbol::from(QUEUE_CAPABILITY)])
-            .build();
+        let source = queue_source(&params.queue);
         let mut receiver = Receiver::builder()
             .name(format!("{INSTANCE_NAME}-{}", params.queue))
             .source(source)
@@ -211,21 +205,6 @@ impl ActiveMqTransport {
             warn!("no unsettled AMQP delivery {tag}; cannot {verb}");
         }
         entry.flatten()
-    }
-}
-
-/// The record bytes of an AMQP body: `Data` sections (concatenated) or an
-/// `AmqpValue` string (a JMS `TextMessage`) or binary. Anything else yields
-/// an empty body, which the core loop dead-letters as malformed.
-fn body_bytes(body: Body<Value>) -> Vec<u8> {
-    match body {
-        Body::Data(batch) => batch.into_iter().flat_map(|d| d.0.into_vec()).collect(),
-        Body::Value(AmqpValue(Value::String(s))) => s.into_bytes(),
-        Body::Value(AmqpValue(Value::Binary(b))) => b.into_vec(),
-        other => {
-            warn!("unsupported AMQP body (expected Data or a string AmqpValue): {other:?}");
-            Vec::new()
-        }
     }
 }
 
@@ -365,10 +344,14 @@ async fn connect_with_retry(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        let result = tokio::time::timeout(CONNECT_ATTEMPT_TIMEOUT, open_connection(params))
-            .await
-            .map_err(|_| anyhow!("no AMQP handshake within {CONNECT_ATTEMPT_TIMEOUT:?}"))
-            .and_then(|r| r.map_err(Into::into));
+        let container_id = format!("{INSTANCE_NAME}-{}", std::process::id());
+        let result = tokio::time::timeout(
+            CONNECT_ATTEMPT_TIMEOUT,
+            open_connection(params, container_id),
+        )
+        .await
+        .map_err(|_| anyhow!("no AMQP handshake within {CONNECT_ATTEMPT_TIMEOUT:?}"))
+        .and_then(|r| r.map_err(Into::into));
         let err = match result {
             Ok(connection) => {
                 if attempt > 1 {
@@ -398,36 +381,6 @@ async fn connect_with_retry(
         warn!("ActiveMQ connect attempt {attempt} failed: {err:#}; retrying in {delay:?}");
         tokio::time::sleep(delay).await;
     }
-}
-
-/// One connect attempt: `params.url` with SASL PLAIN when credentials are set.
-async fn open_connection(params: &ActiveMqParams) -> Result<ConnectionHandle<()>, OpenError> {
-    let container_id = format!("{INSTANCE_NAME}-{}", std::process::id());
-    let mut builder = Connection::builder()
-        .container_id(container_id)
-        .idle_time_out(IDLE_TIMEOUT.as_millis() as u32);
-    if let Some(c) = &params.credentials {
-        builder = builder.sasl_profile(SaslProfile::Plain {
-            username: c.user.clone(),
-            password: c.password.clone(),
-        });
-    }
-    builder.open(params.url.as_str()).await
-}
-
-/// Whether an open error can never succeed by retrying (bad credentials, bad
-/// URL/scheme/TLS setup) — as opposed to a transport error worth a retry.
-/// Same classification as the publisher's.
-fn open_error_is_permanent(e: &OpenError) -> bool {
-    matches!(
-        e,
-        OpenError::SaslError { .. }
-            | OpenError::UrlError(_)
-            | OpenError::InvalidDomain
-            | OpenError::InvalidScheme
-            | OpenError::TlsConnectorNotFound
-            | OpenError::InvalidSchemeForSaslExternal
-    )
 }
 
 #[cfg(test)]
@@ -505,10 +458,11 @@ mod tests {
             upstream.host_str().expect("host"),
             upstream.port().unwrap_or(5672)
         );
-        let credentials = (!upstream.username().is_empty()).then(|| crate::Credentials {
-            user: upstream.username().to_string(),
-            password: upstream.password().unwrap_or_default().to_string(),
-        });
+        let credentials =
+            (!upstream.username().is_empty()).then(|| sz_activemq_amqp::Credentials {
+                user: upstream.username().to_string(),
+                password: upstream.password().unwrap_or_default().to_string(),
+            });
         let local = refused_url(); // nothing listens yet
         let port = url::Url::parse(&local).expect("url").port().expect("port");
         let p = ActiveMqParams {
@@ -571,34 +525,6 @@ mod tests {
         );
     }
     use fe2o3_amqp::link::{LinkStateError, MessageSizeExceeded};
-    use fe2o3_amqp::types::messaging::Data;
-    use fe2o3_amqp::types::primitives::Binary;
-
-    #[test]
-    fn data_sections_are_concatenated() {
-        let body: Body<Value> = Body::Data(
-            vec![
-                Data(Binary::from(b"{\"A\":".to_vec())),
-                Data(Binary::from(b"1}".to_vec())),
-            ]
-            .into(),
-        );
-        assert_eq!(body_bytes(body), b"{\"A\":1}");
-    }
-
-    #[test]
-    fn string_and_binary_values_are_accepted() {
-        let text = Body::Value(AmqpValue(Value::String("{\"A\":1}".into())));
-        assert_eq!(body_bytes(text), b"{\"A\":1}");
-        let bin = Body::Value(AmqpValue(Value::Binary(Binary::from(b"x".to_vec()))));
-        assert_eq!(body_bytes(bin), b"x");
-    }
-
-    #[test]
-    fn other_bodies_become_empty_poison() {
-        assert!(body_bytes(Body::Value(AmqpValue(Value::Long(7)))).is_empty());
-        assert!(body_bytes(Body::Empty).is_empty());
-    }
 
     #[test]
     fn oversized_message_is_a_poison_delivery_already_settled() {

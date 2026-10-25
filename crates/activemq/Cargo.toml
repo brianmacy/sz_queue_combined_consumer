@@ -14,19 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 sz-combined-consumer-core.workspace = true
+sz-activemq-amqp.workspace = true
 sz-rust-sdk.workspace = true
 tokio.workspace = true
 # AMQP 1.0 client. NO lapin / AWS SDK here — this bin compiles only its own
 # transport.
 fe2o3-amqp.workspace = true
-# Held at 0.7.19: tokio-util 0.7.20 adds `impl Encoder<&[u8]> for
-# LengthDelimitedCodec`, which makes fe2o3-amqp 0.18.2 (latest) fail to compile
-# (E0283 in transport/mod.rs). Not used directly; this constraint stops a
-# `cargo update` / Dependabot bump from breaking the build. Remove once
-# fe2o3-amqp ships a fix.
-tokio-util = "=0.7.19"
-url.workspace = true
-percent-encoding.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
@@ -52,3 +45,5 @@ serde_amqp = "0.18"
 # Example record-transform cdylib (SLEEP_MS holds a worker), dlopened by the
 # shutdown-deadline and in-flight-cap e2e tests.
 sz-record-transform-example = { path = "../transform-example" }
+# The publisher round-trip test gzips its input file.
+flate2.workspace = true

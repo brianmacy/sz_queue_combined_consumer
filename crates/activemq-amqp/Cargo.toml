@@ -1,0 +1,22 @@
+[package]
+name = "sz-activemq-amqp"
+description = "Shared Apache ActiveMQ Artemis AMQP 1.0 plumbing (broker URL + SASL credential resolution, connection setup, ANYCAST queue terminus, record body encode/decode) used by the ActiveMQ consumer and publisher. No Senzing dependency."
+version.workspace = true
+publish = false  # not published to crates.io
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "sz_activemq_amqp"
+path = "src/lib.rs"
+
+[dependencies]
+fe2o3-amqp.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+tracing.workspace = true
+# TcpStream + AsyncRead/AsyncWrite for the Open-frame observer
+# (open_connection_observed).
+tokio = { workspace = true, features = ["net"] }

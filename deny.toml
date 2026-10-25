@@ -34,6 +34,10 @@ allow = [
     # lapin -> amq-protocol-tcp -> tcp-stream -> rustls-connector. Consumer-only;
     # the redoer has no lapin/rustls dependency and does not carry this.
     "CDLA-Permissive-2.0",
+    # bzip2's own permissive BSD-style license (no copyleft), carried by
+    # libbz2-rs-sys — the pure-Rust bzip2 decoder sz_activemq_publisher uses
+    # for .bz2 input. Same allowance as sz_rabbit_publisher's deny.toml.
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
 
@@ -52,4 +56,6 @@ unknown-git = "deny"
 allow-git = [
     "https://github.com/brianmacy/sz-rust-sdk",
     "https://github.com/brianmacy/sz-rust-sdk-ffi",
+    # fe2o3-amqp with the per-delivery delivery-id fix (Cargo.toml [patch.crates-io]).
+    "https://github.com/brianmacy/fe2o3-amqp",
 ]

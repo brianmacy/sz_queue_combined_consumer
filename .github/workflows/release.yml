@@ -34,7 +34,7 @@ env:
   # build.rs links dylib=Sz from here; provided by the Senzing runtime container.
   SENZING_LIB_PATH: /opt/senzing/er/lib
   LD_LIBRARY_PATH: /opt/senzing/er/lib
-  BINS: sz_rabbit_combined_consumer sz_sqs_combined_consumer sz_activemq_combined_consumer
+  BINS: sz_rabbit_combined_consumer sz_sqs_combined_consumer sz_activemq_combined_consumer sz_activemq_publisher
 
 jobs:
   resolve:

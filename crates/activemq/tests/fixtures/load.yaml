@@ -40,3 +40,15 @@ body_types:
   loaded_within_secs: 120
   data_record: '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_BODY_DATA","NAME_FULL":"Data Section","ADDR_FULL":"1 Bytes Rd"}'
   value_record: '{"DATA_SOURCE":"TEST","RECORD_ID":"AMQ_BODY_VALUE","NAME_FULL":"Value Section","ADDR_FULL":"2 Text Rd"}'
+
+# sz_activemq_publisher -> this driver: the publisher streams a gzip JSONL
+# file (blank lines included, which it must skip) onto the queue, then the
+# driver loads every record. Proves the publisher's encoding is what the
+# consumer decodes, end to end through the engine.
+publisher_round_trip:
+  queue: sz-amq-pub-roundtrip
+  count: 8
+  blank_every: 3
+  published_within_secs: 60
+  loaded_within_secs: 120
+  record_template: '{"DATA_SOURCE":"TEST","RECORD_ID":"{tag}_{i}","NAME_FULL":"Round Trip {i}","PHONE_NUMBER":"555-01{i}"}'

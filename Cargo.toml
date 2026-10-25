@@ -8,13 +8,15 @@ members = [
     "crates/core",
     "crates/rabbit",
     "crates/sqs",
+    "crates/activemq-amqp",
     "crates/activemq",
+    "crates/activemq-publisher",
     "crates/transform-abi",
     "crates/transform-example",
 ]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 # Bumped 1.88 -> 1.94.1 so the MSRV-aware resolver selects the current AWS SDK
 # (aws-smithy-http-client >= 1.2 uses rustls 0.23 / rustls-webpki 0.103.13+),
@@ -51,13 +53,21 @@ aws-sdk-sqs = { version = "1", default-features = false, features = ["behavior-v
 # `rustls` TLS stack (webpki roots) — no native-tls/OpenSSL. `url` parses the
 # broker URL (already in the tree via fe2o3-amqp); percent-encoding decodes
 # credentials embedded in it.
-fe2o3-amqp = { version = "0.18.2", default-features = false, features = ["rustls"] }
+fe2o3-amqp = { version = "0.18.3", default-features = false, features = ["rustls"] }
 url = "2"
 percent-encoding = "2"
+# Publisher input decompression (crates/activemq-publisher only): gzip via
+# flate2's default pure-Rust miniz_oxide backend; bzip2 0.6's default
+# libbz2-rs-sys backend (pure Rust, no C libbz2). Both MIT/Apache-2.0.
+flate2 = "1"
+bzip2 = "0.6"
 
 # sz-combined-consumer-core: the broker-agnostic engine-processing library shared
 # by every backend binary (RabbitMQ, SQS, ...).
 sz-combined-consumer-core = { path = "crates/core" }
+# Shared ActiveMQ Artemis AMQP 1.0 plumbing (URL/credentials, connection, queue
+# terminus, record body encode/decode) for the ActiveMQ consumer + publisher.
+sz-activemq-amqp = { path = "crates/activemq-amqp" }
 # Record-transform plugin ABI (no Senzing dependency; plugins depend on it too).
 sz-record-transform = { path = "crates/transform-abi" }
 
@@ -66,3 +76,10 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# fe2o3-amqp with the per-delivery delivery-id fix: fork brianmacy/fe2o3-amqp, branch
+# fix/per-delivery-delivery-id (upstream main 0.18.3 + the fix; PR to minghuaw/fe2o3-amqp pending).
+# Upstream numbered deliveries with the per-FRAME transfer-id, so a record split over several
+# frames made the next delivery-id skip and Artemis closed the link. Drop this once upstream ships it.
+[patch.crates-io]
+fe2o3-amqp = { git = "https://github.com/brianmacy/fe2o3-amqp.git", rev = "73de8988ae2420bc2d600beacd44b57d33844399" }

@@ -1,8 +1,56 @@
 # Changelog
 
-Sections headed `0.4.1 — …` ship in tag `v0.4.1` (2026-10-09); all sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); all sections headed `0.3.0 — …` shipped in tag `v0.3.0` (2026-09-23). Each keeps the date it landed on `main`.
+Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections headed `0.4.1 — …` ship in tag `v0.4.1` (2026-10-09); all sections headed `0.4.0 — …` ship together in tag `v0.4.0` (2026-10-06); all sections headed `0.3.0 — …` shipped in tag `v0.3.0` (2026-09-23). Each keeps the date it landed on `main`.
 
-## Unreleased
+## 0.5.0 — ActiveMQ publisher; multi-frame AMQP transfers (2026-10-16)
+
+### Fixed
+
+* **Multi-frame AMQP transfers.** Upstream `fe2o3-amqp` (0.18.2 and 0.18.3)
+  assigned delivery-ids from the per-frame transfer-id, so a record larger than
+  the negotiated `max-frame-size` (Artemis default 131072) made the next
+  delivery-id skip and Artemis closed the connection ("Expected delivery-id N,
+  got N+k-1"). The workspace depends on the fork `brianmacy/fe2o3-amqp`
+  (`fix/per-delivery-delivery-id`, upstream PR minghuaw/fe2o3-amqp#423) via
+  `[patch.crates-io]`; the publisher sends large records as several frames and
+  no broker `maxFrameSize` change is needed (`--min-max-frame-size` now
+  defaults to 0). The `tokio-util` pin is gone (`fe2o3-amqp` 0.18.3 builds on
+  0.7.20).
+* `rustls` 0.23.45 -> 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349).
+
+### Added
+
+* **Publisher side file, resume and progress.** `--side-file` /
+  `--side-max-bytes` (default 200 MiB): oversized records are appended to the
+  side file and logged `sided <file> line <n> bytes <b>` instead of published
+  (FAILED without a side file). `fileprogress <file> <n>` lines mean the first n
+  non-blank records are settled, FAILED or sided (bounded by the oldest pending
+  one), and `--resume` takes them back to skip already-published records.
+  `--max-frame-size` sets the client-advertised frame.
+
+* **`sz_activemq_publisher` — bulk JSONL publisher for Apache ActiveMQ
+  Artemis** (new crate `crates/activemq-publisher`, no Senzing dependency).
+  Streams plain / gzip / bzip2 files (detected from content) or Spark output
+  directories (`part-*`) onto the ANYCAST queue `sz_activemq_combined_consumer`
+  reads, one AMQP `Data` section per non-blank line, durable by default.
+  Bounded in flight (`--max-pending` per file, `--parallel` files), counts
+  `settled` only on `accepted`, retries `rejected`/`released` up to
+  `--max-attempts` (then FAILED, exit 2), reconnects and re-sends on link loss
+  (bounded by `--reconnect-timeout`, at-least-once). A send blocked on broker
+  credit (`address-full-policy=BLOCK`) waits indefinitely and logs
+  `blocked on broker credit` — never treated as link loss, so no duplicates.
+  Flags follow `sz_rabbit_publisher`; see README "Loading the queue".
+* **`sz-activemq-amqp`** (new lib crate): the Artemis broker URL / SASL
+  credential resolution, connection setup, `queue`-capability terminus and
+  record body encode/decode, moved out of `sz_activemq_combined_consumer` so the
+  consumer and publisher share them (no behavior change for the consumer).
+* Tests: `crates/activemq-publisher/tests/publisher_e2e.rs` (real Artemis:
+  mixed-compression directory, BLOCK address with a tiny `maxSizeBytes` —
+  plateau then exactly-once delivery, link loss via TCP proxy, startup
+  failures) and `e2e_activemq_publisher_round_trip` in the consumer e2e
+  (publisher -> real consumer -> engine). CI runs the publisher suite before the
+  consumer suite; the release tarball ships the new binary. `deny.toml` allows
+  `bzip2-1.0.6` (libbz2-rs-sys, permissive), as in `sz_rabbit_publisher`.
 
 * **ActiveMQ: retry an unreachable broker at startup.** New `--reconnect-timeout`
   / `SENZING_ACTIVEMQ_RECONNECT_TIMEOUT` (default 300 s, `0` = forever): the
@@ -22,10 +70,11 @@ Sections headed `0.4.1 — …` ship in tag `v0.4.1` (2026-10-09); all sections 
 * **Prebuilt Linux release binaries.** New `.github/workflows/release.yml`
   (on a `v*` tag push, or `workflow_dispatch` with an existing `tag` to release
   retroactively) builds `sz_rabbit_combined_consumer`,
-  `sz_sqs_combined_consumer` and `sz_activemq_combined_consumer` for linux
+  `sz_sqs_combined_consumer`, `sz_activemq_combined_consumer` and
+  `sz_activemq_publisher` for linux
   x86_64 (`ubuntu-24.04`) and aarch64 (native `ubuntu-24.04-arm`) inside
   `senzing/senzingsdk-runtime:4.3.3`, and attaches
-  `sz_queue_combined_consumer-<tag>-linux-<arch>.tar.gz` (three bins + README,
+  `sz_queue_combined_consumer-<tag>-linux-<arch>.tar.gz` (four bins + README,
   LICENSE, CHANGELOG) plus `SHA256SUMS` to the GitHub Release, whose notes come
   from this file's section(s) for that version. Re-running for an existing
   release overwrites its assets. The binaries link only `libSz.so` + glibc +
