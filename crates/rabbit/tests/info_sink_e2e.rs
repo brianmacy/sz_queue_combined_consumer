@@ -1720,9 +1720,14 @@ fn e2e_redo_processing_failure_is_fatal() {
     let f = fixture();
     let case = case_dir(repo, "redo_process_fail");
     let (config, db) = private_repo(repo, &case);
-    // Load only (redo% 0): the redo the adds enqueue stays queued.
+    // Load only (redo% 0): the redo the adds enqueue stays queued. One
+    // worker, like `seed_redo`: the redo a concurrent load enqueues depends
+    // on scheduling (measured 6-8 rows with 4 workers, usually 0 with 8; 5
+    // every time with 1), and a load that enqueues none leaves the redoer
+    // idle until the exit timeout (seen in CI).
     let (mut cmd, out) = file_mode(repo, &case, &records("ISPF", f.redo_names.len()));
     cmd.env("SENZING_ENGINE_CONFIGURATION_JSON", &config)
+        .env("SENZING_THREADS_PER_PROCESS", "1")
         .env("SENZING_REDO_PERCENT", "0");
     let (code, log) = run(&mut cmd, &out);
     assert_eq!(code, 0, "{log}");
