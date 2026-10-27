@@ -3077,8 +3077,10 @@ name = "sz-combined-consumer-core"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "bzip2",
  "clap",
  "ctrlc",
+ "flate2",
  "libc",
  "num_cpus",
  "serde_json",
