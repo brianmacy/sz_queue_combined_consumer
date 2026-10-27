@@ -1,6 +1,6 @@
 [package]
 name = "sz_activemq_publisher"
-description = "Bulk JSONL publisher for Apache ActiveMQ Artemis (AMQP 1.0): streams plain/gzip/bzip2 record files (or Spark part-* directories) onto the ANYCAST queue sz_activemq_combined_consumer reads, with bounded in-flight, broker-settlement tracking and reconnect on link loss. No Senzing dependency."
+description = "Bulk JSONL publisher for Apache ActiveMQ Artemis (AMQP 1.0): streams plain/gzip/bzip2/zstd record files (or Spark part-* directories) onto the ANYCAST queue sz_activemq_combined_consumer reads, with bounded in-flight, broker-settlement tracking and reconnect on link loss. No Senzing dependency."
 version.workspace = true
 publish = false  # not published to crates.io
 edition.workspace = true
@@ -22,6 +22,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 flate2.workspace = true
 bzip2.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 # tests/publisher_e2e.rs drives a real Artemis broker: the crate's own AMQP

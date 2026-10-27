@@ -4,6 +4,19 @@ Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections head
 
 ## Unreleased
 
+* **zstd input (`*.zst`) for `sz_activemq_publisher` and the consumers' file mode
+  (`--file`).** Sayari datasets are written zstd-compressed by Spark (zstd-jni) or
+  the `zstd` CLI. Both readers decode multi-frame files fully and detect zstd by
+  magic bytes (frame or skippable-frame), with a `.zst`/`.zstd` extension as the
+  fallback so a damaged file fails loudly instead of loading binary as records.
+  Line numbers, `--resume` / `fileprogress` ordinals, `--skip-lines` and the reject
+  file count decoded lines, identical to the same data uncompressed (resume keys
+  stay the file name, e.g. `part-00000.json.zst`). New dependency: `zstd` 0.14
+  (MIT/Apache-2.0; `zstd-sys` bundles libzstd under BSD-3-Clause and needs a C
+  compiler, already required by `aws-lc-sys`); `cargo deny check` passes with no
+  `deny.toml` change. Consumer file mode previously read plain text only (no
+  gzip/bzip2), and still does for those formats.
+
 * **ActiveMQ: retry an unreachable broker at startup.** New `--reconnect-timeout`
   / `SENZING_ACTIVEMQ_RECONNECT_TIMEOUT` (default 300 s, `0` = forever): the
   startup connect retries transient errors every 5 s (30 s per attempt) instead

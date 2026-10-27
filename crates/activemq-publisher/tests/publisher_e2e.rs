@@ -552,7 +552,7 @@ fn via_proxy(url: &str, port: u16) -> (String, String) {
 // Tests
 // ==========================================================================
 
-/// A Spark-style directory (plain + gzip + bzip2 parts, .crc, _SUCCESS,
+/// A Spark-style directory (plain + gzip + bzip2 + zstd parts, .crc, _SUCCESS,
 /// blank lines), --parallel: every record exactly once, durable, and
 /// byte-identical after the consumer's decode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -567,6 +567,7 @@ async fn e2e_publisher_directory_of_mixed_compression_parts() {
         records(&fx.record_template, "PUB_PLAIN", 0..n),
         records(&fx.record_template, "PUB_GZ", 0..n),
         records(&fx.record_template, "PUB_BZ2", 0..n),
+        records(&fx.record_template, "PUB_ZST", 0..n),
     ];
     dir.jsonl("part-00000-a.json", &parts[0], case.blank_every);
     let plain1 = dir.jsonl("tmp1", &parts[1], case.blank_every);
@@ -577,6 +578,13 @@ async fn e2e_publisher_directory_of_mixed_compression_parts() {
     let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
     bz.write_all(&std::fs::read(&plain2).unwrap()).unwrap();
     std::fs::write(dir.0.join("part-00002-a.json.bz2"), bz.finish().unwrap()).unwrap();
+    // zstd part as two concatenated frames (a multi-frame Spark/zstd-jni file).
+    let plain3 = std::fs::read(dir.jsonl("tmp3", &parts[3], case.blank_every)).unwrap();
+    let mid = plain3.len() / 2;
+    let mut zst = zstd::encode_all(&plain3[..mid], 3).unwrap();
+    zst.extend(zstd::encode_all(&plain3[mid..], 3).unwrap());
+    std::fs::write(dir.0.join("part-00003-a.json.zst"), zst).unwrap();
+    std::fs::remove_file(dir.0.join("tmp3")).unwrap();
     std::fs::remove_file(plain1).unwrap();
     std::fs::remove_file(plain2).unwrap();
     std::fs::write(dir.0.join(".part-00000-a.json.crc"), b"not a record").unwrap();
@@ -615,7 +623,7 @@ async fn e2e_publisher_directory_of_mixed_compression_parts() {
     assert_eq!(seen, expected, "every record, byte-identical");
     assert!(drained.iter().all(|d| d.durable), "durable by default");
     eprintln!(
-        "e2e_publisher_directory: {} records from 3 parts",
+        "e2e_publisher_directory: {} records from 4 parts",
         drained.len()
     );
 }
@@ -1093,14 +1101,36 @@ async fn e2e_publisher_record_over_side_max_goes_to_the_side_file() {
 /// `fileprogress <file> <total>`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_publisher_resume_skips_already_published_records() {
+    resume_case(false).await;
+}
+
+/// The same --resume / `fileprogress` contract on a zstd part file: offsets
+/// are ordinals of the decoded non-blank records, identical to the plain file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_publisher_resume_on_zstd_file_matches_plain() {
+    resume_case(true).await;
+}
+
+async fn resume_case(zstd_input: bool) {
     let Some(url) = gate() else { return };
     let fx = fixture();
     let case = &fx.resume;
     let queue = unique(&case.queue);
     let dir = Scratch::new("resume");
     let lines = records(&fx.record_template, "PUB_RESUME", 0..case.count);
-    let name = "part-00000-resume.json";
-    let file = dir.jsonl(name, &lines, case.blank_every);
+    let mut name = "part-00000-resume.json";
+    let mut file = dir.jsonl(name, &lines, case.blank_every);
+    if zstd_input {
+        // Two concatenated frames, as a multi-writer zstd output would be.
+        let plain = std::fs::read(&file).unwrap();
+        let mid = plain.len() / 2;
+        let mut zst = zstd::encode_all(&plain[..mid], 3).unwrap();
+        zst.extend(zstd::encode_all(&plain[mid..], 3).unwrap());
+        std::fs::remove_file(&file).unwrap();
+        name = "part-00000-resume.json.zst";
+        file = dir.0.join(name);
+        std::fs::write(&file, zst).unwrap();
+    }
     let resume = dir.0.join("resume.txt");
     std::fs::write(&resume, format!("fileprogress {name} {}\n", case.skip)).expect("resume file");
 

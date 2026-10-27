@@ -52,7 +52,7 @@ pub const DEFAULT_INFO_SINK_FLUSH_SECS: u64 = 30;
 #[derive(clap::Args, Debug, Clone)]
 pub struct CommonArgs {
     /// Load records from a single JSONL file instead of the message queue (one
-    /// JSON record per line); the queue-source flags are then ignored. redo%
+    /// JSON record per line; plain or zstd `*.zst`); the queue-source flags are then ignored. redo%
     /// applies as in queue mode; at redo% > 0 the process exits once the file
     /// is loaded AND the redo queue is drained (redo% = 0: exits at end of file).
     #[arg(short = 'f', long = "file", env = "SENZING_INPUT_FILE")]
