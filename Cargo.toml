@@ -65,6 +65,12 @@ percent-encoding = "2"
 # libbz2-rs-sys backend (pure Rust, no C libbz2). Both MIT/Apache-2.0.
 flate2 = "1"
 bzip2 = "0.6"
+# zstd input (`*.zst`, multi-frame) for the publisher and the consumer's file
+# mode. zstd-rs is MIT/Apache-2.0; its zstd-sys bundles libzstd (BSD-3-Clause,
+# dual-licensed with GPL-2.0 — we use it under BSD) and needs a C compiler, which
+# the build already requires (aws-lc-sys). No default features: no legacy-format
+# decoders and no dictionary-training code.
+zstd = { version = "0.14", default-features = false }
 
 # sz-combined-consumer-core: the broker-agnostic engine-processing library shared
 # by every backend binary (RabbitMQ, SQS, ...).

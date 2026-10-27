@@ -31,6 +31,10 @@ sz-record-transform.workspace = true
 libc.workspace = true
 # INFO sink plugin ABI (dlopen'd like the transform plugin).
 sz-info-sink.workspace = true
+# `*.gz` / `*.bz2` / `*.zst` input for the file loader (--input-file), detected by magic bytes.
+flate2.workspace = true
+bzip2.workspace = true
+zstd.workspace = true
 
 # `cargo llvm-cov` builds with `--cfg coverage` (runtime.rs writes the
 # coverage profile before a forced `_exit`); declare it for check-cfg.

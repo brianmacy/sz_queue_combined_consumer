@@ -4,8 +4,12 @@
 //!   regular files (Spark output), sorted — hidden `.part-*.crc` checksums and
 //!   `_SUCCESS` markers are skipped by construction.
 //! * Compression is detected from magic bytes, not the extension: gzip
-//!   (multi-member) and bzip2 (multi-stream, `pbzip2`/`lbzip2` output) are
-//!   decoded on the fly; anything else is read as plain text.
+//!   (multi-member), bzip2 (multi-stream, `pbzip2`/`lbzip2` output) and zstd
+//!   (multi-frame: Spark/zstd-jni part files, `zstd` CLI output, concatenated
+//!   `.zst`) are decoded on the fly; anything else is read as plain text. A
+//!   `.zst`/`.zstd` extension is a fallback: such a file whose magic is not
+//!   recognised is still handed to the zstd decoder, so a damaged header fails
+//!   loudly instead of being published as binary "records".
 //! * Lines are read as raw bytes (no UTF-8 validation: the consumer
 //!   dead-letters malformed records itself), one at a time through a
 //!   `BufReader`, so a file is never held in memory. Blank (all-whitespace)
@@ -24,6 +28,13 @@ const PART_PREFIX: &str = "part-";
 const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 /// `BZh` + block-size digit `1`..`9`.
 const BZIP2_MAGIC: [u8; 3] = *b"BZh";
+/// zstd frame magic `0xFD2FB528` (little-endian on disk).
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+/// A zstd skippable frame (`0x184D2A50..=0x184D2A5F`, little-endian on disk) may
+/// legally open a stream; the low nibble of the first byte varies.
+fn is_zstd_skippable(magic: &[u8]) -> bool {
+    magic.len() == 4 && magic[0] & 0xF0 == 0x50 && magic[1..] == [0x2A, 0x4D, 0x18]
+}
 /// Read buffer per open file.
 const READ_BUFFER_BYTES: usize = 256 * 1024;
 
@@ -78,7 +89,7 @@ pub struct LineReader {
 
 impl LineReader {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut magic = [0u8; 3];
+        let mut magic = [0u8; 4];
         let n = read_prefix(path, &mut magic)?;
         let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         let inner: Box<dyn BufRead + Send> = if n >= 2 && magic[..2] == GZIP_MAGIC {
@@ -86,11 +97,17 @@ impl LineReader {
                 READ_BUFFER_BYTES,
                 MultiGzDecoder::new(file),
             ))
-        } else if n == 3 && magic == BZIP2_MAGIC {
+        } else if n >= 3 && magic[..3] == BZIP2_MAGIC {
             Box::new(BufReader::with_capacity(
                 READ_BUFFER_BYTES,
                 MultiBzDecoder::new(file),
             ))
+        } else if is_zstd(path, &magic[..n]) {
+            // The zstd Decoder reads concatenated frames to the end (its
+            // single-frame mode is opt-in), matching the gzip/bzip2 readers.
+            let decoder = zstd::stream::read::Decoder::new(file)
+                .with_context(|| format!("cannot start zstd decoding of {}", path.display()))?;
+            Box::new(BufReader::with_capacity(READ_BUFFER_BYTES, decoder))
         } else {
             Box::new(BufReader::with_capacity(READ_BUFFER_BYTES, file))
         };
@@ -124,6 +141,20 @@ impl LineReader {
             return Ok(Some((self.line_no, line.to_vec())));
         }
     }
+}
+
+/// True for zstd content: a frame/skippable-frame magic, or (fallback) a
+/// non-empty file named `*.zst` / `*.zstd`. An empty `.zst` is an empty plain
+/// file (no records), not an error.
+fn is_zstd(path: &Path, prefix: &[u8]) -> bool {
+    if prefix.len() == 4 && (prefix == ZSTD_MAGIC || is_zstd_skippable(prefix)) {
+        return true;
+    }
+    !prefix.is_empty()
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("zst") || e.eq_ignore_ascii_case("zstd"))
 }
 
 /// Reads up to `buf.len()` leading bytes (fewer for a short file).
@@ -222,6 +253,93 @@ mod tests {
             bytes.extend(enc.finish().unwrap());
         }
         assert_eq!(read_all(&s.write("in.jsonl.bz2", &bytes)), expected());
+    }
+
+    #[test]
+    fn zstd_multi_frame_is_detected_by_magic() {
+        let s = Scratch::new("zst");
+        let mut bytes = Vec::new();
+        // Two concatenated frames (what `cat a.zst b.zst` or per-task writers
+        // produce): both must be read.
+        for half in [&TEXT[..12], &TEXT[12..]] {
+            bytes.extend(zstd::encode_all(half, 3).unwrap());
+        }
+        // Extension deliberately wrong: detection is by content.
+        assert_eq!(read_all(&s.write("in.txt", &bytes)), expected());
+    }
+
+    /// The publisher's resume/`fileprogress` unit is the ordinal of the non-blank
+    /// records the reader yields, so a `.zst` (crate-written multi-frame and real
+    /// `zstd` CLI output) must yield exactly the plain file's `(line, bytes)` stream.
+    #[test]
+    fn zstd_yields_identical_records_and_line_numbers_as_plain() {
+        let s = Scratch::new("zstparity");
+        let mut text = Vec::new();
+        for i in 0..20_000 {
+            match i % 500 {
+                3 => text.extend_from_slice(b"\n"),
+                4 => text.extend_from_slice(b"  \r\n"),
+                _ => text
+                    .extend_from_slice(format!("{{\"R\":{i},\"N\":\"caf\u{e9}\"}}\r\n").as_bytes()),
+            }
+        }
+        let plain = s.write("in.jsonl", &text);
+        let want = read_all(&plain);
+        assert!(want.len() > 19_000);
+
+        let mut multi = Vec::new();
+        for part in [&text[..777], &text[777..100_000], &text[100_000..]] {
+            multi.extend(zstd::encode_all(part, 3).unwrap());
+        }
+        assert_eq!(read_all(&s.write("multi.jsonl.zst", &multi)), want);
+
+        // Real CLI output, when the CLI is installed.
+        let cli = s.0.join("cli.jsonl.zst");
+        if let Ok(st) = std::process::Command::new("zstd")
+            .args(["-q", "-3", "-o"])
+            .arg(&cli)
+            .arg(&plain)
+            .status()
+        {
+            assert!(st.success(), "zstd CLI failed");
+            assert_eq!(read_all(&cli), want);
+        }
+    }
+
+    #[test]
+    fn zstd_by_extension_fallback_and_corruption_fail_loudly() {
+        let s = Scratch::new("zstext");
+        // Not zstd, but named .zst: must be a read error, never plain records.
+        let p = s.write("bad.jsonl.zst", b"{\"A\":1}\n");
+        let mut r = LineReader::open(&p).expect("open");
+        assert!(r.next_record().is_err(), "damaged .zst must fail loudly");
+        // Valid frame, truncated mid-stream: also an error, not a short EOF.
+        let full = zstd::encode_all(&TEXT.repeat(2000)[..], 3).unwrap();
+        let p = s.write("cut.zst", &full[..full.len() - 8]);
+        let mut r = LineReader::open(&p).expect("open");
+        let mut failed = false;
+        loop {
+            match r.next_record() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "truncated zstd must fail loudly");
+        // An empty .zst is an empty file.
+        assert!(read_all(&s.write("empty.zst", b"")).is_empty());
+    }
+
+    #[test]
+    fn zstd_skippable_frame_first_is_detected() {
+        let s = Scratch::new("zstskip");
+        // Skippable frame (magic 0x184D2A51, 3 payload bytes) then a data frame.
+        let mut bytes = vec![0x51, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 1, 2, 3];
+        bytes.extend(zstd::encode_all(TEXT, 3).unwrap());
+        assert_eq!(read_all(&s.write("in.bin", &bytes)), expected());
     }
 
     #[test]

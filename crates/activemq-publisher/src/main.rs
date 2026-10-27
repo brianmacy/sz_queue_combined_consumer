@@ -45,7 +45,7 @@ const EXIT_RECORDS_FAILED: u8 = 2;
 #[command(
     name = "sz_activemq_publisher",
     version = VERSION,
-    about = "Publish JSONL records (plain, gzip or bzip2; files or Spark part-* directories) \
+    about = "Publish JSONL records (plain, gzip, bzip2 or zstd; files or Spark part-* directories) \
              to an Apache ActiveMQ Artemis ANYCAST queue over AMQP 1.0",
     after_help = "\
 Exit codes: 0 all records settled; 1 fatal error; 2 finished with FAILED records.
@@ -65,7 +65,7 @@ indefinitely and logs 'blocked on broker credit' every
 )]
 struct Args {
     /// Input files and/or directories (a directory publishes its part-* files).
-    /// Compression (gzip, bzip2) is detected from the content.
+    /// Compression (gzip, bzip2, zstd) is detected from the content.
     #[arg(value_name = "INPUT", required = true, num_args = 1..)]
     inputs: Vec<PathBuf>,
 

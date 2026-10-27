@@ -29,7 +29,7 @@ client (compile-time backend selection — no runtime switch, no feature flags):
 | `sz_rabbit_combined_consumer` | bin | RabbitMQ | `lapin` |
 | `sz_sqs_combined_consumer` | bin | Amazon SQS (standard queues) | `aws-sdk-sqs` |
 | `sz_activemq_combined_consumer` | bin | Apache ActiveMQ Artemis (AMQP 1.0, anycast queues) | `fe2o3-amqp` (rustls) |
-| `sz_activemq_publisher` | bin | Artemis **publisher**: JSONL files -> the queue the ActiveMQ consumer reads (no Senzing) | `fe2o3-amqp` (rustls), `flate2`, `bzip2` |
+| `sz_activemq_publisher` | bin | Artemis **publisher**: JSONL files -> the queue the ActiveMQ consumer reads (no Senzing) | `fe2o3-amqp` (rustls), `flate2`, `bzip2`, `zstd` |
 | `sz-activemq-amqp` | lib | — (Artemis URL/credentials, connection, anycast terminus, record body encode/decode; shared by the ActiveMQ consumer + publisher) | `fe2o3-amqp` |
 | `sz-record-transform` | lib | — (record-transform plugin C ABI + Rust export macro) | none |
 | `sz-record-transform-example` | cdylib | — (example plugin; used by tests) | none |
@@ -102,7 +102,7 @@ verbatim-compatible with the sibling drivers.
 | `SENZING_THREADS_PER_PROCESS` (`--threads-per-process`) | **12** | worker pool size (0 → CPU count, compat foot-gun) |
 | `SENZING_AMQP_URL` (`-u`/`--url`) | required iff redo% < 100 | RabbitMQ URL |
 | `SENZING_RABBITMQ_QUEUE` (`-q`/`--queue`) | required iff redo% < 100 | source queue (must exist; passive declare) |
-| `SENZING_INPUT_FILE` (`-f`/`--file`) | none | load JSONL (one JSON record per line) from a single file instead of RabbitMQ; mutually exclusive with `--url`/`--queue`. redo% applies as in queue mode. Exits 0 at EOF (redo% = 0) or once the file is loaded and redo is drained (redo% > 0; see *File input*). |
+| `SENZING_INPUT_FILE` (`-f`/`--file`) | none | load JSONL (one JSON record per line) from a single file — plain, gzip, bzip2 or zstd (multi-member / multi-stream / multi-frame files read fully, detected from the magic bytes, not the extension; `--skip-lines` and the reject file count decoded lines) — instead of RabbitMQ; mutually exclusive with `--url`/`--queue`. redo% applies as in queue mode. Exits 0 at EOF (redo% = 0) or once the file is loaded and redo is drained (redo% > 0; see *File input*). |
 | `SENZING_SKIP_LINES` (`--skip-lines`) | 0 | file mode only: skip the first N physical lines. Resumes an interrupted load — the driver prints a safe `--skip-lines` offset (contiguous-completion watermark) at shutdown. |
 | `SENZING_REJECT_FILE` (`--reject-file`) | `<input>.rejected.jsonl` | file mode only: JSONL file that receives every rejected input line **verbatim** (unparseable, engine bad input, retry timeout, SENZ0082). Created lazily on the first reject, opened in append mode. Reprocess with `--file <reject file>`. |
 | `SENZING_RECORD_TRANSFORM_PLUGIN` (`--record-transform-plugin`) | none | shared library that rewrites every load record before `add_record` (all backends). See [Record transform plugins](#record-transform-plugins). |
@@ -269,12 +269,12 @@ with the `queue` target capability (ANYCAST), header `durable=true` by default.
 ```console
 # A Spark output directory (its part-* files) plus a single file, 4 files at a time
 sz_activemq_publisher -u amqp://artemis:artemis@broker:5672 -q senzing-input \
-    -p 4 /public_data/spark_out/ /data/extra.jsonl.bz2
+    -p 4 /public_data/spark_out/ /data/extra.jsonl.bz2 /data/more.jsonl.zst
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `INPUT...` | required | files (plain / gzip / bzip2, detected from content) or directories (their `part-*` files, sorted; `.crc` / `_SUCCESS` ignored). Blank lines are skipped. |
+| `INPUT...` | required | files (plain / gzip / bzip2 / zstd `*.zst`, detected from content; multi-member / multi-stream / multi-frame files read fully; a `.zst`/`.zstd` name is the fallback when the magic is unrecognised, so a damaged one fails loudly) or directories (their `part-*` files, sorted; `.crc` / `_SUCCESS` ignored). Blank lines are skipped. |
 | `-u, --url` | `SENZING_ACTIVEMQ_URL` | `amqp://` only (the broker's max-frame-size is read off the plaintext Open frame), credentials may be embedded |
 | `--user`, `--password` | `SENZING_ACTIVEMQ_USER` / `_PASSWORD` | SASL PLAIN; override URL userinfo |
 | `-q, --queue` | `SENZING_ACTIVEMQ_QUEUE` | queue or FQQN `address::queue` |

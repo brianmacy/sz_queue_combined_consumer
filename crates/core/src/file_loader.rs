@@ -68,7 +68,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -674,6 +674,77 @@ struct ReadSummary {
     dispatched: u64,
 }
 
+/// gzip member magic.
+const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+/// bzip2 stream magic (`BZh` + block-size digit).
+const BZIP2_MAGIC: [u8; 3] = *b"BZh";
+/// zstd frame magic `0xFD2FB528` (little-endian on disk).
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+/// Read buffer over the (de)compressed stream.
+const INPUT_BUFFER_BYTES: usize = 256 * 1024;
+
+/// True when `prefix` (the file's first bytes) opens a zstd frame or skippable
+/// frame (`0x184D2A50..=0x184D2A5F`).
+fn is_zstd_magic(prefix: &[u8]) -> bool {
+    prefix.len() == 4
+        && (prefix == ZSTD_MAGIC || (prefix[0] & 0xF0 == 0x50 && prefix[1..] == [0x2A, 0x4D, 0x18]))
+}
+
+/// Opens the input for line reading. Compression is detected by magic bytes,
+/// not the extension (mirrors `sz_activemq_publisher`'s `input.rs`; that crate
+/// is a Senzing-free bin, so the small detector is duplicated rather than
+/// shared): gzip (multi-member), bzip2 (multi-stream, `pbzip2`/`lbzip2`
+/// output) and zstd (multi-frame, e.g. Spark/zstd-jni part files or `zstd`
+/// CLI output) are decoded on the fly; anything else is plain text. A
+/// `.zst`/`.zstd` extension is a fallback so a non-empty file with a damaged
+/// header fails loudly rather than loading binary as records, and a truncated
+/// or corrupt stream surfaces as a read error. Physical line numbers (resume,
+/// reject file) count decoded lines, so they are identical to the same data
+/// uncompressed.
+fn open_input(path: &Path) -> Result<Box<dyn BufRead>> {
+    let mut file = File::open(path).with_context(|| format!("cannot open input file {path:?}"))?;
+    let mut prefix = [0u8; 4];
+    let mut filled = 0;
+    while filled < prefix.len() {
+        let n = file
+            .read(&mut prefix[filled..])
+            .with_context(|| format!("cannot read input file {path:?}"))?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    let prefix = &prefix[..filled];
+    let by_extension = filled > 0
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("zst") || e.eq_ignore_ascii_case("zstd"));
+    file.seek(SeekFrom::Start(0))
+        .with_context(|| format!("cannot rewind input file {path:?}"))?;
+    if prefix.starts_with(&GZIP_MAGIC) {
+        Ok(Box::new(BufReader::with_capacity(
+            INPUT_BUFFER_BYTES,
+            flate2::read::MultiGzDecoder::new(file),
+        )))
+    } else if prefix.starts_with(&BZIP2_MAGIC) {
+        Ok(Box::new(BufReader::with_capacity(
+            INPUT_BUFFER_BYTES,
+            bzip2::read::MultiBzDecoder::new(file),
+        )))
+    } else if is_zstd_magic(prefix) || by_extension {
+        // The Decoder reads concatenated frames to the end (single-frame mode is opt-in).
+        let decoder = zstd::stream::read::Decoder::new(file)
+            .with_context(|| format!("cannot start zstd decoding of {path:?}"))?;
+        Ok(Box::new(BufReader::with_capacity(
+            INPUT_BUFFER_BYTES,
+            decoder,
+        )))
+    } else {
+        Ok(Box::new(BufReader::with_capacity(INPUT_BUFFER_BYTES, file)))
+    }
+}
+
 /// Reads `path`, skips the first `skip` physical lines, and feeds each remaining
 /// non-blank line to the worker pool as a [`LoadItem`] keyed by absolute line
 /// number. Blank and unparseable lines are completed immediately (blank =
@@ -687,8 +758,7 @@ fn read_and_feed(
     sink: &Arc<Mutex<RejectSink>>,
     in_flight: &InFlightBodies,
 ) -> Result<ReadSummary> {
-    let file = File::open(path).with_context(|| format!("cannot open input file {path:?}"))?;
-    let reader = BufReader::new(file);
+    let reader = open_input(path)?;
 
     let mut line_no: u64 = 0;
     let mut dispatched: u64 = 0;
@@ -915,6 +985,166 @@ mod tests {
         ));
         assert!(stop.load(Ordering::Acquire), "told to stop");
         release.send(()).unwrap();
+    }
+
+    /// Everything `read_and_feed` produces for one input file.
+    struct FeedResult {
+        lines: u64,
+        dispatched: u64,
+        items: Vec<(u64, Vec<u8>)>,
+        watermark: u64,
+        rejected: String,
+    }
+
+    fn feed(path: &Path, skip: u64, tag: &str) -> FeedResult {
+        let reject = path.with_extension(format!("{tag}.rejected"));
+        let _ = std::fs::remove_file(&reject);
+        let (tx, mut rx) = mpsc::channel::<LoadItem>(100_000);
+        let resume = Arc::new(Mutex::new(ResumeTracker::new(skip + 1)));
+        let sink = Arc::new(Mutex::new(RejectSink::new(&reject)));
+        let in_flight: InFlightBodies = Arc::new(Mutex::new(HashMap::new()));
+        let summary =
+            read_and_feed(path, skip, &tx, &resume, &sink, &in_flight).expect("read_and_feed");
+        drop(tx);
+        let mut items = Vec::new();
+        while let Some(i) = rx.blocking_recv() {
+            items.push((i.delivery_tag, i.body));
+        }
+        let watermark = resume.lock().unwrap().watermark();
+        let rejected = std::fs::read_to_string(&reject).unwrap_or_default();
+        let _ = std::fs::remove_file(&reject);
+        FeedResult {
+            lines: summary.lines,
+            dispatched: summary.dispatched,
+            items,
+            watermark,
+            rejected,
+        }
+    }
+
+    /// Compresses each slice as its own gzip member / bzip2 stream / zstd frame
+    /// and concatenates them (the multi-member shape Spark and `pbzip2` write).
+    fn gz_members(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in parts {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(part).unwrap();
+            out.extend(enc.finish().unwrap());
+        }
+        out
+    }
+
+    fn bz_streams(parts: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for part in parts {
+            let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+            enc.write_all(part).unwrap();
+            out.extend(enc.finish().unwrap());
+        }
+        out
+    }
+
+    /// A gz / bz2 / zst input (crate-written multi-member and, when present,
+    /// CLI output) must give the same lines, dispatched records, reject output
+    /// and resume watermark as the plain file, including with a resume skip.
+    /// Format is detected by content, so each is also read under a neutral name.
+    #[test]
+    fn compressed_input_matches_plain_input_for_feed_resume_and_rejects() {
+        let dir = std::env::temp_dir().join(format!("sz_zstd_input_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 6,000 records > one decoder buffer, with blank and unparseable lines.
+        let mut text = String::new();
+        for i in 0..6000 {
+            match i % 1000 {
+                7 => text.push('\n'),
+                13 => text.push_str("not json\n"),
+                _ => text.push_str(&format!(
+                    "{{\"DATA_SOURCE\":\"T\",\"RECORD_ID\":\"{i}\",\"NAME_FULL\":\"n\u{e9} {i}\"}}\n"
+                )),
+            }
+        }
+        let plain = dir.join("in.jsonl");
+        std::fs::write(&plain, &text).unwrap();
+
+        // Crate-written, three concatenated frames split mid-line.
+        let b = text.as_bytes();
+        let mut multi = Vec::new();
+        for part in [&b[..1001], &b[1001..200_001], &b[200_001..]] {
+            multi.extend(zstd::encode_all(part, 3).unwrap());
+        }
+        let zst = dir.join("in.jsonl.zst");
+        std::fs::write(&zst, &multi).unwrap();
+        let mut variants = vec![zst];
+        // The same bytes under a non-.zst name: detected by magic.
+        let magic_only = dir.join("in.dat");
+        std::fs::write(&magic_only, &multi).unwrap();
+        variants.push(magic_only);
+        // gzip (3 members) and bzip2 (3 streams), by extension and by content only.
+        let parts: [&[u8]; 3] = [&b[..1001], &b[1001..200_001], &b[200_001..]];
+        let gz = gz_members(&parts);
+        let bz = bz_streams(&parts);
+        for (name, bytes) in [
+            ("in.jsonl.gz", &gz),
+            ("in.gzdat", &gz),
+            ("in.jsonl.bz2", &bz),
+            ("in.bzdat", &bz),
+        ] {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            variants.push(p);
+        }
+        // Real CLI output (single member/stream/frame), when the tools are installed.
+        for (tool, args, name) in [
+            ("zstd", &["-q", "-3", "-c"][..], "cli.jsonl.zst"),
+            ("gzip", &["-c"][..], "cli.jsonl.gz"),
+            ("bzip2", &["-c"][..], "cli.jsonl.bz2"),
+        ] {
+            if let Ok(out) = std::process::Command::new(tool)
+                .args(args)
+                .arg(&plain)
+                .output()
+            {
+                assert!(out.status.success(), "{tool} CLI failed");
+                let p = dir.join(name);
+                std::fs::write(&p, out.stdout).unwrap();
+                variants.push(p);
+            }
+        }
+
+        for skip in [0u64, 2500] {
+            let want = feed(&plain, skip, "plain");
+            assert!(want.dispatched > 3000 && !want.rejected.is_empty());
+            for v in &variants {
+                let got = feed(v, skip, "cmp");
+                assert_eq!(got.lines, want.lines, "{v:?} skip {skip}: line count");
+                assert_eq!(got.dispatched, want.dispatched, "{v:?} skip {skip}");
+                assert_eq!(got.items, want.items, "{v:?} skip {skip}: records");
+                assert_eq!(got.watermark, want.watermark, "{v:?} skip {skip}");
+                assert_eq!(got.rejected, want.rejected, "{v:?} skip {skip}: rejects");
+            }
+        }
+
+        // Damage is a read error, never records: a plain-text `.zst`, and a
+        // gzip / bzip2 / zstd stream truncated mid-way.
+        let mut damaged = vec![("bad.zst", b"{\"DATA_SOURCE\":\"T\"}\n".to_vec())];
+        for (name, bytes) in [("trunc.gz", &gz), ("trunc.bz2", &bz), ("trunc.zst", &multi)] {
+            damaged.push((name, bytes[..bytes.len() - bytes.len() / 3].to_vec()));
+        }
+        for (name, bytes) in damaged {
+            let bad = dir.join(name);
+            std::fs::write(&bad, bytes).unwrap();
+            let (tx, _rx) = mpsc::channel::<LoadItem>(100_000);
+            let resume = Arc::new(Mutex::new(ResumeTracker::new(1)));
+            let sink = Arc::new(Mutex::new(RejectSink::new(dir.join("bad.rejected"))));
+            let in_flight: InFlightBodies = Arc::new(Mutex::new(HashMap::new()));
+            assert!(
+                read_and_feed(&bad, 0, &tx, &resume, &sink, &in_flight).is_err(),
+                "{name}: damaged input must fail loudly"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
