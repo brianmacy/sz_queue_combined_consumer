@@ -45,4 +45,4 @@ sz-info-sink-fault-fixture = { path = "../info-sink-fault-fixture" }
 # PRIVATE throwaway SQLite repository (never the one the test process's
 # engine has open). The raw C API (bundled SQLite, MIT) keeps the dev tree
 # small; rusqlite would add Zlib-licensed transitive crates.
-libsqlite3-sys = { version = "0.38", features = ["bundled"] }
+libsqlite3-sys = { version = "0.39", features = ["bundled"] }
