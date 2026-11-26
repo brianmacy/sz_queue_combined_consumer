@@ -4,6 +4,18 @@ Sections headed `0.5.0 — …` ship in tag `v0.5.0` (2026-10-16); sections head
 
 ## Unreleased
 
+* **Redo hand-off no longer caps redo at ~50/s per process.** The redo fetcher
+  retried a full worker channel every 100 ms; the channel holds only
+  `redo_pref + 2` jobs (5 at 16 threads, 20% redo), so once the input was
+  exhausted and every worker drained redo, hand-off was capped at ~5 jobs per
+  100 ms however fast the workers were. The retry step is now 1 ms; the bounded
+  channel is still the gating valve and `RUNNING` is still re-checked on every
+  retry (a blocking `send` was rejected: the main thread holds a receiver
+  clone until teardown, so a wedged fetcher would never finish). Measured on a
+  200k distsql file load (8 procs x 16 threads, 20% redo): redo drain 47 s ->
+  13 s per process (~43 -> ~160 redo/s), load 229 s -> 198 s. New test
+  `a_full_channel_does_not_cap_redo_handoff_rate` (fails at 7.3 s with the
+  100 ms step, passes in 0.42 s).
 * **ActiveMQ: retry an unreachable broker at startup.** New `--reconnect-timeout`
   / `SENZING_ACTIVEMQ_RECONNECT_TIMEOUT` (default 300 s, `0` = forever): the
   startup connect retries transient errors every 5 s (30 s per attempt) instead

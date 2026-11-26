@@ -374,8 +374,15 @@ pub fn fetcher_loop(
 /// wedged on a full channel (redoer FIX-2b, verbatim). Returns `Err` if
 /// shutdown was requested before the send completed, or if the channel
 /// disconnected.
+///
+/// The retry nap is 1 ms, not the redoer's 100 ms: the channel holds only
+/// `redo_pref + 2` jobs, so a 100 ms nap capped hand-off at ~50 redo/s per
+/// process whatever the workers could do (measured 51/s, 2026-11-26), and
+/// idled every worker through the post-input redo drain. The bounded channel
+/// is still the gating valve; only the wake latency changes. RUNNING is still
+/// re-checked every nap.
 fn send_interruptible(tx: &SyncSender<RedoJob>, mut job: RedoJob) -> Result<(), ()> {
-    let step = Duration::from_millis(100);
+    let step = Duration::from_millis(1);
     loop {
         if !RUNNING.load(Ordering::Relaxed) {
             return Err(());
@@ -426,6 +433,38 @@ mod tests {
             REDO_FETCHED.load(Ordering::Relaxed),
             REDO_EMPTY_PROBES.load(Ordering::Relaxed),
         )
+    }
+
+    /// The fetcher's full-channel retry must not cap redo throughput. With the
+    /// file-mode channel (redo_pref + 2 = 5 slots) and a 100 ms retry nap, a
+    /// process could hand out at most 50 redo/s however fast its workers were
+    /// (measured 51/s/process on a 1M distsql load, 2026-11-26). The receiver
+    /// spends 1 ms per job (a fast worker), so the sender outruns it and the
+    /// full-channel path is exercised: 400 jobs cost ~0.4 s at worker speed,
+    /// but >= 8 s under a 100 ms nap (5 jobs per nap). The 2 s bound is 5x the
+    /// expected cost so a loaded box passes and the capped version cannot.
+    #[test]
+    fn a_full_channel_does_not_cap_redo_handoff_rate() {
+        const JOBS: usize = 400;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RedoJob>(5);
+        let start = Instant::now();
+        let fetcher = std::thread::spawn(move || {
+            for id in 0..JOBS {
+                assert!(send_interruptible(&tx, (id, String::from("r"))).is_ok());
+            }
+        });
+        let mut received = 0;
+        for _job in rx.iter().take(JOBS) {
+            std::thread::sleep(Duration::from_millis(1));
+            received += 1;
+        }
+        fetcher.join().expect("fetcher thread panicked");
+        let took = start.elapsed();
+        assert_eq!(received, JOBS);
+        assert!(
+            took < Duration::from_secs(2),
+            "{JOBS} redo hand-offs through a 5-slot channel took {took:?}: the full-channel retry caps throughput"
+        );
     }
 
     #[test]
